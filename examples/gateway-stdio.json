@@ -1,0 +1,19 @@
+{
+  "listen": "127.0.0.1:8080",
+  "public_url": "https://mcp.example.com",
+  "state_path": "/var/lib/oauth2-mcp-gateway/state.json",
+  "oauth": {
+    "owner_password_hash": "${OWNER_PASSWORD_HASH}",
+    "scopes": ["mcp"]
+  },
+  "upstream": {
+    "transport": "stdio",
+    "command": "npx",
+    "args": ["-y", "@modelcontextprotocol/server-filesystem", "/srv/workspace"],
+    "env": {
+      "MCP_UPSTREAM_API_KEY": "${MCP_UPSTREAM_API_KEY}"
+    },
+    "max_sessions": 32,
+    "session_idle_secs": 1800
+  }
+}

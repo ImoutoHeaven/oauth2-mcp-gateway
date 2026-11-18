@@ -1,0 +1,22 @@
+{
+  "listen": "127.0.0.1:8080",
+  "public_url": "https://mcp.example.com",
+  "state_path": "/var/lib/oauth2-mcp-gateway/state.json",
+  "oauth": {
+    "owner_password_hash": "${OWNER_PASSWORD_HASH}",
+    "scopes": ["mcp"],
+    "access_token_ttl_secs": 3600,
+    "refresh_token_ttl_secs": 2592000,
+    "refresh_grace_secs": 120
+  },
+  "upstream": {
+    "transport": "http",
+    "url": "http://127.0.0.1:9000/mcp",
+    "bearer_tokens": [
+      "${UPSTREAM_BEARER_TOKEN_1}",
+      "${UPSTREAM_BEARER_TOKEN_2}"
+    ],
+    "passthrough_prefixes": ["/t/"],
+    "request_timeout_secs": 300
+  }
+}
