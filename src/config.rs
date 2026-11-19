@@ -1,4 +1,4 @@
-use crate::crypto::PasswordVerifier;
+use crate::crypto::{PasswordVerifier, zeroize_string};
 use serde::Deserialize;
 use std::collections::BTreeMap;
 use std::net::{IpAddr, SocketAddr};
@@ -16,6 +16,14 @@ pub struct GatewayConfig {
     pub upstream: UpstreamSettings,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum RefreshReusePolicy {
+    #[default]
+    Converge,
+    Revoke,
+}
+
 #[derive(Clone)]
 pub struct OAuthSettings {
     pub verifier: PasswordVerifier,
@@ -23,7 +31,9 @@ pub struct OAuthSettings {
     pub allowed_redirect_hosts: Vec<String>,
     pub access_token_ttl_secs: u64,
     pub refresh_token_ttl_secs: u64,
+    pub max_grant_lifetime_secs: u64,
     pub refresh_grace_secs: u64,
+    pub refresh_reuse_policy: RefreshReusePolicy,
     pub max_registered_clients: usize,
 }
 
@@ -35,7 +45,9 @@ impl std::fmt::Debug for OAuthSettings {
             .field("allowed_redirect_hosts", &self.allowed_redirect_hosts)
             .field("access_token_ttl_secs", &self.access_token_ttl_secs)
             .field("refresh_token_ttl_secs", &self.refresh_token_ttl_secs)
+            .field("max_grant_lifetime_secs", &self.max_grant_lifetime_secs)
             .field("refresh_grace_secs", &self.refresh_grace_secs)
+            .field("refresh_reuse_policy", &self.refresh_reuse_policy)
             .field("max_registered_clients", &self.max_registered_clients)
             .finish()
     }
@@ -134,8 +146,11 @@ struct RawOAuth {
     access_token_ttl_secs: u64,
     #[serde(default = "default_refresh_ttl")]
     refresh_token_ttl_secs: u64,
-    #[serde(default = "default_refresh_grace")]
-    refresh_grace_secs: u64,
+    max_grant_lifetime_secs: Option<u64>,
+    #[serde(default)]
+    refresh_grace_secs: Option<u64>,
+    #[serde(default)]
+    refresh_reuse_policy: RefreshReusePolicy,
     #[serde(default = "default_max_clients")]
     max_registered_clients: usize,
 }
@@ -174,9 +189,6 @@ fn default_access_ttl() -> u64 {
 }
 fn default_refresh_ttl() -> u64 {
     30 * 24 * 3600
-}
-fn default_refresh_grace() -> u64 {
-    120
 }
 fn default_max_clients() -> usize {
     512
@@ -373,8 +385,10 @@ impl GatewayConfig {
                 );
             }
             (Some(pw), None) => {
-                let expanded = expand_env_reference(pw, "oauth.owner_password")?;
-                PasswordVerifier::from_plaintext(&expanded)?
+                let mut expanded = expand_env_reference(pw, "oauth.owner_password")?;
+                let res = PasswordVerifier::from_plaintext(&expanded);
+                zeroize_string(&mut expanded);
+                res?
             }
             (None, Some(hash)) => {
                 let expanded = expand_env_reference(hash, "oauth.owner_password_hash")?;
@@ -409,8 +423,28 @@ impl GatewayConfig {
                 "oauth.refresh_token_ttl_secs must be >= oauth.access_token_ttl_secs".to_owned(),
             );
         }
-        if raw.oauth.refresh_grace_secs > 600 {
-            return Err("oauth.refresh_grace_secs must be in 0..=600".to_owned());
+        let max_grant_lifetime_secs = raw.oauth.max_grant_lifetime_secs.unwrap_or_else(|| {
+            raw.oauth
+                .refresh_token_ttl_secs
+                .saturating_mul(3)
+                .clamp(raw.oauth.refresh_token_ttl_secs, 31_536_000)
+        });
+        if !(raw.oauth.refresh_token_ttl_secs..=31_536_000).contains(&max_grant_lifetime_secs) {
+            return Err(
+                "oauth.max_grant_lifetime_secs must be in oauth.refresh_token_ttl_secs..=31536000"
+                    .to_owned(),
+            );
+        }
+        let refresh_grace_secs = raw.oauth.refresh_grace_secs.unwrap_or_else(|| {
+            raw.oauth
+                .access_token_ttl_secs
+                .min(raw.oauth.refresh_token_ttl_secs)
+        });
+        if refresh_grace_secs > 86_400 || refresh_grace_secs > raw.oauth.refresh_token_ttl_secs {
+            return Err(
+                "oauth.refresh_grace_secs must be in 0..=86400 and <= oauth.refresh_token_ttl_secs"
+                    .to_owned(),
+            );
         }
         if !(16..=4096).contains(&raw.oauth.max_registered_clients) {
             return Err("oauth.max_registered_clients must be in 16..=4096".to_owned());
@@ -429,7 +463,9 @@ impl GatewayConfig {
             allowed_redirect_hosts,
             access_token_ttl_secs: raw.oauth.access_token_ttl_secs,
             refresh_token_ttl_secs: raw.oauth.refresh_token_ttl_secs,
-            refresh_grace_secs: raw.oauth.refresh_grace_secs,
+            max_grant_lifetime_secs,
+            refresh_grace_secs,
+            refresh_reuse_policy: raw.oauth.refresh_reuse_policy,
             max_registered_clients: raw.oauth.max_registered_clients,
         };
 
@@ -604,7 +640,7 @@ fn validate_passthrough_prefix(prefix: &str, upstream_path: &str) -> Result<(), 
         ));
     }
     let lower = prefix.to_ascii_lowercase();
-    for reserved in ["/mcp/", "/oauth/", "/.well-known/", "/healthz/"] {
+    for reserved in ["/oauth/", "/.well-known/", "/healthz/"] {
         if lower.starts_with(reserved) || reserved.starts_with(&lower) {
             return Err(format!(
                 "passthrough prefix {prefix:?} overlaps reserved gateway route {reserved:?}"
@@ -721,10 +757,31 @@ mod tests {
         let cfg = GatewayConfig::from_json_str(&loopback_json, Path::new(".")).unwrap();
         assert_eq!(cfg.public_url, "http://[::1]:8080");
         assert!(!cfg.public_is_https);
+        assert_eq!(cfg.oauth.refresh_token_ttl_secs, 2_592_000);
+        assert_eq!(cfg.oauth.max_grant_lifetime_secs, 7_776_000);
         let UpstreamSettings::Stdio(stdio) = &cfg.upstream else {
             panic!("expected stdio upstream");
         };
         assert_eq!(stdio.args, vec!["${LITERAL_ARG_KEPT}"]);
+
+        let custom_rt = loopback_json.replace(
+            "\"owner_password_hash\":",
+            "\"refresh_token_ttl_secs\": 7776000, \"owner_password_hash\":",
+        );
+        let custom_cfg = GatewayConfig::from_json_str(&custom_rt, Path::new(".")).unwrap();
+        assert_eq!(custom_cfg.oauth.max_grant_lifetime_secs, 23_328_000);
+
+        let too_short_grant = loopback_json.replace(
+            "\"owner_password_hash\":",
+            "\"refresh_token_ttl_secs\": 3600, \"max_grant_lifetime_secs\": 1800, \"owner_password_hash\":",
+        );
+        assert!(GatewayConfig::from_json_str(&too_short_grant, Path::new(".")).is_err());
+
+        let too_long_grant = loopback_json.replace(
+            "\"owner_password_hash\":",
+            "\"max_grant_lifetime_secs\": 31536001, \"owner_password_hash\":",
+        );
+        assert!(GatewayConfig::from_json_str(&too_long_grant, Path::new(".")).is_err());
 
         assert!(expand_env_reference("${DEFINITELY_UNSET_GW_TEST_VAR}", "field").is_err());
         assert!(expand_env_reference("prefix-${VAR}", "field").is_err());

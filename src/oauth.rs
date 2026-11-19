@@ -1,17 +1,19 @@
-use crate::config::{GatewayConfig, is_loopback_host};
+use crate::config::{GatewayConfig, RefreshReusePolicy, is_loopback_host};
 use crate::crypto::{
-    constant_time_eq_str, is_valid_s256_challenge, random_token_b64, sha256_b64, verify_pkce_s256,
+    constant_time_eq_str, hmac_sha256, is_valid_s256_challenge, random_token_b64, sha256_b64,
+    verify_pkce_s256, zeroize_bytes, zeroize_string,
 };
 use crate::store::{
-    AccessTokenRecord, GrantRecord, PersistedState, RefreshTokenRecord, RegisteredClient,
-    StateStore, unix_now,
+    AccessTokenRecord, GraceRefreshRecord, GrantRecord, MAX_GRACE_REFRESHES, PersistedState,
+    RefreshTokenRecord, RegisteredClient, StateStore, unix_now,
 };
 use crate::types::{
-    AuthChallenge, HttpReply, VerifiedToken, bytes_body, empty_body, json_reply, text_reply,
+    AuthChallenge, HttpReply, VerifiedToken, bytes_body, empty_body, hex_nibble, json_reply,
+    method_not_allowed, text_reply,
 };
 use crate::upstream_http::{ContentLengthCheck, check_content_length_limit};
 use base64::Engine;
-use base64::engine::general_purpose::{STANDARD, STANDARD_NO_PAD};
+use base64::engine::general_purpose::{STANDARD, STANDARD_NO_PAD, URL_SAFE_NO_PAD};
 use bytes::Bytes;
 use http::{HeaderMap, Method, Request, Response, StatusCode, header};
 use http_body::Body;
@@ -20,6 +22,8 @@ use hyper::body::Incoming;
 use serde::Deserialize;
 use serde_json::json;
 use std::collections::{BTreeMap, HashMap, VecDeque};
+use std::future::Future;
+use std::net::{IpAddr, Ipv4Addr};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use url::Url;
@@ -28,17 +32,20 @@ const MAX_POST_BODY_BYTES: usize = 64 * 1024;
 const OAUTH_BODY_TIMEOUT: Duration = Duration::from_secs(10);
 const MAX_REDIRECT_URIS: usize = 16;
 const MAX_CLIENT_NAME_CHARS: usize = 256;
+const MAX_STATE_BYTES: usize = 1024;
 const PENDING_AUTH_TTL_SECS: u64 = 300;
-const MAX_PENDING_AUTHS: usize = 256;
+const MAX_PENDING_AUTHS: usize = 512;
+const MAX_PENDING_AUTHS_PER_IP: usize = 32;
+const MAX_AR_ATTEMPTS: u8 = 3;
 const AUTH_CODE_TTL_SECS: u64 = 300;
 const MAX_AUTH_CODES: usize = 256;
 const CONSUMED_CODE_TTL_SECS: u64 = 300;
 const MAX_CONSUMED_CODES: usize = 1024;
 const PW_FAIL_WINDOW: Duration = Duration::from_secs(15 * 60);
 const PW_MAX_FAILURES: usize = 10;
+const PW_GLOBAL_PACE_DELAY: Duration = Duration::from_millis(100);
+const MAX_PW_FAILURE_IPS: usize = 4096;
 const MAX_ACCESS_TOKENS_PER_GRANT: usize = 64;
-const MAX_ACTIVE_REFRESH_PER_GRANT: usize = 8;
-const MAX_ROTATED_REFRESH_PER_GRANT: usize = 256;
 const MAX_GRACE_CACHE: usize = 1024;
 const MAX_ACTIVE_GRANTS: usize = 4096;
 
@@ -48,21 +55,27 @@ type EarlyReply = Box<HttpReply>;
 type RevokeHook = Arc<dyn Fn(&str) + Send + Sync>;
 
 pub struct OAuthEngine {
+    core: Arc<EngineCore>,
+}
+
+struct EngineCore {
     config: Arc<GatewayConfig>,
     store: StateStore,
     inner: Mutex<EngineState>,
-    persist_lock: tokio::sync::Mutex<()>,
+    persist_lock: Arc<tokio::sync::Mutex<()>>,
     pw_verify_gate: tokio::sync::Mutex<()>,
     on_revoke: Option<RevokeHook>,
 }
 
 struct EngineState {
     persisted: PersistedState,
+    access_index: HashMap<String, String>,
+    grant_index: HashMap<String, usize>,
     pending_auths: VecDeque<PendingAuthRequest>,
     auth_codes: VecDeque<AuthCodeEntry>,
     consumed_codes: VecDeque<ConsumedCodeEntry>,
     grace_cache: HashMap<String, GraceCacheEntry>,
-    pw_failures: VecDeque<Instant>,
+    pw_failures: HashMap<IpAddr, VecDeque<Instant>>,
     rr_cursor: usize,
 }
 
@@ -77,6 +90,8 @@ struct PendingAuthRequest {
     resource: String,
     state: Option<String>,
     code_challenge: String,
+    peer_ip: IpAddr,
+    attempts: u8,
     expires_at: u64,
 }
 
@@ -98,12 +113,19 @@ struct ConsumedCodeEntry {
 
 #[derive(Clone)]
 struct GraceCacheEntry {
-    grant_id: String,
+    tip_gen: u64,
     access_token: String,
     refresh_token: String,
-    a1_expires_at: u64,
+    a_expires_at: u64,
     scopes: Vec<String>,
     grace_until: u64,
+}
+
+impl Drop for GraceCacheEntry {
+    fn drop(&mut self) {
+        zeroize_string(&mut self.access_token);
+        zeroize_string(&mut self.refresh_token);
+    }
 }
 
 #[derive(Deserialize)]
@@ -113,28 +135,98 @@ struct DcrRequest {
     grant_types: Option<Vec<String>>,
     response_types: Option<Vec<String>>,
     token_endpoint_auth_method: Option<String>,
+    scope: Option<String>,
+}
+
+struct RotatedTip {
+    access_token: String,
+    refresh_token: String,
+    expires_in: u64,
+    scopes: Vec<String>,
+    cache_entry: Option<GraceCacheEntry>,
+}
+
+struct ParsedRefreshToken<'a> {
+    grant_id: &'a str,
+    r#gen: u64,
+    nonce: &'a str,
+    tag: &'a str,
+}
+
+impl EngineCore {
+    fn notify_revoke(&self, grant_id: &str) {
+        if let Some(hook) = &self.on_revoke {
+            hook(grant_id);
+        }
+    }
 }
 
 impl EngineState {
+    fn sync_indexes(&mut self) {
+        self.access_index.clear();
+        self.grant_index.clear();
+        for (idx, grant) in self.persisted.grants.iter().enumerate() {
+            self.grant_index.insert(grant.grant_id.clone(), idx);
+            for at in &grant.access_tokens {
+                self.access_index
+                    .insert(at.token_sha256.clone(), grant.grant_id.clone());
+            }
+        }
+    }
+
+    fn prune_persisted(&mut self, now: u64) {
+        if self.persisted.prune_expired(now) {
+            self.sync_indexes();
+        }
+    }
+
     fn prune_ephemeral(&mut self, now: u64) {
         self.pending_auths.retain(|entry| entry.expires_at > now);
         self.auth_codes.retain(|entry| entry.expires_at > now);
         self.consumed_codes.retain(|entry| entry.expires_at > now);
         self.grace_cache
-            .retain(|_, entry| entry.grace_until >= now && entry.a1_expires_at > now);
+            .retain(|_, entry| entry.grace_until >= now && entry.a_expires_at > now);
         let mono_now = Instant::now();
-        while let Some(&ts) = self.pw_failures.front() {
-            if mono_now.saturating_duration_since(ts) >= PW_FAIL_WINDOW {
-                self.pw_failures.pop_front();
-            } else {
-                break;
+        self.pw_failures.retain(|_, deque| {
+            while let Some(&ts) = deque.front() {
+                if mono_now.saturating_duration_since(ts) >= PW_FAIL_WINDOW {
+                    deque.pop_front();
+                } else {
+                    break;
+                }
             }
-        }
+            !deque.is_empty()
+        });
     }
 
-    fn insert_grace_cache(&mut self, rt_hash: String, entry: GraceCacheEntry) {
+    fn ip_pw_failures(&self, ip: &IpAddr) -> usize {
+        self.pw_failures.get(ip).map_or(0, VecDeque::len)
+    }
+
+    fn total_pw_failures(&self) -> usize {
+        self.pw_failures.values().map(VecDeque::len).sum()
+    }
+
+    fn record_pw_failure(&mut self, ip: IpAddr) {
+        if self.pw_failures.len() >= MAX_PW_FAILURE_IPS
+            && !self.pw_failures.contains_key(&ip)
+            && let Some(oldest_ip) = self
+                .pw_failures
+                .iter()
+                .min_by_key(|(_, dq)| dq.back().copied())
+                .map(|(k, _)| *k)
+        {
+            self.pw_failures.remove(&oldest_ip);
+        }
+        self.pw_failures
+            .entry(ip)
+            .or_default()
+            .push_back(Instant::now());
+    }
+
+    fn insert_grace_cache(&mut self, grant_id: String, entry: GraceCacheEntry) {
         if self.grace_cache.len() >= MAX_GRACE_CACHE
-            && !self.grace_cache.contains_key(&rt_hash)
+            && !self.grace_cache.contains_key(&grant_id)
             && let Some(evict_key) = self
                 .grace_cache
                 .iter()
@@ -143,7 +235,36 @@ impl EngineState {
         {
             self.grace_cache.remove(&evict_key);
         }
-        self.grace_cache.insert(rt_hash, entry);
+        self.grace_cache.insert(grant_id, entry);
+    }
+
+    fn record_consumed_code(&mut self, code_sha256: String, grant_id: String, expires_at: u64) {
+        if self
+            .consumed_codes
+            .iter()
+            .any(|c| constant_time_eq_str(&c.code_sha256, &code_sha256))
+        {
+            return;
+        }
+        while self.consumed_codes.len() >= MAX_CONSUMED_CODES {
+            self.consumed_codes.pop_front();
+        }
+        self.consumed_codes.push_back(ConsumedCodeEntry {
+            code_sha256,
+            grant_id,
+            expires_at,
+        });
+    }
+
+    fn remove_grant_immediate(&mut self, grant_id: &str) -> Option<PersistedState> {
+        let before = self.persisted.grants.len();
+        self.persisted.grants.retain(|g| g.grant_id != grant_id);
+        self.grace_cache.remove(grant_id);
+        if self.persisted.grants.len() == before {
+            return None;
+        }
+        self.sync_indexes();
+        Some(self.persisted.clone())
     }
 
     fn select_pool_slot(&mut self, pool_size: usize) -> usize {
@@ -187,48 +308,89 @@ impl OAuthEngine {
     ) -> Result<Arc<Self>, String> {
         let now = unix_now();
         let (store, persisted) = StateStore::open(config.state_path.clone(), now)?;
-        let state = EngineState {
+        let mut state = EngineState {
             persisted,
+            access_index: HashMap::new(),
+            grant_index: HashMap::new(),
             pending_auths: VecDeque::new(),
             auth_codes: VecDeque::new(),
             consumed_codes: VecDeque::new(),
             grace_cache: HashMap::new(),
-            pw_failures: VecDeque::new(),
+            pw_failures: HashMap::new(),
             rr_cursor: 0,
         };
+        state.sync_indexes();
+        let initial_consumed: Vec<(String, String, u64)> = state
+            .persisted
+            .grants
+            .iter()
+            .filter_map(|grant| {
+                let (h, exp) = grant.consumed_code_sha256.as_ref()?;
+                (*exp > now).then(|| (h.clone(), grant.grant_id.clone(), *exp))
+            })
+            .collect();
+        for (h, gid, exp) in initial_consumed {
+            state.record_consumed_code(h, gid, exp);
+        }
         Ok(Arc::new(Self {
-            config,
-            store,
-            inner: Mutex::new(state),
-            persist_lock: tokio::sync::Mutex::new(()),
-            pw_verify_gate: tokio::sync::Mutex::new(()),
-            on_revoke,
+            core: Arc::new(EngineCore {
+                config,
+                store,
+                inner: Mutex::new(state),
+                persist_lock: Arc::new(tokio::sync::Mutex::new(())),
+                pw_verify_gate: tokio::sync::Mutex::new(()),
+                on_revoke,
+            }),
         }))
     }
 
     pub fn resource_path(&self) -> &str {
-        &self.config.resource_path
+        &self.core.config.resource_path
     }
 
-    fn notify_revoke(&self, grant_id: &str) {
-        if let Some(hook) = &self.on_revoke {
-            hook(grant_id);
-        }
+    pub fn is_grant_active(&self, grant_id: &str) -> bool {
+        let now = unix_now();
+        let expected_resource = self.core.config.mcp_resource_url();
+        let guard = self
+            .core
+            .inner
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let Some(&idx) = guard.grant_index.get(grant_id) else {
+            return false;
+        };
+        let Some(grant) = guard.persisted.grants.get(idx) else {
+            return false;
+        };
+        now < grant.max_expires_at
+            && grant.resource == expected_resource
+            && (grant.access_tokens.iter().any(|at| at.expires_at > now)
+                || grant
+                    .current_refresh
+                    .as_ref()
+                    .is_some_and(|rt| rt.expires_at > now))
     }
 
-    async fn persist_snapshot(&self, snapshot: PersistedState) -> Result<PersistedState, ()> {
-        let store = self.store.clone();
-        let to_save = snapshot.clone();
-        match tokio::task::spawn_blocking(move || store.save(&to_save)).await {
-            Ok(Ok(())) => Ok(snapshot),
-            Ok(Err(err)) => {
-                eprintln!("oauth2-mcp-gateway: failed to persist OAuth state: {err}");
-                Err(())
-            }
-            Err(err) => {
-                eprintln!("oauth2-mcp-gateway: state persistence task failed: {err}");
-                Err(())
-            }
+    async fn run_uncancellable<F, Fut>(&self, f: F) -> HttpReply
+    where
+        F: FnOnce(Arc<EngineCore>) -> Fut + Send + 'static,
+        Fut: Future<Output = HttpReply> + Send + 'static,
+    {
+        let core = Arc::clone(&self.core);
+        // Detached task finishes state commit and fsync even if client drops TCP mid-request.
+        let handle = tokio::spawn(async move {
+            let _persist_guard = Arc::clone(&core.persist_lock).lock_owned().await;
+            let reply = f(core).await;
+            drop(_persist_guard);
+            reply
+        });
+        match handle.await {
+            Ok(reply) => reply,
+            Err(_) => oauth_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "server_error",
+                "persistence task panicked",
+            ),
         }
     }
 
@@ -241,11 +403,12 @@ impl OAuthEngine {
     }
 
     pub async fn handle(&self, req: Request<Incoming>) -> HttpReply {
+        let peer_ip = req.extensions().get::<IpAddr>().copied();
         let path = req.uri().path().to_owned();
         match path.as_str() {
             p if p == "/.well-known/oauth-protected-resource"
                 || p.strip_prefix("/.well-known/oauth-protected-resource")
-                    == Some(self.config.resource_path.as_str()) =>
+                    == Some(self.core.config.resource_path.as_str()) =>
             {
                 if req.method() != Method::GET {
                     return method_not_allowed("GET");
@@ -255,7 +418,7 @@ impl OAuthEngine {
             p if p.starts_with("/.well-known/oauth-protected-resource/") => not_found_reply(),
             p if p == "/.well-known/oauth-authorization-server"
                 || p.strip_prefix("/.well-known/oauth-authorization-server")
-                    == Some(self.config.resource_path.as_str()) =>
+                    == Some(self.core.config.resource_path.as_str()) =>
             {
                 if req.method() != Method::GET {
                     return method_not_allowed("GET");
@@ -270,8 +433,8 @@ impl OAuthEngine {
                 self.handle_register(req).await
             }
             "/oauth/authorize" => match *req.method() {
-                Method::GET => self.handle_authorize_get(&req),
-                Method::POST => self.handle_authorize_post(req).await,
+                Method::GET => self.handle_authorize_get(&req, peer_ip),
+                Method::POST => self.handle_authorize_post(req, peer_ip).await,
                 _ => method_not_allowed("GET, POST"),
             },
             "/oauth/token" => {
@@ -319,47 +482,74 @@ impl OAuthEngine {
 
         let token_hash = sha256_b64(token);
         let now = unix_now();
-        let expected_resource = self.config.mcp_resource_url();
+        let expected_resource = self.core.config.mcp_resource_url();
 
         let guard = self
+            .core
             .inner
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        for grant in &guard.persisted.grants {
-            if grant.resource != expected_resource {
-                continue;
-            }
-            for at in &grant.access_tokens {
-                if at.expires_at > now && constant_time_eq_str(&at.token_sha256, &token_hash) {
-                    return Ok(VerifiedToken {
-                        grant_id: grant.grant_id.clone(),
-                        client_id: grant.client_id.clone(),
-                        pool_slot: grant.pool_slot,
-                        scopes: grant.scopes.clone(),
-                        resource: grant.resource.clone(),
-                    });
-                }
-            }
+        let Some(grant_id) = guard.access_index.get(&token_hash) else {
+            return Err(AuthChallenge::InvalidToken);
+        };
+        let Some(&grant_idx) = guard.grant_index.get(grant_id) else {
+            return Err(AuthChallenge::InvalidToken);
+        };
+        let Some(grant) = guard.persisted.grants.get(grant_idx) else {
+            return Err(AuthChallenge::InvalidToken);
+        };
+        if now >= grant.max_expires_at || grant.resource != expected_resource {
+            return Err(AuthChallenge::InvalidToken);
         }
-        Err(AuthChallenge::InvalidToken)
+        let Some(at) = grant
+            .access_tokens
+            .iter()
+            .find(|at| at.expires_at > now && constant_time_eq_str(&at.token_sha256, &token_hash))
+        else {
+            return Err(AuthChallenge::InvalidToken);
+        };
+        if !at
+            .scopes
+            .iter()
+            .any(|s| self.core.config.oauth.scopes.contains(s))
+        {
+            return Err(AuthChallenge::InsufficientScope);
+        }
+        Ok(VerifiedToken {
+            grant_id: grant.grant_id.clone(),
+            client_id: grant.client_id.clone(),
+            pool_slot: grant.pool_slot,
+            scopes: at.scopes.clone(),
+            resource: grant.resource.clone(),
+        })
     }
 
     pub fn www_authenticate_value(&self, challenge: AuthChallenge) -> String {
         let meta_url = format!(
             "{}/.well-known/oauth-protected-resource{}",
-            self.config.public_url, self.config.resource_path
+            self.core.config.public_url, self.core.config.resource_path
         );
         match challenge {
             AuthChallenge::MissingToken => format!("Bearer resource_metadata=\"{meta_url}\""),
             AuthChallenge::InvalidToken => {
                 format!("Bearer resource_metadata=\"{meta_url}\", error=\"invalid_token\"")
             }
+            AuthChallenge::InsufficientScope => {
+                let scope = self.core.config.oauth.scopes.join(" ");
+                format!(
+                    "Bearer resource_metadata=\"{meta_url}\", error=\"insufficient_scope\", scope=\"{scope}\""
+                )
+            }
         }
     }
 
     pub fn unauthorized_reply(&self, challenge: AuthChallenge) -> HttpReply {
+        let status = match challenge {
+            AuthChallenge::InsufficientScope => StatusCode::FORBIDDEN,
+            AuthChallenge::MissingToken | AuthChallenge::InvalidToken => StatusCode::UNAUTHORIZED,
+        };
         Response::builder()
-            .status(StatusCode::UNAUTHORIZED)
+            .status(status)
             .header(
                 header::WWW_AUTHENTICATE,
                 self.www_authenticate_value(challenge),
@@ -367,24 +557,24 @@ impl OAuthEngine {
             .header(header::CONNECTION, "close")
             .header(header::CACHE_CONTROL, "no-store")
             .body(empty_body())
-            .expect("valid 401 reply")
+            .expect("valid auth challenge reply")
     }
 
     fn handle_prm(&self) -> HttpReply {
-        let pub_url = &self.config.public_url;
+        let pub_url = &self.core.config.public_url;
         json_reply(
             StatusCode::OK,
             &json!({
-                "resource": self.config.mcp_resource_url(),
+                "resource": self.core.config.mcp_resource_url(),
                 "authorization_servers": [pub_url],
                 "bearer_methods_supported": ["header"],
-                "scopes_supported": self.config.oauth.scopes,
+                "scopes_supported": self.core.config.oauth.scopes,
             }),
         )
     }
 
     fn handle_as_metadata(&self) -> HttpReply {
-        let pub_url = &self.config.public_url;
+        let pub_url = &self.core.config.public_url;
         json_reply(
             StatusCode::OK,
             &json!({
@@ -393,8 +583,9 @@ impl OAuthEngine {
                 "token_endpoint": format!("{pub_url}/oauth/token"),
                 "registration_endpoint": format!("{pub_url}/oauth/register"),
                 "revocation_endpoint": format!("{pub_url}/oauth/revoke"),
-                "scopes_supported": self.config.oauth.scopes,
+                "scopes_supported": self.core.config.oauth.scopes,
                 "response_types_supported": ["code"],
+                "response_modes_supported": ["query"],
                 "grant_types_supported": ["authorization_code", "refresh_token"],
                 "token_endpoint_auth_methods_supported": [
                     "none",
@@ -438,7 +629,7 @@ impl OAuthEngine {
         let Some(raw_uris) = raw_req.redirect_uris else {
             return oauth_error(
                 StatusCode::BAD_REQUEST,
-                "invalid_redirect_uri",
+                "invalid_client_metadata",
                 "redirect_uris is required",
             );
         };
@@ -451,7 +642,7 @@ impl OAuthEngine {
         }
         let mut redirect_uris = Vec::with_capacity(raw_uris.len());
         for uri in raw_uris {
-            if !self.is_allowed_redirect_uri(&uri) {
+            if !is_allowed_redirect_uri(&self.core.config, &uri) {
                 return oauth_error(
                     StatusCode::BAD_REQUEST,
                     "invalid_redirect_uri",
@@ -466,10 +657,15 @@ impl OAuthEngine {
         let client_name = match raw_req.client_name {
             None => None,
             Some(name) => {
+                if name.chars().any(is_forbidden_display_char) {
+                    return oauth_error(
+                        StatusCode::BAD_REQUEST,
+                        "invalid_client_metadata",
+                        "invalid client_name",
+                    );
+                }
                 let trimmed = name.trim();
-                if trimmed.chars().count() > MAX_CLIENT_NAME_CHARS
-                    || trimmed.chars().any(char::is_control)
-                {
+                if trimmed.chars().count() > MAX_CLIENT_NAME_CHARS {
                     return oauth_error(
                         StatusCode::BAD_REQUEST,
                         "invalid_client_metadata",
@@ -481,6 +677,21 @@ impl OAuthEngine {
                 } else {
                     Some(trimmed.to_owned())
                 }
+            }
+        };
+
+        let allowed_scopes = match raw_req.scope {
+            None => None,
+            Some(raw_scope) => {
+                let Some(parsed) = parse_scope_list(&raw_scope, &self.core.config.oauth.scopes)
+                else {
+                    return oauth_error(
+                        StatusCode::BAD_REQUEST,
+                        "invalid_client_metadata",
+                        "invalid or unsupported scope",
+                    );
+                };
+                Some(parsed)
             }
         };
 
@@ -569,104 +780,107 @@ impl OAuthEngine {
             (Some(sec), Some(digest))
         };
 
-        let now = unix_now();
-        let record = RegisteredClient {
-            client_id: client_id.clone(),
-            client_name: client_name.clone(),
-            redirect_uris: redirect_uris.clone(),
-            grant_types: grant_types.clone(),
-            response_types: response_types.clone(),
-            token_endpoint_auth_method: auth_method.clone(),
-            client_secret_sha256: secret_sha256,
-            issued_at: now,
-        };
+        self.run_uncancellable(move |core| async move {
+            let now = unix_now();
+            let record = RegisteredClient {
+                client_id: client_id.clone(),
+                client_name: client_name.clone(),
+                redirect_uris: redirect_uris.clone(),
+                grant_types: grant_types.clone(),
+                response_types: response_types.clone(),
+                token_endpoint_auth_method: auth_method.clone(),
+                client_secret_sha256: secret_sha256,
+                allowed_scopes: allowed_scopes.clone(),
+                issued_at: now,
+            };
 
-        let _persist_guard = self.persist_lock.lock().await;
-        let (snapshot, evicted_ids) = {
-            let mut guard = self
-                .inner
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
-            guard.persisted.prune_expired(now);
-            guard.prune_ephemeral(now);
+            let snapshot = {
+                let mut guard = core
+                    .inner
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                guard.prune_persisted(now);
+                guard.prune_ephemeral(now);
 
-            let max_clients = self.config.oauth.max_registered_clients;
-            let mut candidate_clients = guard.persisted.clients.clone();
-            let mut evicted_ids = Vec::new();
-            while candidate_clients.len() >= max_clients {
-                let oldest_idle_idx = candidate_clients
-                    .iter()
-                    .enumerate()
-                    .filter(|(_, c)| {
-                        !guard
-                            .persisted
-                            .grants
-                            .iter()
-                            .any(|g| g.client_id == c.client_id)
-                    })
-                    .min_by_key(|(idx, c)| (c.issued_at, *idx))
-                    .map(|(idx, _)| idx);
+                let max_clients = core.config.oauth.max_registered_clients;
+                let mut candidate_clients = guard.persisted.clients.clone();
+                while candidate_clients.len() >= max_clients {
+                    let oldest_idle_idx = candidate_clients
+                        .iter()
+                        .enumerate()
+                        .filter(|(_, c)| {
+                            !guard
+                                .persisted
+                                .grants
+                                .iter()
+                                .any(|g| g.client_id == c.client_id)
+                                && !guard
+                                    .pending_auths
+                                    .iter()
+                                    .any(|p| p.client_id == c.client_id)
+                                && !guard.auth_codes.iter().any(|a| a.client_id == c.client_id)
+                        })
+                        .min_by_key(|(idx, c)| (c.issued_at, *idx))
+                        .map(|(idx, _)| idx);
 
-                let Some(evict_idx) = oldest_idle_idx else {
-                    return oauth_error(
-                        StatusCode::TOO_MANY_REQUESTS,
-                        "temporarily_unavailable",
-                        "maximum active registered clients reached",
-                    );
-                };
-                let removed = candidate_clients.remove(evict_idx);
-                evicted_ids.push(removed.client_id);
+                    let Some(evict_idx) = oldest_idle_idx else {
+                        return oauth_error(
+                            StatusCode::TOO_MANY_REQUESTS,
+                            "temporarily_unavailable",
+                            "maximum active registered clients reached",
+                        );
+                    };
+                    candidate_clients.remove(evict_idx);
+                }
+
+                candidate_clients.push(record);
+                let mut snap = guard.persisted.clone();
+                snap.clients = candidate_clients;
+                snap
+            };
+
+            let Ok(persisted) = persist_snapshot(&core.store, snapshot).await else {
+                return oauth_error(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "server_error",
+                    "failed to persist registered client",
+                );
+            };
+
+            {
+                let mut guard = core
+                    .inner
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                guard.persisted = persisted;
+                guard.sync_indexes();
             }
 
-            candidate_clients.push(record);
-            let mut snapshot = guard.persisted.clone();
-            snapshot.clients = candidate_clients;
-            (snapshot, evicted_ids)
-        };
-
-        let Ok(persisted) = self.persist_snapshot(snapshot).await else {
-            return oauth_error(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "server_error",
-                "failed to persist registered client",
-            );
-        };
-
-        {
-            let mut guard = self
-                .inner
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
-            guard.persisted = persisted;
-            if !evicted_ids.is_empty() {
-                guard
-                    .pending_auths
-                    .retain(|p| !evicted_ids.contains(&p.client_id));
-                guard
-                    .auth_codes
-                    .retain(|c| !evicted_ids.contains(&c.client_id));
+            let mut resp_obj = serde_json::Map::new();
+            resp_obj.insert("client_id".to_owned(), json!(client_id));
+            resp_obj.insert("client_id_issued_at".to_owned(), json!(now));
+            if let Some(mut secret) = plain_secret {
+                resp_obj.insert("client_secret".to_owned(), json!(&secret));
+                resp_obj.insert("client_secret_expires_at".to_owned(), json!(0));
+                zeroize_string(&mut secret);
             }
-        }
+            if let Some(name) = client_name {
+                resp_obj.insert("client_name".to_owned(), json!(name));
+            }
+            if let Some(scopes) = allowed_scopes {
+                resp_obj.insert("scope".to_owned(), json!(scopes.join(" ")));
+            }
+            resp_obj.insert("redirect_uris".to_owned(), json!(redirect_uris));
+            resp_obj.insert("grant_types".to_owned(), json!(grant_types));
+            resp_obj.insert("response_types".to_owned(), json!(response_types));
+            resp_obj.insert("token_endpoint_auth_method".to_owned(), json!(auth_method));
 
-        let mut resp_obj = serde_json::Map::new();
-        resp_obj.insert("client_id".to_owned(), json!(client_id));
-        resp_obj.insert("client_id_issued_at".to_owned(), json!(now));
-        if let Some(secret) = plain_secret {
-            resp_obj.insert("client_secret".to_owned(), json!(secret));
-            resp_obj.insert("client_secret_expires_at".to_owned(), json!(0));
-        }
-        if let Some(name) = client_name {
-            resp_obj.insert("client_name".to_owned(), json!(name));
-        }
-        resp_obj.insert("redirect_uris".to_owned(), json!(redirect_uris));
-        resp_obj.insert("grant_types".to_owned(), json!(grant_types));
-        resp_obj.insert("response_types".to_owned(), json!(response_types));
-        resp_obj.insert("token_endpoint_auth_method".to_owned(), json!(auth_method));
-
-        json_reply(StatusCode::CREATED, &serde_json::Value::Object(resp_obj))
+            json_reply(StatusCode::CREATED, &serde_json::Value::Object(resp_obj))
+        })
+        .await
     }
 
-    fn handle_authorize_get(&self, req: &Request<Incoming>) -> HttpReply {
+    fn handle_authorize_get(&self, req: &Request<Incoming>, peer_ip: Option<IpAddr>) -> HttpReply {
         let query = req.uri().query().unwrap_or("");
         let Ok(params) = parse_unique_form(query.as_bytes()) else {
             return html_status_reply(
@@ -685,6 +899,7 @@ impl OAuthEngine {
         let now = unix_now();
         let client_meta = {
             let mut guard = self
+                .core
                 .inner
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
@@ -701,7 +916,7 @@ impl OAuthEngine {
             return html_status_reply(StatusCode::BAD_REQUEST, "Unknown client_id");
         };
         if !client.redirect_uris.iter().any(|u| u == redirect_uri)
-            || !self.is_allowed_redirect_uri(redirect_uri)
+            || !is_allowed_redirect_uri(&self.core.config, redirect_uri)
         {
             return html_status_reply(StatusCode::BAD_REQUEST, "Unregistered redirect_uri");
         }
@@ -709,7 +924,7 @@ impl OAuthEngine {
         let state_param = params.get("state").cloned();
         if state_param
             .as_deref()
-            .is_some_and(|s| s.chars().any(char::is_control))
+            .is_some_and(|s| s.len() > MAX_STATE_BYTES || s.chars().any(char::is_control))
         {
             return html_status_reply(StatusCode::BAD_REQUEST, "Invalid state parameter");
         }
@@ -717,14 +932,16 @@ impl OAuthEngine {
         match params.get("response_type").map(String::as_str) {
             Some("code") => {}
             Some(_) => {
-                return self.authorize_error_redirect(
+                return authorize_error_redirect(
+                    &self.core.config,
                     redirect_uri,
                     "unsupported_response_type",
                     state_param.as_deref(),
                 );
             }
             None => {
-                return self.authorize_error_redirect(
+                return authorize_error_redirect(
+                    &self.core.config,
                     redirect_uri,
                     "invalid_request",
                     state_param.as_deref(),
@@ -735,7 +952,8 @@ impl OAuthEngine {
         if !client.grant_types.iter().any(|g| g == "authorization_code")
             || !client.response_types.iter().any(|r| r == "code")
         {
-            return self.authorize_error_redirect(
+            return authorize_error_redirect(
+                &self.core.config,
                 redirect_uri,
                 "unauthorized_client",
                 state_param.as_deref(),
@@ -756,12 +974,30 @@ impl OAuthEngine {
             );
         };
 
+        let effective_allowed_scopes: Vec<String> = match &client.allowed_scopes {
+            None => self.core.config.oauth.scopes.clone(),
+            Some(client_scopes) => client_scopes
+                .iter()
+                .filter(|s| self.core.config.oauth.scopes.contains(s))
+                .cloned()
+                .collect(),
+        };
+        if effective_allowed_scopes.is_empty() {
+            return authorize_error_redirect(
+                &self.core.config,
+                redirect_uri,
+                "invalid_scope",
+                state_param.as_deref(),
+            );
+        }
+
         let scopes = match params.get("scope") {
-            None => self.config.oauth.scopes.clone(),
+            None => effective_allowed_scopes,
             Some(raw_scope) => {
-                let Some(parsed_scopes) = parse_scope_list(raw_scope, &self.config.oauth.scopes)
+                let Some(parsed_scopes) = parse_scope_list(raw_scope, &effective_allowed_scopes)
                 else {
-                    return self.authorize_error_redirect(
+                    return authorize_error_redirect(
+                        &self.core.config,
                         redirect_uri,
                         "invalid_scope",
                         state_param.as_deref(),
@@ -771,9 +1007,12 @@ impl OAuthEngine {
             }
         };
 
-        let Ok(resource) = self.normalize_resource(params.get("resource").map(String::as_str))
-        else {
-            return self.authorize_error_redirect(
+        let Ok(resource) = normalize_resource(
+            &self.core.config,
+            params.get("resource").map(String::as_str),
+        ) else {
+            return authorize_error_redirect(
+                &self.core.config,
                 redirect_uri,
                 "invalid_target",
                 state_param.as_deref(),
@@ -784,6 +1023,7 @@ impl OAuthEngine {
             return html_status_reply(StatusCode::INTERNAL_SERVER_ERROR, "Random source error");
         };
 
+        let ip_key = peer_ip.unwrap_or(IpAddr::V4(Ipv4Addr::UNSPECIFIED));
         let pending = PendingAuthRequest {
             ar_id: ar_id.clone(),
             csrf_token: csrf_token.clone(),
@@ -794,27 +1034,49 @@ impl OAuthEngine {
             resource,
             state: state_param,
             code_challenge,
+            peer_ip: ip_key,
+            attempts: 0,
             expires_at: now.saturating_add(PENDING_AUTH_TTL_SECS),
         };
 
         {
             let mut guard = self
+                .core
                 .inner
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
             guard.prune_ephemeral(now);
-            while guard.pending_auths.len() >= MAX_PENDING_AUTHS {
-                guard.pending_auths.pop_front();
+            let ip_pending = guard
+                .pending_auths
+                .iter()
+                .filter(|p| p.peer_ip == ip_key)
+                .count();
+            if ip_pending >= MAX_PENDING_AUTHS_PER_IP
+                || guard.pending_auths.len() >= MAX_PENDING_AUTHS
+            {
+                return html_status_reply(
+                    StatusCode::TOO_MANY_REQUESTS,
+                    "Too many pending authorization requests",
+                );
             }
             guard.pending_auths.push_back(pending.clone());
         }
 
-        let cookie = self.build_ar_cookie(&ar_id, &csrf_token, PENDING_AUTH_TTL_SECS);
+        let cookie = build_ar_cookie(
+            self.core.config.public_is_https,
+            &ar_id,
+            &csrf_token,
+            PENDING_AUTH_TTL_SECS,
+        );
         let html = render_authorize_page(&pending, None);
         html_reply_with_cookie(StatusCode::OK, html, Some(&cookie))
     }
 
-    async fn handle_authorize_post(&self, req: Request<Incoming>) -> HttpReply {
+    async fn handle_authorize_post(
+        &self,
+        req: Request<Incoming>,
+        peer_ip: Option<IpAddr>,
+    ) -> HttpReply {
         if !has_media_type(req.headers(), "application/x-www-form-urlencoded") {
             return html_status_reply(
                 StatusCode::BAD_REQUEST,
@@ -826,7 +1088,7 @@ impl OAuthEngine {
             Ok(bytes) => bytes,
             Err(err) => return body_error_html(err),
         };
-        let Ok(form) = parse_unique_form(&body) else {
+        let Ok(mut form) = parse_unique_form(&body) else {
             return html_status_reply(StatusCode::BAD_REQUEST, "Invalid form submission");
         };
 
@@ -836,16 +1098,23 @@ impl OAuthEngine {
         let Some(form_csrf) = form.get("csrf_token").filter(|v| !v.is_empty()) else {
             return html_status_reply(StatusCode::FORBIDDEN, "Missing CSRF token");
         };
-        let password = form.get("password").cloned().unwrap_or_default();
+        let is_deny = match form.get("decision").map(String::as_str) {
+            None | Some("approve") => false,
+            Some("deny") => true,
+            Some(_) => return html_status_reply(StatusCode::BAD_REQUEST, "Invalid decision"),
+        };
 
+        let ip_key = peer_ip.unwrap_or(IpAddr::V4(Ipv4Addr::UNSPECIFIED));
         let now = unix_now();
+
         let pending_snapshot = {
             let mut guard = self
+                .core
                 .inner
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
             guard.prune_ephemeral(now);
-            if guard.pw_failures.len() >= PW_MAX_FAILURES {
+            if !is_deny && guard.ip_pw_failures(&ip_key) >= PW_MAX_FAILURES {
                 return html_status_reply(
                     StatusCode::TOO_MANY_REQUESTS,
                     "Too many failed attempts",
@@ -865,45 +1134,116 @@ impl OAuthEngine {
             );
         };
 
-        let cookie_name = format!("mcp_ar_{}", pending.ar_id);
-        let Some(cookie_csrf) = extract_cookie(&req_headers, &cookie_name) else {
-            return html_status_reply(StatusCode::FORBIDDEN, "Missing session cookie");
-        };
-        if !constant_time_eq_str(&cookie_csrf, &pending.csrf_token)
+        let cookie_name = ar_cookie_name(self.core.config.public_is_https, &pending.ar_id);
+        if !has_valid_csrf_cookie(&req_headers, &cookie_name, &pending.csrf_token)
             || !constant_time_eq_str(form_csrf, &pending.csrf_token)
         {
             return html_status_reply(StatusCode::FORBIDDEN, "CSRF validation failed");
         }
 
-        let _verify_guard = self.pw_verify_gate.lock().await;
-        {
+        if is_deny {
+            let consumed = {
+                let mut guard = self
+                    .core
+                    .inner
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                guard.prune_ephemeral(unix_now());
+                let Some(pos) = guard
+                    .pending_auths
+                    .iter()
+                    .position(|entry| entry.ar_id == pending.ar_id)
+                else {
+                    return html_status_reply(
+                        StatusCode::BAD_REQUEST,
+                        "Authorization request already consumed",
+                    );
+                };
+                guard.pending_auths.remove(pos).expect("position exists")
+            };
+            let clear_cookie =
+                build_ar_cookie(self.core.config.public_is_https, &consumed.ar_id, "", 0);
+            let Ok(mut location) = Url::parse(&consumed.redirect_uri) else {
+                return html_status_reply(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "Invalid redirect target",
+                );
+            };
+            {
+                let mut pairs = location.query_pairs_mut();
+                pairs.append_pair("error", "access_denied");
+                pairs.append_pair("iss", &self.core.config.public_url);
+                if let Some(st) = &consumed.state {
+                    pairs.append_pair("state", st);
+                }
+            }
+            return finish_authorize_redirect(&req_headers, &clear_cookie, &location);
+        }
+
+        let mut password = form.remove("password").unwrap_or_default();
+        let _verify_guard = self.core.pw_verify_gate.lock().await;
+        let should_pace = {
             let mut guard = self
+                .core
                 .inner
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
             let check_now = unix_now();
             guard.prune_ephemeral(check_now);
-            if guard.pw_failures.len() >= PW_MAX_FAILURES {
+            if guard.ip_pw_failures(&ip_key) >= PW_MAX_FAILURES {
+                zeroize_string(&mut password);
                 return html_status_reply(
                     StatusCode::TOO_MANY_REQUESTS,
                     "Too many failed attempts",
                 );
             }
+            peer_ip.is_some() && guard.total_pw_failures() >= PW_MAX_FAILURES
+        };
+
+        if should_pace {
+            tokio::time::sleep(PW_GLOBAL_PACE_DELAY).await;
         }
 
-        let verifier = self.config.oauth.verifier.clone();
-        let pw_valid = tokio::task::spawn_blocking(move || verifier.verify(&password))
-            .await
-            .unwrap_or(false);
+        let verifier = self.core.config.oauth.verifier.clone();
+        let pw_valid = tokio::task::spawn_blocking(move || {
+            let valid = verifier.verify(&password);
+            zeroize_string(&mut password);
+            valid
+        })
+        .await
+        .unwrap_or(false);
 
         let finish_now = unix_now();
         if !pw_valid {
-            let mut guard = self
-                .inner
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
-            guard.prune_ephemeral(finish_now);
-            guard.pw_failures.push_back(Instant::now());
+            let mut burned = false;
+            {
+                let mut guard = self
+                    .core
+                    .inner
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                guard.prune_ephemeral(finish_now);
+                guard.record_pw_failure(ip_key);
+                if let Some(pos) = guard
+                    .pending_auths
+                    .iter()
+                    .position(|entry| entry.ar_id == pending.ar_id)
+                {
+                    guard.pending_auths[pos].attempts =
+                        guard.pending_auths[pos].attempts.saturating_add(1);
+                    if guard.pending_auths[pos].attempts >= MAX_AR_ATTEMPTS {
+                        guard.pending_auths.remove(pos);
+                        burned = true;
+                    }
+                }
+            }
+            if burned {
+                let clear_cookie =
+                    build_ar_cookie(self.core.config.public_is_https, &pending.ar_id, "", 0);
+                let html =
+                    render_authorize_page(&pending, Some("Maximum password attempts exceeded"));
+                return html_reply_with_cookie(StatusCode::UNAUTHORIZED, html, Some(&clear_cookie));
+            }
             let html = render_authorize_page(&pending, Some("Incorrect password"));
             return html_reply_with_cookie(StatusCode::UNAUTHORIZED, html, None);
         }
@@ -915,6 +1255,7 @@ impl OAuthEngine {
 
         let consumed = {
             let mut guard = self
+                .core
                 .inner
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
@@ -957,42 +1298,21 @@ impl OAuthEngine {
             entry
         };
 
-        let clear_cookie = self.build_ar_cookie(&consumed.ar_id, "", 0);
+        let clear_cookie =
+            build_ar_cookie(self.core.config.public_is_https, &consumed.ar_id, "", 0);
         let Ok(mut location) = Url::parse(&consumed.redirect_uri) else {
             return html_status_reply(StatusCode::INTERNAL_SERVER_ERROR, "Invalid redirect target");
         };
         {
             let mut pairs = location.query_pairs_mut();
             pairs.append_pair("code", &raw_code);
-            pairs.append_pair("iss", &self.config.public_url);
+            pairs.append_pair("iss", &self.core.config.public_url);
             if let Some(st) = &consumed.state {
                 pairs.append_pair("state", st);
             }
         }
 
-        if req_headers
-            .get("sec-fetch-mode")
-            .is_some_and(|mode| mode == "navigate")
-        {
-            // Chromium applies form-action to the POST redirect chain. A new document
-            // can navigate to the registered callback without sending the form body.
-            let callback = escape_html(location.as_str());
-            let html = format!(
-                "<!DOCTYPE html><html lang=\"en\"><head><meta charset=\"utf-8\">\
-                 <title>Return to the app</title><meta http-equiv=\"refresh\" content=\"0;url={callback}\">\
-                 </head><body><a href=\"{callback}\">Return to the app</a></body></html>"
-            );
-            return html_reply_with_cookie(StatusCode::OK, html, Some(&clear_cookie));
-        }
-
-        Response::builder()
-            .status(StatusCode::SEE_OTHER)
-            .header(header::LOCATION, location.as_str())
-            .header(header::SET_COOKIE, clear_cookie)
-            .header(header::CACHE_CONTROL, "no-store")
-            .header(header::REFERRER_POLICY, "no-referrer")
-            .body(empty_body())
-            .expect("valid 303 response")
+        finish_authorize_redirect(&req_headers, &clear_cookie, &location)
     }
 
     async fn handle_token(&self, req: Request<Incoming>) -> HttpReply {
@@ -1022,8 +1342,8 @@ impl OAuthEngine {
         };
 
         match form.get("grant_type").map(String::as_str) {
-            Some("authorization_code") => self.handle_token_auth_code(&client, &form).await,
-            Some("refresh_token") => self.handle_token_refresh(&client, &form).await,
+            Some("authorization_code") => self.handle_token_auth_code(client, form).await,
+            Some("refresh_token") => self.handle_token_refresh(client, form).await,
             Some(_) => oauth_error(
                 StatusCode::BAD_REQUEST,
                 "unsupported_grant_type",
@@ -1039,8 +1359,8 @@ impl OAuthEngine {
 
     async fn handle_token_auth_code(
         &self,
-        client: &RegisteredClient,
-        form: &BTreeMap<String, String>,
+        client: RegisteredClient,
+        form: BTreeMap<String, String>,
     ) -> HttpReply {
         if !client.grant_types.iter().any(|g| g == "authorization_code") {
             return oauth_error(
@@ -1049,7 +1369,7 @@ impl OAuthEngine {
                 "client is not authorized for authorization_code",
             );
         }
-        let Some(raw_code) = form.get("code").filter(|c| !c.is_empty()) else {
+        let Some(raw_code) = form.get("code").filter(|c| !c.is_empty()).cloned() else {
             return oauth_error(
                 StatusCode::BAD_REQUEST,
                 "invalid_request",
@@ -1057,252 +1377,308 @@ impl OAuthEngine {
             );
         };
 
-        let code_hash = sha256_b64(raw_code);
-        let _persist_guard = self.persist_lock.lock().await;
-        let now = unix_now();
+        let code_hash = sha256_b64(&raw_code);
 
-        enum AuthCodePlan {
-            Replay {
-                grant_id: String,
-                snapshot: Option<PersistedState>,
-            },
-            Issue {
-                snapshot: PersistedState,
-                grant_id: String,
-                access_token: String,
-                refresh_token: Option<String>,
-                access_ttl: u64,
-                scopes: Vec<String>,
-            },
-            Reply(EarlyReply),
-        }
+        self.run_uncancellable(move |core| async move {
+            let now = unix_now();
 
-        let plan = {
-            let mut guard = self
-                .inner
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
-            guard.persisted.prune_expired(now);
-            guard.prune_ephemeral(now);
-
-            if let Some(replayed_grant_id) = guard
-                .consumed_codes
-                .iter()
-                .find(|c| constant_time_eq_str(&c.code_sha256, &code_hash))
-                .map(|c| c.grant_id.clone())
-            {
-                let mut snapshot = guard.persisted.clone();
-                let before = snapshot.grants.len();
-                snapshot.grants.retain(|g| g.grant_id != replayed_grant_id);
-                let changed = snapshot.grants.len() != before;
-                if !changed {
-                    guard
-                        .grace_cache
-                        .retain(|_, e| e.grant_id != replayed_grant_id);
-                }
-                AuthCodePlan::Replay {
-                    grant_id: replayed_grant_id,
-                    snapshot: changed.then_some(snapshot),
-                }
-            } else {
-                let mut make_plan = || -> AuthCodePlan {
-                    let Some(code_verifier) = form.get("code_verifier").filter(|v| !v.is_empty())
-                    else {
-                        return AuthCodePlan::Reply(Box::new(oauth_error(
-                            StatusCode::BAD_REQUEST,
-                            "invalid_request",
-                            "code_verifier is required",
-                        )));
-                    };
-
-                    let requested_resource = match form.get("resource") {
-                        None => None,
-                        Some(raw_res) => match self.normalize_resource(Some(raw_res)) {
-                            Ok(norm) => Some(norm),
-                            Err(()) => {
-                                return AuthCodePlan::Reply(Box::new(oauth_error(
-                                    StatusCode::BAD_REQUEST,
-                                    "invalid_target",
-                                    "invalid resource target",
-                                )));
-                            }
-                        },
-                    };
-
-                    let Some(code_pos) = guard
-                        .auth_codes
-                        .iter()
-                        .position(|entry| constant_time_eq_str(&entry.code_sha256, &code_hash))
-                    else {
-                        return AuthCodePlan::Reply(Box::new(oauth_error(
-                            StatusCode::BAD_REQUEST,
-                            "invalid_grant",
-                            "unknown or expired authorization code",
-                        )));
-                    };
-                    let code_entry = guard.auth_codes.remove(code_pos).expect("position exists");
-
-                    if code_entry.client_id != client.client_id {
-                        return AuthCodePlan::Reply(Box::new(oauth_error(
-                            StatusCode::BAD_REQUEST,
-                            "invalid_grant",
-                            "authorization code was not issued to this client",
-                        )));
-                    }
-                    if form.get("redirect_uri").map(String::as_str)
-                        != Some(code_entry.redirect_uri.as_str())
-                    {
-                        return AuthCodePlan::Reply(Box::new(oauth_error(
-                            StatusCode::BAD_REQUEST,
-                            "invalid_grant",
-                            "redirect_uri mismatch",
-                        )));
-                    }
-                    if let Some(res) = requested_resource
-                        && res != code_entry.resource
-                    {
-                        return AuthCodePlan::Reply(Box::new(oauth_error(
-                            StatusCode::BAD_REQUEST,
-                            "invalid_target",
-                            "resource mismatch",
-                        )));
-                    }
-                    if !verify_pkce_s256(code_verifier, &code_entry.code_challenge) {
-                        return AuthCodePlan::Reply(Box::new(oauth_error(
-                            StatusCode::BAD_REQUEST,
-                            "invalid_grant",
-                            "PKCE verification failed",
-                        )));
-                    }
-                    if guard.persisted.grants.len() >= MAX_ACTIVE_GRANTS {
-                        return AuthCodePlan::Reply(Box::new(oauth_error(
-                            StatusCode::TOO_MANY_REQUESTS,
-                            "temporarily_unavailable",
-                            "maximum active grants reached",
-                        )));
-                    }
-
-                    let (Ok(grant_suffix), Ok(access_token), Ok(refresh_token)) = (
-                        random_token_b64(18),
-                        random_token_b64(32),
-                        random_token_b64(32),
-                    ) else {
-                        return AuthCodePlan::Reply(Box::new(oauth_error(
-                            StatusCode::INTERNAL_SERVER_ERROR,
-                            "server_error",
-                            "random generation failed",
-                        )));
-                    };
-
-                    let grant_id = format!("grt_{grant_suffix}");
-                    let pool_slot = guard.select_pool_slot(self.config.upstream.pool_size());
-                    let access_ttl = self.config.oauth.access_token_ttl_secs;
-                    let refresh_ttl = self.config.oauth.refresh_token_ttl_secs;
-                    let issue_refresh = client.grant_types.iter().any(|g| g == "refresh_token");
-
-                    let mut refresh_tokens = Vec::new();
-                    if issue_refresh {
-                        refresh_tokens.push(RefreshTokenRecord {
-                            token_sha256: sha256_b64(&refresh_token),
-                            expires_at: now.saturating_add(refresh_ttl),
-                            grace_until: None,
-                        });
-                    }
-
-                    let grant = GrantRecord {
-                        grant_id: grant_id.clone(),
-                        client_id: client.client_id.clone(),
-                        pool_slot,
-                        scopes: code_entry.scopes.clone(),
-                        resource: code_entry.resource,
-                        access_tokens: vec![AccessTokenRecord {
-                            token_sha256: sha256_b64(&access_token),
-                            expires_at: now.saturating_add(access_ttl),
-                        }],
-                        refresh_tokens,
-                    };
-
-                    let mut snapshot = guard.persisted.clone();
-                    snapshot.grants.push(grant);
-                    AuthCodePlan::Issue {
-                        snapshot,
-                        grant_id,
-                        access_token,
-                        refresh_token: issue_refresh.then_some(refresh_token),
-                        access_ttl,
-                        scopes: code_entry.scopes,
-                    }
-                };
-                make_plan()
+            enum AuthCodePlan {
+                Replay {
+                    grant_id: String,
+                    snapshot: Option<PersistedState>,
+                },
+                Issue {
+                    snapshot: PersistedState,
+                    grant_id: String,
+                    access_token: String,
+                    refresh_token: Option<String>,
+                    expires_in: u64,
+                    scopes: Vec<String>,
+                },
+                Reply(EarlyReply),
             }
-        };
 
-        match plan {
-            AuthCodePlan::Reply(reply) => *reply,
-            AuthCodePlan::Replay { grant_id, snapshot } => {
-                if let Some(snap) = snapshot {
-                    let Ok(persisted) = self.persist_snapshot(snap).await else {
+            let plan = {
+                let mut guard = core
+                    .inner
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                guard.prune_persisted(now);
+                guard.prune_ephemeral(now);
+
+                let replayed = guard
+                    .consumed_codes
+                    .iter()
+                    .find(|c| constant_time_eq_str(&c.code_sha256, &code_hash))
+                    .map(|c| c.grant_id.clone())
+                    .or_else(|| {
+                        guard.persisted.grants.iter().find_map(|g| {
+                            let (h, exp) = g.consumed_code_sha256.as_ref()?;
+                            (*exp > now && constant_time_eq_str(h, &code_hash))
+                                .then(|| g.grant_id.clone())
+                        })
+                    });
+
+                if let Some(replayed_grant_id) = replayed {
+                    guard.record_consumed_code(
+                        code_hash.clone(),
+                        replayed_grant_id.clone(),
+                        now.saturating_add(CONSUMED_CODE_TTL_SECS),
+                    );
+                    let snapshot = guard.remove_grant_immediate(&replayed_grant_id);
+                    AuthCodePlan::Replay {
+                        grant_id: replayed_grant_id,
+                        snapshot,
+                    }
+                } else {
+                    let mut make_plan = || -> AuthCodePlan {
+                        let Some(code_verifier) =
+                            form.get("code_verifier").filter(|v| !v.is_empty())
+                        else {
+                            return AuthCodePlan::Reply(Box::new(oauth_error(
+                                StatusCode::BAD_REQUEST,
+                                "invalid_request",
+                                "code_verifier is required",
+                            )));
+                        };
+
+                        let requested_resource = match form.get("resource") {
+                            None => None,
+                            Some(raw_res) => {
+                                match normalize_resource(&core.config, Some(raw_res)) {
+                                    Ok(norm) => Some(norm),
+                                    Err(()) => {
+                                        return AuthCodePlan::Reply(Box::new(oauth_error(
+                                            StatusCode::BAD_REQUEST,
+                                            "invalid_target",
+                                            "invalid resource target",
+                                        )));
+                                    }
+                                }
+                            }
+                        };
+
+                        let Some(code_pos) = guard
+                            .auth_codes
+                            .iter()
+                            .position(|entry| constant_time_eq_str(&entry.code_sha256, &code_hash))
+                        else {
+                            return AuthCodePlan::Reply(Box::new(oauth_error(
+                                StatusCode::BAD_REQUEST,
+                                "invalid_grant",
+                                "unknown or expired authorization code",
+                            )));
+                        };
+
+                        let (
+                            code_client_id,
+                            code_redirect_uri,
+                            code_resource,
+                            code_challenge,
+                            code_scopes,
+                        ) = {
+                            let entry = &guard.auth_codes[code_pos];
+                            (
+                                entry.client_id.clone(),
+                                entry.redirect_uri.clone(),
+                                entry.resource.clone(),
+                                entry.code_challenge.clone(),
+                                entry.scopes.clone(),
+                            )
+                        };
+
+                        if code_client_id != client.client_id {
+                            guard.auth_codes.remove(code_pos);
+                            return AuthCodePlan::Reply(Box::new(oauth_error(
+                                StatusCode::BAD_REQUEST,
+                                "invalid_grant",
+                                "authorization code was not issued to this client",
+                            )));
+                        }
+                        if form.get("redirect_uri").map(String::as_str)
+                            != Some(code_redirect_uri.as_str())
+                        {
+                            guard.auth_codes.remove(code_pos);
+                            return AuthCodePlan::Reply(Box::new(oauth_error(
+                                StatusCode::BAD_REQUEST,
+                                "invalid_grant",
+                                "redirect_uri mismatch",
+                            )));
+                        }
+                        if let Some(res) = requested_resource
+                            && res != code_resource
+                        {
+                            guard.auth_codes.remove(code_pos);
+                            return AuthCodePlan::Reply(Box::new(oauth_error(
+                                StatusCode::BAD_REQUEST,
+                                "invalid_target",
+                                "resource mismatch",
+                            )));
+                        }
+                        if !verify_pkce_s256(code_verifier, &code_challenge) {
+                            guard.auth_codes.remove(code_pos);
+                            return AuthCodePlan::Reply(Box::new(oauth_error(
+                                StatusCode::BAD_REQUEST,
+                                "invalid_grant",
+                                "PKCE verification failed",
+                            )));
+                        }
+                        if guard.persisted.grants.len() >= MAX_ACTIVE_GRANTS {
+                            return AuthCodePlan::Reply(Box::new(oauth_error(
+                                StatusCode::TOO_MANY_REQUESTS,
+                                "temporarily_unavailable",
+                                "maximum active grants reached",
+                            )));
+                        }
+
+                        let (Ok(grant_suffix), Ok(access_token), Ok(family_key_b64)) = (
+                            random_token_b64(18),
+                            random_token_b64(32),
+                            random_token_b64(32),
+                        ) else {
+                            return AuthCodePlan::Reply(Box::new(oauth_error(
+                                StatusCode::INTERNAL_SERVER_ERROR,
+                                "server_error",
+                                "random generation failed",
+                            )));
+                        };
+
+                        let grant_id = format!("grt_{grant_suffix}");
+                        let max_expires_at =
+                            now.saturating_add(core.config.oauth.max_grant_lifetime_secs);
+                        let access_ttl = core.config.oauth.access_token_ttl_secs;
+                        let refresh_ttl = core.config.oauth.refresh_token_ttl_secs;
+                        let a0_expires_at = now.saturating_add(access_ttl).min(max_expires_at);
+                        let issue_refresh = client.grant_types.iter().any(|g| g == "refresh_token");
+
+                        let (refresh_token, current_refresh) = if issue_refresh {
+                            let Ok(rt0) = mint_refresh_token(&grant_id, 0, &family_key_b64) else {
+                                return AuthCodePlan::Reply(Box::new(oauth_error(
+                                    StatusCode::INTERNAL_SERVER_ERROR,
+                                    "server_error",
+                                    "random generation failed",
+                                )));
+                            };
+                            let r0_expires_at = now.saturating_add(refresh_ttl).min(max_expires_at);
+                            let rec = RefreshTokenRecord {
+                                r#gen: 0,
+                                token_sha256: sha256_b64(&rt0),
+                                expires_at: r0_expires_at,
+                            };
+                            (Some(rt0), Some(rec))
+                        } else {
+                            (None, None)
+                        };
+
+                        let pool_slot = guard.select_pool_slot(core.config.upstream.pool_size());
+                        let grant = GrantRecord {
+                            grant_id: grant_id.clone(),
+                            client_id: client.client_id.clone(),
+                            pool_slot,
+                            scopes: code_scopes.clone(),
+                            resource: code_resource,
+                            issued_at: now,
+                            max_expires_at,
+                            family_key_b64,
+                            current_gen: 0,
+                            current_refresh,
+                            grace_refreshes: Vec::new(),
+                            access_tokens: vec![AccessTokenRecord {
+                                token_sha256: sha256_b64(&access_token),
+                                expires_at: a0_expires_at,
+                                scopes: code_scopes.clone(),
+                            }],
+                            consumed_code_sha256: Some((
+                                code_hash.clone(),
+                                now.saturating_add(CONSUMED_CODE_TTL_SECS),
+                            )),
+                        };
+
+                        let mut snapshot = guard.persisted.clone();
+                        snapshot.grants.push(grant);
+                        AuthCodePlan::Issue {
+                            snapshot,
+                            grant_id,
+                            access_token,
+                            refresh_token,
+                            expires_in: a0_expires_at.saturating_sub(now).max(1),
+                            scopes: code_scopes,
+                        }
+                    };
+                    make_plan()
+                }
+            };
+
+            match plan {
+                AuthCodePlan::Reply(reply) => *reply,
+                AuthCodePlan::Replay { grant_id, snapshot } => {
+                    if let Some(snap) = snapshot {
+                        core.notify_revoke(&grant_id);
+                        if persist_snapshot(&core.store, snap).await.is_err() {
+                            return oauth_error(
+                                StatusCode::INTERNAL_SERVER_ERROR,
+                                "server_error",
+                                "failed to persist grant revocation",
+                            );
+                        }
+                    }
+                    oauth_error(
+                        StatusCode::BAD_REQUEST,
+                        "invalid_grant",
+                        "authorization code has already been used",
+                    )
+                }
+                AuthCodePlan::Issue {
+                    snapshot,
+                    grant_id,
+                    access_token,
+                    refresh_token,
+                    expires_in,
+                    scopes,
+                } => {
+                    let Ok(persisted) = persist_snapshot(&core.store, snapshot).await else {
                         return oauth_error(
                             StatusCode::INTERNAL_SERVER_ERROR,
                             "server_error",
-                            "failed to persist grant revocation",
+                            "failed to persist token grant",
                         );
                     };
                     {
-                        let mut guard = self
+                        let mut guard = core
                             .inner
                             .lock()
                             .unwrap_or_else(|poisoned| poisoned.into_inner());
                         guard.persisted = persisted;
-                        guard.grace_cache.retain(|_, e| e.grant_id != grant_id);
+                        guard.sync_indexes();
+                        if let Some(pos) = guard
+                            .auth_codes
+                            .iter()
+                            .position(|entry| constant_time_eq_str(&entry.code_sha256, &code_hash))
+                        {
+                            guard.auth_codes.remove(pos);
+                        }
+                        guard.record_consumed_code(
+                            code_hash,
+                            grant_id,
+                            now.saturating_add(CONSUMED_CODE_TTL_SECS),
+                        );
                     }
-                    self.notify_revoke(&grant_id);
+                    token_success_reply(
+                        &access_token,
+                        expires_in,
+                        refresh_token.as_deref(),
+                        &scopes,
+                    )
                 }
-                oauth_error(
-                    StatusCode::BAD_REQUEST,
-                    "invalid_grant",
-                    "authorization code has already been used",
-                )
             }
-            AuthCodePlan::Issue {
-                snapshot,
-                grant_id,
-                access_token,
-                refresh_token,
-                access_ttl,
-                scopes,
-            } => {
-                let Ok(persisted) = self.persist_snapshot(snapshot).await else {
-                    return oauth_error(
-                        StatusCode::INTERNAL_SERVER_ERROR,
-                        "server_error",
-                        "failed to persist token grant",
-                    );
-                };
-                {
-                    let mut guard = self
-                        .inner
-                        .lock()
-                        .unwrap_or_else(|poisoned| poisoned.into_inner());
-                    guard.persisted = persisted;
-                    while guard.consumed_codes.len() >= MAX_CONSUMED_CODES {
-                        guard.consumed_codes.pop_front();
-                    }
-                    guard.consumed_codes.push_back(ConsumedCodeEntry {
-                        code_sha256: code_hash,
-                        grant_id,
-                        expires_at: now.saturating_add(CONSUMED_CODE_TTL_SECS),
-                    });
-                }
-                token_success_reply(&access_token, access_ttl, refresh_token.as_deref(), &scopes)
-            }
-        }
+        })
+        .await
     }
 
     async fn handle_token_refresh(
         &self,
-        client: &RegisteredClient,
-        form: &BTreeMap<String, String>,
+        client: RegisteredClient,
+        form: BTreeMap<String, String>,
     ) -> HttpReply {
         if !client.grant_types.iter().any(|g| g == "refresh_token") {
             return oauth_error(
@@ -1311,7 +1687,7 @@ impl OAuthEngine {
                 "client is not authorized for refresh_token",
             );
         }
-        let Some(raw_rt) = form.get("refresh_token").filter(|t| !t.is_empty()) else {
+        let Some(raw_rt) = form.get("refresh_token").filter(|t| !t.is_empty()).cloned() else {
             return oauth_error(
                 StatusCode::BAD_REQUEST,
                 "invalid_request",
@@ -1319,312 +1695,273 @@ impl OAuthEngine {
             );
         };
 
-        let rt_hash = sha256_b64(raw_rt);
-        let _persist_guard = self.persist_lock.lock().await;
-        let now = unix_now();
+        self.run_uncancellable(move |core| async move {
+            let Some(parsed) = parse_refresh_token(&raw_rt) else {
+                return oauth_error(
+                    StatusCode::BAD_REQUEST,
+                    "invalid_grant",
+                    "unknown or expired refresh token",
+                );
+            };
+            let rt_hash = sha256_b64(&raw_rt);
+            let now = unix_now();
 
-        enum RefreshPlan {
-            Reply(EarlyReply),
-            RevokeReplay {
-                grant_id: String,
-                snapshot: PersistedState,
-            },
-            PersistGraceFallback {
-                snapshot: PersistedState,
-                cache_entry: GraceCacheEntry,
-                access_token: String,
-                refresh_token: String,
-                access_ttl: u64,
-                scopes: Vec<String>,
-            },
-            PersistRotation {
-                snapshot: PersistedState,
-                cache_entry: Option<GraceCacheEntry>,
-                access_token: String,
-                refresh_token: String,
-                access_ttl: u64,
-                scopes: Vec<String>,
-            },
-        }
+            enum RefreshPlan {
+                Reply(EarlyReply),
+                RevokeReplay {
+                    grant_id: String,
+                    snapshot: PersistedState,
+                },
+                PersistTip {
+                    snapshot: PersistedState,
+                    grant_id: String,
+                    tip: RotatedTip,
+                },
+            }
 
-        let plan = {
-            let mut guard = self
-                .inner
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
-            guard.persisted.prune_expired(now);
-            guard.prune_ephemeral(now);
+            let plan = {
+                let mut guard = core
+                    .inner
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                guard.prune_persisted(now);
+                guard.prune_ephemeral(now);
 
-            let make_plan = || -> RefreshPlan {
-                let mut matched: Option<(usize, usize)> = None;
-                for (g_idx, grant) in guard.persisted.grants.iter().enumerate() {
-                    for (r_idx, rt) in grant.refresh_tokens.iter().enumerate() {
-                        if rt.expires_at > now && constant_time_eq_str(&rt.token_sha256, &rt_hash) {
-                            matched = Some((g_idx, r_idx));
-                            break;
-                        }
-                    }
-                    if matched.is_some() {
-                        break;
-                    }
-                }
-
-                let Some((grant_idx, rt_idx)) = matched else {
-                    return RefreshPlan::Reply(Box::new(oauth_error(
-                        StatusCode::BAD_REQUEST,
-                        "invalid_grant",
-                        "unknown or expired refresh token",
-                    )));
-                };
-
-                if guard.persisted.grants[grant_idx].client_id != client.client_id {
-                    return RefreshPlan::Reply(Box::new(oauth_error(
-                        StatusCode::BAD_REQUEST,
-                        "invalid_grant",
-                        "refresh token was not issued to this client",
-                    )));
-                }
-
-                if guard.persisted.grants[grant_idx].resource != self.config.mcp_resource_url() {
-                    return RefreshPlan::Reply(Box::new(oauth_error(
-                        StatusCode::BAD_REQUEST,
-                        "invalid_grant",
-                        "refresh token targets a previous resource URL",
-                    )));
-                }
-
-                let existing_grace =
-                    guard.persisted.grants[grant_idx].refresh_tokens[rt_idx].grace_until;
-                let r0_expires_at =
-                    guard.persisted.grants[grant_idx].refresh_tokens[rt_idx].expires_at;
-                let grant_id = guard.persisted.grants[grant_idx].grant_id.clone();
-
-                if let Some(gu) = existing_grace {
-                    let within_grace = self.config.oauth.refresh_grace_secs > 0 && now <= gu;
-                    if !within_grace {
-                        let mut snapshot = guard.persisted.clone();
-                        snapshot.grants.retain(|g| g.grant_id != grant_id);
-                        return RefreshPlan::RevokeReplay { grant_id, snapshot };
-                    }
-
-                    let grant = &guard.persisted.grants[grant_idx];
-                    let effective_scopes =
-                        match self.validate_refresh_scope_and_resource(grant, form) {
-                            Ok(scopes) => scopes,
-                            Err(reply) => return RefreshPlan::Reply(reply),
-                        };
-                    if effective_scopes.len() != grant.scopes.len() {
+                let mut make_plan = || -> RefreshPlan {
+                    let Some(&grant_idx) = guard.grant_index.get(parsed.grant_id) else {
                         return RefreshPlan::Reply(Box::new(oauth_error(
                             StatusCode::BAD_REQUEST,
-                            "invalid_scope",
-                            "refresh retry cannot narrow the current scope",
+                            "invalid_grant",
+                            "unknown or expired refresh token",
+                        )));
+                    };
+                    let grant = &guard.persisted.grants[grant_idx];
+                    if !verify_refresh_family_tag(&parsed, &grant.family_key_b64) {
+                        return RefreshPlan::Reply(Box::new(oauth_error(
+                            StatusCode::BAD_REQUEST,
+                            "invalid_grant",
+                            "unknown or expired refresh token",
+                        )));
+                    }
+                    if grant.client_id != client.client_id {
+                        return RefreshPlan::Reply(Box::new(oauth_error(
+                            StatusCode::BAD_REQUEST,
+                            "invalid_grant",
+                            "refresh token was not issued to this client",
+                        )));
+                    }
+                    if grant.resource != core.config.mcp_resource_url() {
+                        return RefreshPlan::Reply(Box::new(oauth_error(
+                            StatusCode::BAD_REQUEST,
+                            "invalid_grant",
+                            "refresh token targets a previous resource URL",
+                        )));
+                    }
+                    if now >= grant.max_expires_at {
+                        return RefreshPlan::Reply(Box::new(oauth_error(
+                            StatusCode::BAD_REQUEST,
+                            "invalid_grant",
+                            "grant has reached maximum lifetime",
                         )));
                     }
 
-                    if let Some(cached) = guard.grace_cache.get(&rt_hash).cloned()
-                        && cached.a1_expires_at > now
-                        && cached.scopes.len() == grant.scopes.len()
-                        && cached
-                            .scopes
-                            .iter()
-                            .all(|scope| grant.scopes.contains(scope))
+                    let grant_id = grant.grant_id.clone();
+                    let grace_secs = core.config.oauth.refresh_grace_secs;
+
+                    if parsed.r#gen > grant.current_gen {
+                        return RefreshPlan::Reply(Box::new(oauth_error(
+                            StatusCode::BAD_REQUEST,
+                            "invalid_grant",
+                            "unknown or expired refresh token",
+                        )));
+                    }
+
+                    if parsed.r#gen < grant.current_gen {
+                        let within_grace = grace_secs > 0
+                            && grant.grace_refreshes.iter().any(|gr| {
+                                gr.r#gen == parsed.r#gen
+                                    && now <= gr.grace_until
+                                    && constant_time_eq_str(&gr.token_sha256, &rt_hash)
+                            });
+                        if !within_grace
+                            && core.config.oauth.refresh_reuse_policy == RefreshReusePolicy::Revoke
+                        {
+                            let snap = guard
+                                .remove_grant_immediate(&grant_id)
+                                .expect("grant_idx matched");
+                            return RefreshPlan::RevokeReplay {
+                                grant_id,
+                                snapshot: snap,
+                            };
+                        }
+
+                        // Ensure the active tip has not expired before converging an older generation.
+                        let tip_live = grant.current_refresh.as_ref().is_some_and(|cur| {
+                            cur.r#gen == grant.current_gen && cur.expires_at > now
+                        });
+                        if !tip_live {
+                            return RefreshPlan::Reply(Box::new(oauth_error(
+                                StatusCode::BAD_REQUEST,
+                                "invalid_grant",
+                                "unknown or expired refresh token",
+                            )));
+                        }
+
+                        let effective_scopes =
+                            match validate_refresh_scope_and_resource(&core.config, grant, &form) {
+                                Ok(scopes) => scopes,
+                                Err(reply) => return RefreshPlan::Reply(reply),
+                            };
+                        if within_grace && effective_scopes.len() != grant.scopes.len() {
+                            return RefreshPlan::Reply(Box::new(oauth_error(
+                                StatusCode::BAD_REQUEST,
+                                "invalid_scope",
+                                "refresh retry cannot narrow the current scope",
+                            )));
+                        }
+
+                        if let Some(cached) = guard.grace_cache.get(&grant_id).cloned()
+                            && cached.tip_gen == grant.current_gen
+                            && cached.a_expires_at > now
+                            && cached.scopes.len() == effective_scopes.len()
+                            && cached.scopes.iter().all(|s| effective_scopes.contains(s))
+                        {
+                            let rem_ttl = cached.a_expires_at.saturating_sub(now).max(1);
+                            return RefreshPlan::Reply(Box::new(token_success_reply(
+                                &cached.access_token,
+                                rem_ttl,
+                                Some(&cached.refresh_token),
+                                &cached.scopes,
+                            )));
+                        }
+
+                        let mut snapshot = guard.persisted.clone();
+                        let target_grant = &mut snapshot.grants[grant_idx];
+                        let Ok(tip) = rotate_grant_tip(
+                            target_grant,
+                            effective_scopes,
+                            now,
+                            core.config.oauth.access_token_ttl_secs,
+                            core.config.oauth.refresh_token_ttl_secs,
+                            grace_secs,
+                            core.config.oauth.refresh_reuse_policy,
+                        ) else {
+                            return RefreshPlan::Reply(Box::new(oauth_error(
+                                StatusCode::INTERNAL_SERVER_ERROR,
+                                "server_error",
+                                "random generation failed",
+                            )));
+                        };
+
+                        return RefreshPlan::PersistTip {
+                            snapshot,
+                            grant_id,
+                            tip,
+                        };
+                    }
+
+                    // Active tip: parsed.gen == grant.current_gen.
+                    let Some(cur_rt) = &grant.current_refresh else {
+                        return RefreshPlan::Reply(Box::new(oauth_error(
+                            StatusCode::BAD_REQUEST,
+                            "invalid_grant",
+                            "unknown or expired refresh token",
+                        )));
+                    };
+                    if cur_rt.r#gen != grant.current_gen
+                        || cur_rt.expires_at <= now
+                        || !constant_time_eq_str(&cur_rt.token_sha256, &rt_hash)
                     {
-                        let rem_ttl = cached.a1_expires_at.saturating_sub(now).max(1);
-                        return RefreshPlan::Reply(Box::new(token_success_reply(
-                            &cached.access_token,
-                            rem_ttl,
-                            Some(&cached.refresh_token),
-                            &cached.scopes,
+                        return RefreshPlan::Reply(Box::new(oauth_error(
+                            StatusCode::BAD_REQUEST,
+                            "invalid_grant",
+                            "unknown or expired refresh token",
                         )));
                     }
 
-                    let (Ok(a_re), Ok(r_re)) = (random_token_b64(32), random_token_b64(32)) else {
+                    let effective_scopes =
+                        match validate_refresh_scope_and_resource(&core.config, grant, &form) {
+                            Ok(s) => s,
+                            Err(reply) => return RefreshPlan::Reply(reply),
+                        };
+
+                    let mut snapshot = guard.persisted.clone();
+                    let target_grant = &mut snapshot.grants[grant_idx];
+                    let Ok(tip) = rotate_grant_tip(
+                        target_grant,
+                        effective_scopes,
+                        now,
+                        core.config.oauth.access_token_ttl_secs,
+                        core.config.oauth.refresh_token_ttl_secs,
+                        grace_secs,
+                        core.config.oauth.refresh_reuse_policy,
+                    ) else {
                         return RefreshPlan::Reply(Box::new(oauth_error(
                             StatusCode::INTERNAL_SERVER_ERROR,
                             "server_error",
                             "random generation failed",
                         )));
                     };
-                    let access_ttl = self.config.oauth.access_token_ttl_secs;
-                    let refresh_ttl = self.config.oauth.refresh_token_ttl_secs;
-                    let a_re_expires = now.saturating_add(access_ttl);
-                    let ceiling = guard.persisted.grants[grant_idx]
-                        .refresh_tokens
-                        .iter()
-                        .filter(|rt| rt.grace_until.is_none())
-                        .map(|rt| rt.expires_at)
-                        .max();
-                    let r_re_expires = ceiling
-                        .unwrap_or_else(|| now.saturating_add(refresh_ttl))
-                        .min(now.saturating_add(refresh_ttl));
 
-                    let mut snapshot = guard.persisted.clone();
-                    let target_grant = &mut snapshot.grants[grant_idx];
-                    target_grant.access_tokens.push(AccessTokenRecord {
-                        token_sha256: sha256_b64(&a_re),
-                        expires_at: a_re_expires,
-                    });
-                    target_grant.refresh_tokens.push(RefreshTokenRecord {
-                        token_sha256: sha256_b64(&r_re),
-                        expires_at: r_re_expires,
-                        grace_until: None,
-                    });
-                    trim_rotated_refresh_history(target_grant);
-                    let scopes = target_grant.scopes.clone();
-
-                    return RefreshPlan::PersistGraceFallback {
+                    RefreshPlan::PersistTip {
                         snapshot,
-                        cache_entry: GraceCacheEntry {
-                            grant_id,
-                            access_token: a_re.clone(),
-                            refresh_token: r_re.clone(),
-                            a1_expires_at: a_re_expires,
-                            scopes: scopes.clone(),
-                            grace_until: gu,
-                        },
-                        access_token: a_re,
-                        refresh_token: r_re,
-                        access_ttl,
-                        scopes,
-                    };
-                }
-
-                let effective_scopes = match self
-                    .validate_refresh_scope_and_resource(&guard.persisted.grants[grant_idx], form)
-                {
-                    Ok(s) => s,
-                    Err(reply) => return RefreshPlan::Reply(reply),
-                };
-
-                let (Ok(a1), Ok(r1)) = (random_token_b64(32), random_token_b64(32)) else {
-                    return RefreshPlan::Reply(Box::new(oauth_error(
-                        StatusCode::INTERNAL_SERVER_ERROR,
-                        "server_error",
-                        "random generation failed",
-                    )));
-                };
-
-                let grace_secs = self.config.oauth.refresh_grace_secs;
-                let grace_until = r0_expires_at.min(now.saturating_add(grace_secs));
-                let access_ttl = self.config.oauth.access_token_ttl_secs;
-                let refresh_ttl = self.config.oauth.refresh_token_ttl_secs;
-                let a1_expires_at = now.saturating_add(access_ttl);
-                let r1_expires_at = now.saturating_add(refresh_ttl);
-
-                let mut snapshot = guard.persisted.clone();
-                let target_grant = &mut snapshot.grants[grant_idx];
-                target_grant.scopes = effective_scopes.clone();
-                target_grant.refresh_tokens[rt_idx].grace_until = Some(grace_until);
-                target_grant.access_tokens.push(AccessTokenRecord {
-                    token_sha256: sha256_b64(&a1),
-                    expires_at: a1_expires_at,
-                });
-                target_grant.refresh_tokens.push(RefreshTokenRecord {
-                    token_sha256: sha256_b64(&r1),
-                    expires_at: r1_expires_at,
-                    grace_until: None,
-                });
-                trim_rotated_refresh_history(target_grant);
-
-                let cache_entry = (grace_secs > 0).then(|| GraceCacheEntry {
-                    grant_id,
-                    access_token: a1.clone(),
-                    refresh_token: r1.clone(),
-                    a1_expires_at,
-                    scopes: effective_scopes.clone(),
-                    grace_until,
-                });
-
-                RefreshPlan::PersistRotation {
-                    snapshot,
-                    cache_entry,
-                    access_token: a1,
-                    refresh_token: r1,
-                    access_ttl,
-                    scopes: effective_scopes,
-                }
-            };
-            make_plan()
-        };
-
-        match plan {
-            RefreshPlan::Reply(reply) => *reply,
-            RefreshPlan::RevokeReplay { grant_id, snapshot } => {
-                let Ok(persisted) = self.persist_snapshot(snapshot).await else {
-                    return oauth_error(
-                        StatusCode::INTERNAL_SERVER_ERROR,
-                        "server_error",
-                        "failed to persist grant revocation",
-                    );
-                };
-                {
-                    let mut guard = self
-                        .inner
-                        .lock()
-                        .unwrap_or_else(|poisoned| poisoned.into_inner());
-                    guard.persisted = persisted;
-                    guard.grace_cache.retain(|_, e| e.grant_id != grant_id);
-                }
-                self.notify_revoke(&grant_id);
-                oauth_error(
-                    StatusCode::BAD_REQUEST,
-                    "invalid_grant",
-                    "refresh token reuse detected",
-                )
-            }
-            RefreshPlan::PersistGraceFallback {
-                snapshot,
-                cache_entry,
-                access_token,
-                refresh_token,
-                access_ttl,
-                scopes,
-            } => {
-                let Ok(persisted) = self.persist_snapshot(snapshot).await else {
-                    return oauth_error(
-                        StatusCode::INTERNAL_SERVER_ERROR,
-                        "server_error",
-                        "failed to persist refreshed token",
-                    );
-                };
-                {
-                    let mut guard = self
-                        .inner
-                        .lock()
-                        .unwrap_or_else(|poisoned| poisoned.into_inner());
-                    guard.persisted = persisted;
-                    guard.insert_grace_cache(rt_hash, cache_entry);
-                }
-                token_success_reply(&access_token, access_ttl, Some(&refresh_token), &scopes)
-            }
-            RefreshPlan::PersistRotation {
-                snapshot,
-                cache_entry,
-                access_token,
-                refresh_token,
-                access_ttl,
-                scopes,
-            } => {
-                let Ok(persisted) = self.persist_snapshot(snapshot).await else {
-                    return oauth_error(
-                        StatusCode::INTERNAL_SERVER_ERROR,
-                        "server_error",
-                        "failed to persist rotated token",
-                    );
-                };
-                {
-                    let mut guard = self
-                        .inner
-                        .lock()
-                        .unwrap_or_else(|poisoned| poisoned.into_inner());
-                    guard.persisted = persisted;
-                    if let Some(entry) = cache_entry {
-                        guard.insert_grace_cache(rt_hash, entry);
+                        grant_id,
+                        tip,
                     }
+                };
+                make_plan()
+            };
+
+            match plan {
+                RefreshPlan::Reply(reply) => *reply,
+                RefreshPlan::RevokeReplay { grant_id, snapshot } => {
+                    core.notify_revoke(&grant_id);
+                    if persist_snapshot(&core.store, snapshot).await.is_err() {
+                        return oauth_error(
+                            StatusCode::INTERNAL_SERVER_ERROR,
+                            "server_error",
+                            "failed to persist grant revocation",
+                        );
+                    }
+                    oauth_error(
+                        StatusCode::BAD_REQUEST,
+                        "invalid_grant",
+                        "refresh token reuse detected",
+                    )
                 }
-                token_success_reply(&access_token, access_ttl, Some(&refresh_token), &scopes)
+                RefreshPlan::PersistTip {
+                    snapshot,
+                    grant_id,
+                    tip,
+                } => {
+                    let Ok(persisted) = persist_snapshot(&core.store, snapshot).await else {
+                        return oauth_error(
+                            StatusCode::INTERNAL_SERVER_ERROR,
+                            "server_error",
+                            "failed to persist rotated token",
+                        );
+                    };
+                    {
+                        let mut guard = core
+                            .inner
+                            .lock()
+                            .unwrap_or_else(|poisoned| poisoned.into_inner());
+                        guard.persisted = persisted;
+                        guard.sync_indexes();
+                        if let Some(entry) = tip.cache_entry {
+                            guard.insert_grace_cache(grant_id, entry);
+                        }
+                    }
+                    token_success_reply(
+                        &tip.access_token,
+                        tip.expires_in,
+                        Some(&tip.refresh_token),
+                        &tip.scopes,
+                    )
+                }
             }
-        }
+        })
+        .await
     }
 
     async fn handle_revoke(&self, req: Request<Incoming>) -> HttpReply {
@@ -1648,20 +1985,12 @@ impl OAuthEngine {
             );
         };
 
-        let has_client_creds = req_headers.contains_key(header::AUTHORIZATION)
-            || form.contains_key("client_id")
-            || form.contains_key("client_secret");
-
-        let authed_client = if has_client_creds {
-            match self.authenticate_token_client(&req_headers, &form) {
-                Ok(c) => Some(c),
-                Err(reply) => return *reply,
-            }
-        } else {
-            None
+        let authed_client = match self.authenticate_token_client(&req_headers, &form) {
+            Ok(c) => c,
+            Err(reply) => return *reply,
         };
 
-        let Some(raw_token) = form.get("token") else {
+        let Some(raw_token) = form.get("token").cloned() else {
             return oauth_error(
                 StatusCode::BAD_REQUEST,
                 "invalid_request",
@@ -1672,76 +2001,64 @@ impl OAuthEngine {
             return empty_ok_reply();
         }
 
-        let token_hash = sha256_b64(raw_token);
-        let _persist_guard = self.persist_lock.lock().await;
-        let now = unix_now();
+        self.run_uncancellable(move |core| async move {
+            let token_hash = sha256_b64(&raw_token);
+            let now = unix_now();
 
-        let planned = {
-            let mut guard = self
-                .inner
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
-            guard.persisted.prune_expired(now);
-            guard.prune_ephemeral(now);
+            let revoked_plan = {
+                let mut guard = core
+                    .inner
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                guard.prune_persisted(now);
+                guard.prune_ephemeral(now);
 
-            let found_grant = guard
-                .persisted
-                .grants
-                .iter()
-                .find(|grant| {
-                    grant
-                        .access_tokens
-                        .iter()
-                        .any(|at| constant_time_eq_str(&at.token_sha256, &token_hash))
-                        || grant
-                            .refresh_tokens
-                            .iter()
-                            .any(|rt| constant_time_eq_str(&rt.token_sha256, &token_hash))
-                })
-                .map(|g| (g.grant_id.clone(), g.client_id.clone()));
+                let matched_grant_id = guard.access_index.get(&token_hash).cloned().or_else(|| {
+                    let parsed = parse_refresh_token(&raw_token)?;
+                    let &idx = guard.grant_index.get(parsed.grant_id)?;
+                    let grant = &guard.persisted.grants[idx];
+                    if parsed.r#gen == grant.current_gen {
+                        let cur = grant.current_refresh.as_ref()?;
+                        (cur.r#gen == grant.current_gen
+                            && constant_time_eq_str(&cur.token_sha256, &token_hash)
+                            && verify_refresh_family_tag(&parsed, &grant.family_key_b64))
+                        .then(|| grant.grant_id.clone())
+                    } else if parsed.r#gen < grant.current_gen {
+                        verify_refresh_family_tag(&parsed, &grant.family_key_b64)
+                            .then(|| grant.grant_id.clone())
+                    } else {
+                        None
+                    }
+                });
 
-            let Some((grant_id, owner_client_id)) = found_grant else {
-                return empty_ok_reply();
-            };
-
-            if let Some(client) = authed_client {
-                if client.client_id != owner_client_id {
+                let Some(grant_id) = matched_grant_id else {
+                    return empty_ok_reply();
+                };
+                let Some(&idx) = guard.grant_index.get(&grant_id) else {
+                    return empty_ok_reply();
+                };
+                if guard.persisted.grants[idx].client_id != authed_client.client_id {
                     return empty_ok_reply();
                 }
-            } else if let Some(owner_client) = guard
-                .persisted
-                .clients
-                .iter()
-                .find(|c| c.client_id == owner_client_id)
-                && owner_client.token_endpoint_auth_method != "none"
-            {
-                let basic = owner_client.token_endpoint_auth_method == "client_secret_basic";
-                return invalid_client_reply(basic, "client authentication required");
+
+                let snapshot = guard
+                    .remove_grant_immediate(&grant_id)
+                    .expect("grant_id matched");
+                (grant_id, snapshot)
+            };
+
+            let (grant_id, snapshot) = revoked_plan;
+            core.notify_revoke(&grant_id);
+            if persist_snapshot(&core.store, snapshot).await.is_err() {
+                return oauth_error(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "server_error",
+                    "failed to persist grant revocation",
+                );
             }
-
-            let mut snapshot = guard.persisted.clone();
-            snapshot.grants.retain(|g| g.grant_id != grant_id);
-            (grant_id, snapshot)
-        };
-
-        let (grant_id, snapshot) = planned;
-        let Ok(persisted) = self.persist_snapshot(snapshot).await else {
-            return oauth_error(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "server_error",
-                "failed to persist grant revocation",
-            );
-        };
-        {
-            let mut guard = self
-                .inner
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
-            guard.persisted = persisted;
-            guard.grace_cache.retain(|_, e| e.grant_id != grant_id);
-        }
-        self.notify_revoke(&grant_id);
-        empty_ok_reply()
+            empty_ok_reply()
+        })
+        .await
     }
 
     fn authenticate_token_client(
@@ -1782,6 +2099,7 @@ impl OAuthEngine {
         let used_basic = basic_creds.is_some();
         let client_opt = {
             let guard = self
+                .core
                 .inner
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
@@ -1872,178 +2190,458 @@ impl OAuthEngine {
 
         Ok(client)
     }
+}
 
-    fn validate_refresh_scope_and_resource(
-        &self,
-        grant: &GrantRecord,
-        form: &BTreeMap<String, String>,
-    ) -> Result<Vec<String>, EarlyReply> {
-        if let Some(raw_res) = form.get("resource") {
-            let Ok(norm) = self.normalize_resource(Some(raw_res)) else {
-                return Err(Box::new(oauth_error(
-                    StatusCode::BAD_REQUEST,
-                    "invalid_target",
-                    "invalid resource target",
-                )));
-            };
-            if norm != grant.resource {
-                return Err(Box::new(oauth_error(
-                    StatusCode::BAD_REQUEST,
-                    "invalid_target",
-                    "resource does not match grant",
-                )));
-            }
+async fn persist_snapshot(
+    store: &StateStore,
+    snapshot: PersistedState,
+) -> Result<PersistedState, ()> {
+    let store_clone = store.clone();
+    let to_save = snapshot.clone();
+    match tokio::task::spawn_blocking(move || store_clone.save(&to_save)).await {
+        Ok(Ok(())) => Ok(snapshot),
+        Ok(Err(err)) => {
+            eprintln!("oauth2-mcp-gateway: failed to persist OAuth state: {err}");
+            Err(())
         }
-
-        match form.get("scope") {
-            None => Ok(grant.scopes.clone()),
-            Some(raw_scope) => {
-                let Some(parsed) = parse_scope_list(raw_scope, &grant.scopes) else {
-                    return Err(Box::new(oauth_error(
-                        StatusCode::BAD_REQUEST,
-                        "invalid_scope",
-                        "requested scope exceeds granted scope",
-                    )));
-                };
-                Ok(parsed)
-            }
+        Err(err) => {
+            eprintln!("oauth2-mcp-gateway: state persistence task failed: {err}");
+            Err(())
         }
-    }
-
-    fn is_allowed_redirect_uri(&self, raw: &str) -> bool {
-        if raw.is_empty() || raw.chars().any(|c| c.is_whitespace() || c.is_control()) {
-            return false;
-        }
-        let Ok(parsed) = Url::parse(raw) else {
-            return false;
-        };
-        if parsed.fragment().is_some()
-            || !parsed.username().is_empty()
-            || parsed.password().is_some()
-            || parsed.query_pairs().any(|(key, _)| {
-                matches!(
-                    key.as_ref(),
-                    "code" | "iss" | "state" | "error" | "error_description" | "error_uri"
-                )
-            })
-        {
-            return false;
-        }
-        let Some(host) = parsed.host_str() else {
-            return false;
-        };
-        if is_loopback_host(host) {
-            return matches!(parsed.scheme(), "http" | "https");
-        }
-        if parsed.scheme() != "https" {
-            return false;
-        }
-        if self.config.oauth.allowed_redirect_hosts.is_empty() {
-            return true;
-        }
-        let lower_host = host.to_ascii_lowercase();
-        self.config
-            .oauth
-            .allowed_redirect_hosts
-            .iter()
-            .any(|allowed| allowed == &lower_host)
-    }
-
-    fn normalize_resource(&self, raw: Option<&str>) -> Result<String, ()> {
-        let mcp_url = self.config.mcp_resource_url();
-        match raw {
-            None => Ok(mcp_url),
-            Some(val) => {
-                let pub_url = &self.config.public_url;
-                if val == pub_url
-                    || val == mcp_url
-                    || (val.len() == pub_url.len() + 1
-                        && val.starts_with(pub_url.as_str())
-                        && val.ends_with('/'))
-                {
-                    Ok(mcp_url)
-                } else {
-                    Err(())
-                }
-            }
-        }
-    }
-
-    fn authorize_error_redirect(
-        &self,
-        redirect_uri: &str,
-        error_code: &str,
-        state: Option<&str>,
-    ) -> HttpReply {
-        let Ok(mut location) = Url::parse(redirect_uri) else {
-            return html_status_reply(StatusCode::BAD_REQUEST, "Invalid redirect_uri");
-        };
-        {
-            let mut pairs = location.query_pairs_mut();
-            pairs.append_pair("error", error_code);
-            pairs.append_pair("iss", &self.config.public_url);
-            if let Some(st) = state {
-                pairs.append_pair("state", st);
-            }
-        }
-        Response::builder()
-            .status(StatusCode::SEE_OTHER)
-            .header(header::LOCATION, location.as_str())
-            .header(header::CACHE_CONTROL, "no-store")
-            .header(header::REFERRER_POLICY, "no-referrer")
-            .body(empty_body())
-            .expect("valid 303 error redirect")
-    }
-
-    fn build_ar_cookie(&self, ar_id: &str, csrf_token: &str, max_age: u64) -> String {
-        let mut cookie = format!(
-            "mcp_ar_{ar_id}={csrf_token}; HttpOnly; SameSite=Lax; Path=/oauth/authorize; Max-Age={max_age}"
-        );
-        if self.config.public_is_https {
-            cookie.push_str("; Secure");
-        }
-        cookie
     }
 }
 
-fn trim_rotated_refresh_history(grant: &mut GrantRecord) {
+fn rotate_grant_tip(
+    grant: &mut GrantRecord,
+    effective_scopes: Vec<String>,
+    now: u64,
+    access_ttl: u64,
+    refresh_ttl: u64,
+    grace_secs: u64,
+    reuse_policy: RefreshReusePolicy,
+) -> Result<RotatedTip, ()> {
+    let next_gen = grant.current_gen.checked_add(1).ok_or(())?;
+    let a_new = random_token_b64(32).map_err(|_| ())?;
+    let r_new = mint_refresh_token(&grant.grant_id, next_gen, &grant.family_key_b64)?;
+
+    if let Some(prev_rt) = grant.current_refresh.take()
+        && grace_secs > 0
+    {
+        let gu = prev_rt.expires_at.min(now.saturating_add(grace_secs));
+        if gu >= now {
+            grant.grace_refreshes.push(GraceRefreshRecord {
+                r#gen: prev_rt.r#gen,
+                token_sha256: prev_rt.token_sha256,
+                grace_until: gu,
+            });
+        }
+    }
+    grant.grace_refreshes.retain(|gr| gr.grace_until >= now);
+    if grant.grace_refreshes.len() > MAX_GRACE_REFRESHES {
+        let excess = grant.grace_refreshes.len() - MAX_GRACE_REFRESHES;
+        grant.grace_refreshes.drain(0..excess);
+    }
+
+    let a_expires_at = now.saturating_add(access_ttl).min(grant.max_expires_at);
+    let r_expires_at = now.saturating_add(refresh_ttl).min(grant.max_expires_at);
+
+    grant.current_gen = next_gen;
+    grant.current_refresh = Some(RefreshTokenRecord {
+        r#gen: next_gen,
+        token_sha256: sha256_b64(&r_new),
+        expires_at: r_expires_at,
+    });
+    grant.access_tokens.push(AccessTokenRecord {
+        token_sha256: sha256_b64(&a_new),
+        expires_at: a_expires_at,
+        scopes: effective_scopes.clone(),
+    });
     if grant.access_tokens.len() > MAX_ACCESS_TOKENS_PER_GRANT {
-        let drop_at = grant.access_tokens.len() - MAX_ACCESS_TOKENS_PER_GRANT;
-        grant.access_tokens.drain(0..drop_at);
+        let excess = grant.access_tokens.len() - MAX_ACCESS_TOKENS_PER_GRANT;
+        grant.access_tokens.drain(0..excess);
     }
-    let active_count = grant
-        .refresh_tokens
-        .iter()
-        .filter(|rt| rt.grace_until.is_none())
-        .count();
-    if active_count > MAX_ACTIVE_REFRESH_PER_GRANT {
-        let mut excess_active = active_count - MAX_ACTIVE_REFRESH_PER_GRANT;
-        grant.refresh_tokens.retain(|rt| {
-            if excess_active > 0 && rt.grace_until.is_none() {
-                excess_active -= 1;
-                false
-            } else {
-                true
-            }
-        });
-    }
-    let rotated_count = grant
-        .refresh_tokens
-        .iter()
-        .filter(|rt| rt.grace_until.is_some())
-        .count();
-    if rotated_count <= MAX_ROTATED_REFRESH_PER_GRANT {
-        return;
-    }
-    let mut excess = rotated_count - MAX_ROTATED_REFRESH_PER_GRANT;
-    grant.refresh_tokens.retain(|rt| {
-        if excess > 0 && rt.grace_until.is_some() {
-            excess -= 1;
-            false
+
+    let cache_entry = (grace_secs > 0 || reuse_policy == RefreshReusePolicy::Converge).then(|| {
+        let max_gu = grant
+            .grace_refreshes
+            .iter()
+            .map(|gr| gr.grace_until)
+            .max()
+            .unwrap_or_else(|| r_expires_at.min(now.saturating_add(grace_secs)));
+        let cache_until = if reuse_policy == RefreshReusePolicy::Converge {
+            max_gu.max(a_expires_at)
         } else {
-            true
+            max_gu
+        };
+        GraceCacheEntry {
+            tip_gen: next_gen,
+            access_token: a_new.clone(),
+            refresh_token: r_new.clone(),
+            a_expires_at,
+            scopes: effective_scopes.clone(),
+            grace_until: cache_until,
         }
     });
+
+    let expires_in = a_expires_at.saturating_sub(now).max(1);
+    Ok(RotatedTip {
+        access_token: a_new,
+        refresh_token: r_new,
+        expires_in,
+        scopes: effective_scopes,
+        cache_entry,
+    })
+}
+
+fn mint_refresh_token(grant_id: &str, generation: u64, family_key_b64: &str) -> Result<String, ()> {
+    let mut family_key = URL_SAFE_NO_PAD.decode(family_key_b64).map_err(|_| ())?;
+    if family_key.len() != 32 {
+        zeroize_bytes(&mut family_key);
+        return Err(());
+    }
+    let nonce = random_token_b64(32).map_err(|_| ())?;
+    let signing_input = format!("{grant_id}.{generation}.{nonce}");
+    let mut mac = hmac_sha256(&family_key, signing_input.as_bytes());
+    zeroize_bytes(&mut family_key);
+    let tag = URL_SAFE_NO_PAD.encode(mac);
+    zeroize_bytes(&mut mac);
+    Ok(format!("rt1.{grant_id}.{generation}.{nonce}.{tag}"))
+}
+
+fn parse_refresh_token(raw: &str) -> Option<ParsedRefreshToken<'_>> {
+    let mut parts = raw.split('.');
+    let prefix = parts.next()?;
+    let grant_id = parts.next()?;
+    let gen_str = parts.next()?;
+    let nonce = parts.next()?;
+    let tag = parts.next()?;
+    if parts.next().is_some()
+        || prefix != "rt1"
+        || grant_id.is_empty()
+        || gen_str.is_empty()
+        || (gen_str.len() > 1 && gen_str.starts_with('0'))
+        || nonce.is_empty()
+        || tag.is_empty()
+    {
+        return None;
+    }
+    let r#gen = gen_str.parse::<u64>().ok()?;
+    Some(ParsedRefreshToken {
+        grant_id,
+        r#gen,
+        nonce,
+        tag,
+    })
+}
+
+fn verify_refresh_family_tag(parsed: &ParsedRefreshToken<'_>, family_key_b64: &str) -> bool {
+    let Ok(mut family_key) = URL_SAFE_NO_PAD.decode(family_key_b64) else {
+        return false;
+    };
+    if family_key.len() != 32 {
+        zeroize_bytes(&mut family_key);
+        return false;
+    }
+    let signing_input = format!("{}.{}.{}", parsed.grant_id, parsed.r#gen, parsed.nonce);
+    let mut mac = hmac_sha256(&family_key, signing_input.as_bytes());
+    zeroize_bytes(&mut family_key);
+    let expected_tag = URL_SAFE_NO_PAD.encode(mac);
+    zeroize_bytes(&mut mac);
+    constant_time_eq_str(parsed.tag, &expected_tag)
+}
+
+fn validate_refresh_scope_and_resource(
+    config: &GatewayConfig,
+    grant: &GrantRecord,
+    form: &BTreeMap<String, String>,
+) -> Result<Vec<String>, EarlyReply> {
+    if let Some(raw_res) = form.get("resource") {
+        let Ok(norm) = normalize_resource(config, Some(raw_res)) else {
+            return Err(Box::new(oauth_error(
+                StatusCode::BAD_REQUEST,
+                "invalid_target",
+                "invalid resource target",
+            )));
+        };
+        if norm != grant.resource {
+            return Err(Box::new(oauth_error(
+                StatusCode::BAD_REQUEST,
+                "invalid_target",
+                "resource does not match grant",
+            )));
+        }
+    }
+
+    match form.get("scope") {
+        None => Ok(grant.scopes.clone()),
+        Some(raw_scope) => {
+            let Some(parsed) = parse_scope_list(raw_scope, &grant.scopes) else {
+                return Err(Box::new(oauth_error(
+                    StatusCode::BAD_REQUEST,
+                    "invalid_scope",
+                    "requested scope exceeds granted scope",
+                )));
+            };
+            Ok(parsed)
+        }
+    }
+}
+
+fn is_forbidden_display_char(c: char) -> bool {
+    c.is_control()
+        || matches!(
+            c,
+            '\u{200B}'..='\u{200F}'
+                | '\u{202A}'..='\u{202E}'
+                | '\u{2066}'..='\u{2069}'
+                | '\u{FEFF}'
+        )
+}
+
+fn extract_raw_host_and_path(raw: &str) -> Option<(&str, &str)> {
+    if raw.is_empty()
+        || raw.contains('\\')
+        || raw.chars().any(|c| c.is_whitespace() || c.is_control())
+    {
+        return None;
+    }
+    let (_, after_scheme) = raw.split_once("://")?;
+    let authority_end = after_scheme
+        .find(['/', '?', '#'])
+        .unwrap_or(after_scheme.len());
+    let authority = &after_scheme[..authority_end];
+    if authority.is_empty() || authority.contains('@') {
+        return None;
+    }
+    let raw_host = if authority.starts_with('[') {
+        let close = authority.find(']')?;
+        let port_part = &authority[close + 1..];
+        if let Some(port) = port_part.strip_prefix(':') {
+            if port.is_empty() || !port.bytes().all(|b| b.is_ascii_digit()) {
+                return None;
+            }
+        } else if !port_part.is_empty() {
+            return None;
+        }
+        &authority[..=close]
+    } else if let Some((h, port)) = authority.split_once(':') {
+        if h.is_empty() || port.is_empty() || !port.bytes().all(|b| b.is_ascii_digit()) {
+            return None;
+        }
+        h
+    } else {
+        authority
+    };
+    let rest = &after_scheme[authority_end..];
+    let path_end = rest.find(['?', '#']).unwrap_or(rest.len());
+    Some((raw_host, &rest[..path_end]))
+}
+
+fn has_clean_url_path(raw_path: &str) -> bool {
+    if raw_path.is_empty() {
+        return true;
+    }
+    for seg in raw_path.split('/') {
+        if seg == "." || seg == ".." {
+            return false;
+        }
+        let bytes = seg.as_bytes();
+        let mut decoded = Vec::with_capacity(bytes.len());
+        let mut i = 0;
+        while i < bytes.len() {
+            if bytes[i] == b'%' {
+                if i + 2 >= bytes.len() {
+                    return false;
+                }
+                let (Some(hi), Some(lo)) = (hex_nibble(bytes[i + 1]), hex_nibble(bytes[i + 2]))
+                else {
+                    return false;
+                };
+                let b = (hi << 4) | lo;
+                if b == 0 || b == b'/' || b == b'\\' {
+                    return false;
+                }
+                decoded.push(b);
+                i += 3;
+            } else {
+                decoded.push(bytes[i]);
+                i += 1;
+            }
+        }
+        if decoded == b"." || decoded == b".." {
+            return false;
+        }
+    }
+    true
+}
+
+fn is_canonical_host(raw_host: &str, parsed_host: &str) -> bool {
+    if raw_host.contains('%') || raw_host.ends_with('.') {
+        return false;
+    }
+    if raw_host.is_ascii() {
+        raw_host.eq_ignore_ascii_case(parsed_host)
+    } else {
+        url::Host::parse(raw_host).is_ok_and(|h| h.to_string().eq_ignore_ascii_case(parsed_host))
+    }
+}
+
+fn is_allowed_redirect_uri(config: &GatewayConfig, raw: &str) -> bool {
+    let Some((raw_host, raw_path)) = extract_raw_host_and_path(raw) else {
+        return false;
+    };
+    if !has_clean_url_path(raw_path) {
+        return false;
+    }
+    let Ok(parsed) = Url::parse(raw) else {
+        return false;
+    };
+    if parsed.fragment().is_some()
+        || !parsed.username().is_empty()
+        || parsed.password().is_some()
+        || parsed.query_pairs().any(|(key, _)| {
+            matches!(
+                key.as_ref(),
+                "code" | "iss" | "state" | "error" | "error_description" | "error_uri"
+            )
+        })
+    {
+        return false;
+    }
+    let Some(host) = parsed.host_str() else {
+        return false;
+    };
+    if !is_canonical_host(raw_host, host) {
+        return false;
+    }
+    if is_loopback_host(host) {
+        return matches!(parsed.scheme(), "http" | "https");
+    }
+    if parsed.scheme() != "https" {
+        return false;
+    }
+    if config.oauth.allowed_redirect_hosts.is_empty() {
+        return true;
+    }
+    let lower_host = host.to_ascii_lowercase();
+    config
+        .oauth
+        .allowed_redirect_hosts
+        .iter()
+        .any(|allowed| allowed == &lower_host)
+}
+
+fn normalize_resource(config: &GatewayConfig, raw: Option<&str>) -> Result<String, ()> {
+    let mcp_url = config.mcp_resource_url();
+    let Some(val) = raw else {
+        return Ok(mcp_url);
+    };
+    let (raw_host, raw_path) = extract_raw_host_and_path(val).ok_or(())?;
+    if !has_clean_url_path(raw_path) {
+        return Err(());
+    }
+    let parsed = Url::parse(val).map_err(|_| ())?;
+    if parsed.query().is_some()
+        || parsed.fragment().is_some()
+        || !parsed.username().is_empty()
+        || parsed.password().is_some()
+    {
+        return Err(());
+    }
+    let parsed_host = parsed.host_str().ok_or(())?;
+    if !is_canonical_host(raw_host, parsed_host) {
+        return Err(());
+    }
+    if !parsed
+        .origin()
+        .ascii_serialization()
+        .eq_ignore_ascii_case(&config.public_url)
+    {
+        return Err(());
+    }
+    if parsed.path() == "/" || parsed.path() == config.resource_path {
+        Ok(mcp_url)
+    } else {
+        Err(())
+    }
+}
+
+fn authorize_error_redirect(
+    config: &GatewayConfig,
+    redirect_uri: &str,
+    error_code: &str,
+    state: Option<&str>,
+) -> HttpReply {
+    let Ok(mut location) = Url::parse(redirect_uri) else {
+        return html_status_reply(StatusCode::BAD_REQUEST, "Invalid redirect_uri");
+    };
+    {
+        let mut pairs = location.query_pairs_mut();
+        pairs.append_pair("error", error_code);
+        pairs.append_pair("iss", &config.public_url);
+        if let Some(st) = state {
+            pairs.append_pair("state", st);
+        }
+    }
+    Response::builder()
+        .status(StatusCode::SEE_OTHER)
+        .header(header::LOCATION, location.as_str())
+        .header(header::CACHE_CONTROL, "no-store")
+        .header(header::REFERRER_POLICY, "no-referrer")
+        .body(empty_body())
+        .expect("valid 303 error redirect")
+}
+
+fn finish_authorize_redirect(
+    req_headers: &HeaderMap,
+    clear_cookie: &str,
+    location: &Url,
+) -> HttpReply {
+    if is_navigate_fetch_mode(req_headers) {
+        // Chromium applies form-action to POST redirects; meta-refresh navigates cleanly.
+        let callback = escape_html(location.as_str());
+        let html = format!(
+            "<!DOCTYPE html><html lang=\"en\"><head><meta charset=\"utf-8\">\
+             <title>Continue</title><meta http-equiv=\"refresh\" content=\"0;url={callback}\">\
+             </head><body><a href=\"{callback}\">Continue</a></body></html>"
+        );
+        return html_reply_with_cookie(StatusCode::OK, html, Some(clear_cookie));
+    }
+
+    Response::builder()
+        .status(StatusCode::SEE_OTHER)
+        .header(header::LOCATION, location.as_str())
+        .header(header::SET_COOKIE, clear_cookie)
+        .header(header::CACHE_CONTROL, "no-store")
+        .header(header::REFERRER_POLICY, "no-referrer")
+        .body(empty_body())
+        .expect("valid 303 response")
+}
+
+fn is_navigate_fetch_mode(headers: &HeaderMap) -> bool {
+    headers
+        .get("sec-fetch-mode")
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(|mode| mode.trim_ascii().eq_ignore_ascii_case("navigate"))
+}
+
+fn ar_cookie_name(public_is_https: bool, ar_id: &str) -> String {
+    if public_is_https {
+        format!("__Host-mcp_ar_{ar_id}")
+    } else {
+        format!("mcp_ar_{ar_id}")
+    }
+}
+
+fn build_ar_cookie(public_is_https: bool, ar_id: &str, csrf_token: &str, max_age: u64) -> String {
+    let name = ar_cookie_name(public_is_https, ar_id);
+    if public_is_https {
+        format!("{name}={csrf_token}; Path=/; Max-Age={max_age}; HttpOnly; Secure; SameSite=Lax")
+    } else {
+        format!(
+            "{name}={csrf_token}; Path=/oauth/authorize; Max-Age={max_age}; HttpOnly; SameSite=Lax"
+        )
+    }
 }
 
 fn strip_bearer_prefix(header_val: &str) -> Option<&str> {
@@ -2108,17 +2706,20 @@ fn parse_basic_auth(headers: &HeaderMap) -> Result<Option<(String, String)>, Ear
                 "invalid Base64 in Basic credentials",
             ))
         })?;
-    let decoded_str = String::from_utf8(decoded_bytes)
+    let mut decoded_str = String::from_utf8(decoded_bytes)
         .map_err(|_| Box::new(invalid_client_reply(true, "non-UTF-8 Basic credentials")))?;
 
     if let Some((raw_id, raw_secret)) = decoded_str.split_once(':') {
-        let client_id = form_urldecode_component(raw_id).map_err(|()| {
+        let id_res = form_urldecode_component(raw_id);
+        let sec_res = form_urldecode_component(raw_secret);
+        zeroize_string(&mut decoded_str);
+        let client_id = id_res.map_err(|()| {
             Box::new(invalid_client_reply(
                 true,
                 "invalid URL encoding in client_id",
             ))
         })?;
-        let client_secret = form_urldecode_component(raw_secret).map_err(|()| {
+        let client_secret = sec_res.map_err(|()| {
             Box::new(invalid_client_reply(
                 true,
                 "invalid URL encoding in client_secret",
@@ -2127,19 +2728,24 @@ fn parse_basic_auth(headers: &HeaderMap) -> Result<Option<(String, String)>, Ear
         return Ok(Some((client_id, client_secret)));
     }
 
-    let unescaped = form_urldecode_component(&decoded_str).map_err(|()| {
+    let unescaped_res = form_urldecode_component(&decoded_str);
+    zeroize_string(&mut decoded_str);
+    let mut unescaped = unescaped_res.map_err(|()| {
         Box::new(invalid_client_reply(
             true,
             "invalid Basic credential encoding",
         ))
     })?;
     let Some((client_id, client_secret)) = unescaped.split_once(':') else {
+        zeroize_string(&mut unescaped);
         return Err(Box::new(invalid_client_reply(
             true,
             "Basic credentials missing colon separator",
         )));
     };
-    Ok(Some((client_id.to_owned(), client_secret.to_owned())))
+    let out = (client_id.to_owned(), client_secret.to_owned());
+    zeroize_string(&mut unescaped);
+    Ok(Some(out))
 }
 
 fn form_urldecode_component(input: &str) -> Result<String, ()> {
@@ -2156,8 +2762,8 @@ fn form_urldecode_component(input: &str) -> Result<String, ()> {
                 if idx + 2 >= bytes.len() {
                     return Err(());
                 }
-                let hi = decode_hex_nibble(bytes[idx + 1])?;
-                let lo = decode_hex_nibble(bytes[idx + 2])?;
+                let hi = hex_nibble(bytes[idx + 1]).ok_or(())?;
+                let lo = hex_nibble(bytes[idx + 2]).ok_or(())?;
                 out.push((hi << 4) | lo);
                 idx += 3;
             }
@@ -2168,15 +2774,6 @@ fn form_urldecode_component(input: &str) -> Result<String, ()> {
         }
     }
     String::from_utf8(out).map_err(|_| ())
-}
-
-fn decode_hex_nibble(b: u8) -> Result<u8, ()> {
-    match b {
-        b'0'..=b'9' => Ok(b - b'0'),
-        b'a'..=b'f' => Ok(b - b'a' + 10),
-        b'A'..=b'F' => Ok(b - b'A' + 10),
-        _ => Err(()),
-    }
 }
 
 enum BodyReadError {
@@ -2205,61 +2802,56 @@ async fn read_limited_body(req: Request<Incoming>) -> Result<Bytes, BodyReadErro
     }
 }
 
+fn with_connection_close(mut reply: HttpReply) -> HttpReply {
+    reply.headers_mut().insert(
+        header::CONNECTION,
+        header::HeaderValue::from_static("close"),
+    );
+    reply
+}
+
 fn body_error_json(err: BodyReadError) -> HttpReply {
     match err {
-        BodyReadError::InvalidContentLength => oauth_error(
+        BodyReadError::InvalidContentLength => with_connection_close(oauth_error(
             StatusCode::BAD_REQUEST,
             "invalid_request",
             "invalid Content-Length header",
-        ),
-        BodyReadError::TooLarge => oauth_error(
+        )),
+        BodyReadError::TooLarge => with_connection_close(oauth_error(
             StatusCode::PAYLOAD_TOO_LARGE,
             "invalid_request",
             "request body exceeds 64 KiB limit",
-        ),
+        )),
         BodyReadError::ReadFailed => oauth_error(
             StatusCode::BAD_REQUEST,
             "invalid_request",
             "failed to read request body",
         ),
-        BodyReadError::Timeout => {
-            let mut reply = oauth_error(
-                StatusCode::REQUEST_TIMEOUT,
-                "invalid_request",
-                "OAuth request body read timed out",
-            );
-            reply.headers_mut().insert(
-                header::CONNECTION,
-                header::HeaderValue::from_static("close"),
-            );
-            reply
-        }
+        BodyReadError::Timeout => with_connection_close(oauth_error(
+            StatusCode::REQUEST_TIMEOUT,
+            "invalid_request",
+            "OAuth request body read timed out",
+        )),
     }
 }
 
 fn body_error_html(err: BodyReadError) -> HttpReply {
     match err {
-        BodyReadError::InvalidContentLength => {
-            html_status_reply(StatusCode::BAD_REQUEST, "Invalid Content-Length header")
-        }
-        BodyReadError::TooLarge => html_status_reply(
+        BodyReadError::InvalidContentLength => with_connection_close(html_status_reply(
+            StatusCode::BAD_REQUEST,
+            "Invalid Content-Length header",
+        )),
+        BodyReadError::TooLarge => with_connection_close(html_status_reply(
             StatusCode::PAYLOAD_TOO_LARGE,
             "Request body exceeds 64 KiB limit",
-        ),
+        )),
         BodyReadError::ReadFailed => {
             html_status_reply(StatusCode::BAD_REQUEST, "Failed to read request body")
         }
-        BodyReadError::Timeout => {
-            let mut reply = html_status_reply(
-                StatusCode::REQUEST_TIMEOUT,
-                "OAuth request body read timed out",
-            );
-            reply.headers_mut().insert(
-                header::CONNECTION,
-                header::HeaderValue::from_static("close"),
-            );
-            reply
-        }
+        BodyReadError::Timeout => with_connection_close(html_status_reply(
+            StatusCode::REQUEST_TIMEOUT,
+            "OAuth request body read timed out",
+        )),
     }
 }
 
@@ -2306,7 +2898,8 @@ fn parse_scope_list(raw: &str, allowed: &[String]) -> Option<Vec<String>> {
     if out.is_empty() { None } else { Some(out) }
 }
 
-fn extract_cookie(headers: &HeaderMap, target_name: &str) -> Option<String> {
+fn has_valid_csrf_cookie(headers: &HeaderMap, target_name: &str, expected_csrf: &str) -> bool {
+    let mut matched = false;
     for val in headers.get_all(header::COOKIE) {
         let Ok(raw) = val.to_str() else {
             continue;
@@ -2315,12 +2908,14 @@ fn extract_cookie(headers: &HeaderMap, target_name: &str) -> Option<String> {
             let Some((name, cookie_val)) = pair.trim_ascii().split_once('=') else {
                 continue;
             };
-            if name.trim_ascii() == target_name {
-                return Some(cookie_val.trim_ascii().to_owned());
+            if name.trim_ascii() == target_name
+                && constant_time_eq_str(cookie_val.trim_ascii(), expected_csrf)
+            {
+                matched = true;
             }
         }
     }
-    None
+    matched
 }
 
 fn escape_html(input: &str) -> String {
@@ -2345,7 +2940,16 @@ fn render_authorize_page(pending: &PendingAuthRequest, error_notice: Option<&str
         .unwrap_or(pending.client_id.as_str());
     let display = escape_html(display_raw);
     let client_id = escape_html(&pending.client_id);
+    let resource = escape_html(&pending.resource);
     let redirect_uri = escape_html(&pending.redirect_uri);
+    let callback_host = Url::parse(&pending.redirect_uri)
+        .ok()
+        .and_then(|u| match (u.host_str(), u.port()) {
+            (Some(h), Some(p)) => Some(escape_html(&format!("{h}:{p}"))),
+            (Some(h), None) => Some(escape_html(h)),
+            _ => None,
+        })
+        .unwrap_or_default();
     let ar_id = escape_html(&pending.ar_id);
     let csrf_token = escape_html(&pending.csrf_token);
 
@@ -2355,14 +2959,6 @@ fn render_authorize_page(pending: &PendingAuthRequest, error_notice: Option<&str
         scope_chips.push_str(&escape_html(scope));
         scope_chips.push_str("</span>");
     }
-
-    let name_row = match pending.client_name.as_deref() {
-        Some(name) if name != pending.client_id => format!(
-            "<div class=\"row\"><dt>Client</dt><dd>{}</dd></div>",
-            escape_html(name)
-        ),
-        _ => String::new(),
-    };
 
     let alert_block = match error_notice {
         Some(msg) => format!("<p class=\"alert\" role=\"alert\">{}</p>", escape_html(msg)),
@@ -2375,35 +2971,40 @@ fn render_authorize_page(pending: &PendingAuthRequest, error_notice: Option<&str
 <head>\
 <meta charset=\"utf-8\">\
 <meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">\
-<title>Authorize {display}</title>\
+<title>Allow {display}</title>\
 <style>\
 *{{box-sizing:border-box;margin:0;padding:0}}\
 body{{min-height:100vh;display:flex;align-items:center;justify-content:center;padding:2rem;background:#f8fafc;color:#0f172a;font-family:system-ui,-apple-system,sans-serif;line-height:1.5}}\
-main{{width:100%;max-width:40rem;background:#ffffff;border:1px solid #e2e8f0;border-radius:0.75rem;padding:2.5rem;box-shadow:0 10px 30px rgba(15,23,42,0.06)}}\
-h1{{font-size:clamp(1.35rem,2.5vw,1.75rem);font-weight:650;letter-spacing:-0.02em;margin-bottom:1.75rem;word-break:break-word}}\
-dl{{display:grid;gap:1rem;margin-bottom:1.75rem;padding:1.25rem;background:#f8fafc;border-radius:0.5rem;border:1px solid #e2e8f0}}\
-.row{{display:grid;gap:0.25rem}}\
+main{{width:100%;max-width:42rem;background:#ffffff;border:1px solid #e2e8f0;border-radius:0.75rem;padding:2.5rem;box-shadow:0 10px 30px rgba(15,23,42,0.06)}}\
+h1{{font-size:clamp(1.35rem,2.4vw,1.7rem);font-weight:650;letter-spacing:-0.02em;margin-bottom:1.5rem;word-break:break-word}}\
+dl{{display:grid;gap:0.9rem;margin-bottom:1.5rem;padding:1.25rem;background:#f8fafc;border-radius:0.5rem;border:1px solid #e2e8f0}}\
+.row{{display:grid;gap:0.2rem}}\
 dt{{font-size:0.75rem;font-weight:600;text-transform:uppercase;letter-spacing:0.05em;color:#475569}}\
-dd{{font-size:0.925rem;color:#0f172a;word-break:break-all}}\
-code{{font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:0.875rem}}\
-.chips{{display:flex;flex-wrap:wrap;gap:0.5rem}}\
-.chip{{display:inline-block;padding:0.2rem 0.6rem;background:#e2e8f0;color:#0f172a;border-radius:0.375rem;font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:0.825rem}}\
+dd{{font-size:0.9rem;color:#0f172a;word-break:break-all}}\
+.host{{display:block;font-weight:600;margin-bottom:0.15rem}}\
+code{{font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:0.85rem;color:#334155}}\
+.chips{{display:flex;flex-wrap:wrap;gap:0.45rem}}\
+.chip{{display:inline-block;padding:0.18rem 0.55rem;background:#e2e8f0;color:#0f172a;border-radius:0.375rem;font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:0.8rem}}\
 .alert{{margin-bottom:1.25rem;padding:0.75rem 1rem;border-radius:0.5rem;background:#fef2f2;border:1px solid #fecaca;color:#991b1b;font-size:0.9rem;font-weight:500}}\
 label{{display:block;font-size:0.875rem;font-weight:600;margin-bottom:0.5rem;color:#1e293b}}\
 input[type=\"password\"]{{width:100%;padding:0.7rem 0.875rem;font-size:1rem;border:1px solid #cbd5e1;border-radius:0.5rem;background:#ffffff;color:#0f172a;margin-bottom:1.5rem}}\
 input[type=\"password\"]:focus{{outline:2px solid #0f172a;outline-offset:1px}}\
-button{{width:100%;padding:0.8rem 1.25rem;font-size:0.95rem;font-weight:600;color:#ffffff;background:#0f172a;border:none;border-radius:0.5rem;cursor:pointer;transition:background-color 150ms ease}}\
-button:hover{{background:#1e293b}}\
+.actions{{display:grid;grid-template-columns:1fr auto;gap:0.75rem}}\
+button{{padding:0.78rem 1.25rem;font-size:0.95rem;font-weight:600;border-radius:0.5rem;cursor:pointer;transition:background-color 150ms ease}}\
+.approve{{color:#ffffff;background:#0f172a;border:1px solid #0f172a}}\
+.approve:hover{{background:#1e293b}}\
+.deny{{color:#0f172a;background:#ffffff;border:1px solid #cbd5e1}}\
+.deny:hover{{background:#f1f5f9}}\
 @media (prefers-reduced-motion:reduce){{button{{transition:none}}}}\
 </style>\
 </head>\
 <body>\
 <main>\
-<h1>Authorize {display}</h1>\
+<h1>Allow {display}</h1>\
 <dl>\
-{name_row}\
+<div class=\"row\"><dt>Resource</dt><dd><code>{resource}</code></dd></div>\
+<div class=\"row\"><dt>Callback</dt><dd><span class=\"host\">{callback_host}</span><code>{redirect_uri}</code></dd></div>\
 <div class=\"row\"><dt>Client ID</dt><dd><code>{client_id}</code></dd></div>\
-<div class=\"row\"><dt>Redirect URI</dt><dd><code>{redirect_uri}</code></dd></div>\
 <div class=\"row\"><dt>Scopes</dt><dd class=\"chips\">{scope_chips}</dd></div>\
 </dl>\
 {alert_block}\
@@ -2412,7 +3013,10 @@ button:hover{{background:#1e293b}}\
 <input type=\"hidden\" name=\"csrf_token\" value=\"{csrf_token}\">\
 <label for=\"password\">Password</label>\
 <input id=\"password\" name=\"password\" type=\"password\" required autofocus autocomplete=\"current-password\">\
-<button type=\"submit\">Authorize {display}</button>\
+<div class=\"actions\">\
+<button type=\"submit\" name=\"decision\" value=\"approve\" class=\"approve\">Allow access</button>\
+<button type=\"submit\" name=\"decision\" value=\"deny\" formnovalidate class=\"deny\">Deny</button>\
+</div>\
 </form>\
 </main>\
 </body>\
@@ -2504,18 +3108,6 @@ fn empty_ok_reply() -> HttpReply {
         .header(header::CACHE_CONTROL, "no-store")
         .body(empty_body())
         .expect("valid 200 empty reply")
-}
-
-fn method_not_allowed(allow: &'static str) -> HttpReply {
-    let mut reply = text_reply(
-        StatusCode::METHOD_NOT_ALLOWED,
-        "text/plain; charset=utf-8",
-        "method not allowed",
-    );
-    reply
-        .headers_mut()
-        .insert(header::ALLOW, header::HeaderValue::from_static(allow));
-    reply
 }
 
 fn not_found_reply() -> HttpReply {
