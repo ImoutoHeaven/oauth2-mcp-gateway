@@ -1346,13 +1346,10 @@ impl StdioSession {
 
         let writer_alive = Arc::clone(&alive);
         tokio::spawn(async move {
-            loop {
-                let Some(buf) = (tokio::select! {
-                    _ = writer_cancel.cancelled() => None,
-                    msg = stdin_rx.recv() => msg,
-                }) else {
-                    break;
-                };
+            while let Some(buf) = tokio::select! {
+                _ = writer_cancel.cancelled() => None,
+                msg = stdin_rx.recv() => msg,
+            } {
                 let write_ok = tokio::select! {
                     _ = writer_cancel.cancelled() => false,
                     res = async {
