@@ -2,105 +2,111 @@
 
 ## 1. Sidecar boundary and scope
 
-`oauth2-mcp-gateway` is a single-upstream OAuth 2.1 authentication sidecar for Model Context Protocol (MCP) servers. One gateway process binds a local socket behind a reverse proxy (such as Nginx, Traefik, Caddy, Cloudflare Tunnel, or Tailscale Funnel) and stands directly in front of one MCP service.
+`oauth2-mcp-gateway` is a single-upstream OAuth 2.1 authentication sidecar for Model Context Protocol (MCP) servers. One gateway process binds a local socket behind an edge reverse proxy or tunnel (Nginx, Traefik, Caddy, Cloudflare Tunnel, or Tailscale Funnel) and fronts one MCP service.
 
-Responsibilities inside scope:
+In scope:
 
-1. Serve OAuth 2.1 metadata, Dynamic Client Registration (RFC 7591), PKCE S256 authorization code grants, refresh token rotation with a bounded concurrency grace window, and token revocation (RFC 7009).
-2. Authenticate inbound `/mcp` requests using opaque Bearer access tokens bound to the configured public resource URL.
-3. Forward authenticated MCP traffic to either:
-   - an upstream Streamable HTTP MCP server using a credential selected from a configured upstream Bearer token pool, or
-   - a per-session isolated `stdio` MCP child process managed by the gateway.
-4. Forward configured unauthenticated capability URL prefixes (for example `/t/`) directly to an HTTP upstream as byte streams without buffering bodies in memory.
+1. Serve OAuth 2.1 discovery metadata, Dynamic Client Registration (RFC 7591), PKCE `S256` authorization code grants, single-tip generation-tracked refresh token rotation, and authenticated token revocation (RFC 7009).
+2. Validate `Host` and normalized `Origin` headers, and authenticate inbound requests on `<resource_path>` (default `/mcp`) using opaque Bearer access tokens bound to `<public_url><resource_path>`.
+3. Bridge authenticated MCP traffic to an upstream Streamable HTTP MCP endpoint (with optional static Bearer token pooling and per-grant session binding) or to isolated per-session `stdio` child processes.
+4. Stream configured unauthenticated capability URL prefixes (such as `/t/`) directly to an HTTP upstream origin without buffering bodies in memory.
 
-Responsibilities outside scope:
+Outside scope:
 
-- TLS termination, ACME certificates, HTTP/2 or HTTP/3 termination, and virtual-host or multi-service path routing. An edge reverse proxy handles these.
-- External OIDC federation (Google, GitHub, Okta), multi-user RBAC databases, SQL ORMs, and web activity dashboards.
-- MCP tool aggregation, tool name rewriting, or JSON Schema transformation. Upstream JSON-RPC payloads pass through unchanged.
+- TLS termination, ACME certificate management, HTTP/2 or HTTP/3 edge listeners, and multi-service virtual-host routing. An edge reverse proxy or tunnel handles these layers.
+- External OIDC federation, multi-user RBAC databases, SQL storage engines, and web administration consoles.
+- MCP tool filtering, tool name rewriting, or JSON Schema modification. Tool schemas and tool arguments pass through unchanged.
 
-## 2. Configuration contract
+## 2. Configuration and state persistence
 
-The gateway reads one JSON configuration file selected via `--config <path>` (default `gateway.json`). Unknown fields are rejected (`deny_unknown_fields`). String fields equal to `"${VAR}"` expand from the process environment at startup (except `upstream.args`, whose items pass verbatim as command arguments); missing or empty referenced variables fail startup.
+The gateway loads one JSON configuration file (maximum 1 MiB) from `--config <path>` or `OAUTH2_MCP_GATEWAY_CONFIG` (default `gateway.json`). Startup rejects unknown fields (`deny_unknown_fields`). String fields equal to `"${VAR}"` expand from the process environment at startup, except entries in `upstream.args`, which pass verbatim as child command arguments. Partial interpolation such as `"prefix-${VAR}"` and missing or empty referenced variables fail startup.
 
 Top-level fields:
 
 - `listen`: local socket address to bind, such as `"127.0.0.1:8080"`.
-- `public_url`: canonical external origin without path, query, fragment, or userinfo, such as `"https://mcp.example.com"`. Plain `http://` is accepted only when the host is `localhost`, `127.0.0.1`, or `[::1]`.
-- `resource_path`: optional public MCP path, default `/mcp`. The proxy maps this path to the gateway’s `/mcp` route and forwards the public discovery paths unchanged.
-- `state_path`: regular file path for persisted OAuth clients and hashed token grants (created with mode `0600` on Unix, updated via sibling temporary file `fsync` and atomic `rename`).
-- `oauth`: owner credential and token lifetimes.
+- `public_url`: canonical external origin without path, query, fragment, or userinfo, such as `"https://mcp.example.com"`. Plain `http://` is permitted only when the host is `localhost`, `127.0.0.1`, or `[::1]`.
+- `resource_path`: optional public MCP path, default `"/mcp"`. The gateway serves `<resource_path>` directly, so a reverse proxy using `location / { proxy_pass http://127.0.0.1:8080; }` forwards `<resource_path>`, `/.well-known/*`, `/oauth/*`, and `passthrough_prefixes` without URL rewriting.
+- `state_path`: regular file path for persisted OAuth clients and hashed token grants (`state.json`). Relative paths resolve against the configuration file directory. On Unix, the gateway creates missing parent directories with mode `0700` and enforces mode `0600` on `state.json` using a sibling temporary file, `fsync`, and atomic `rename`.
+- `oauth`: owner credential and token lifetime configuration.
 - `upstream`: tagged union (`"transport": "http"` or `"transport": "stdio"`).
 
-Key `oauth` settings and defaults:
+`oauth` settings and defaults:
 
-- `owner_password_hash` (PBKDF2-HMAC-SHA256 formatted `pbkdf2-sha256$210000$<salt_b64>$<hash_b64>`) or `owner_password` (plain secret expanded from `"${VAR}"` and hashed into PBKDF2-HMAC-SHA256 in memory at startup; specifying both or an empty secret fails startup).
-- `scopes`: supported scope strings, default `["mcp"]`.
-- `allowed_redirect_hosts`: optional hostname allowlist for DCR `redirect_uris`. When empty, any `https://` host (without fragment or userinfo) and loopback `http://` hosts are permitted. When non-empty, non-loopback `https://` hosts must match an entry in `allowed_redirect_hosts`.
+- `owner_password_hash` (`pbkdf2-sha256$<iterations>$<salt_b64>$<hash_b64>`, `600000` default iterations from `hash-password`, `10000..=5000000` accepted) or `owner_password` (plaintext secret expanded from `"${VAR}"` and hashed in memory at startup with `PBKDF2-HMAC-SHA256` at `600000` iterations). Specifying both, neither, or an empty secret fails startup.
+- `scopes`: allowed RFC 6749 scope tokens, default `["mcp"]`.
+- `allowed_redirect_hosts`: optional hostname allowlist for DCR `redirect_uris`. Loopback `http://` hosts remain permitted; when non-empty, `https://` hosts must match an IDNA-normalized entry in `allowed_redirect_hosts`. Wildcards are rejected.
 - `access_token_ttl_secs`: `60..=86400`, default `3600`.
-- `refresh_token_ttl_secs`: `300..=7776000`, default `2592000` (30 days).
-- `refresh_grace_secs`: `0..=600`, default `120`.
+- `refresh_token_ttl_secs`: `300..=7776000`, default `2592000` (30 days), at least `access_token_ttl_secs`.
+- `max_grant_lifetime_secs`: total sliding refresh lifetime ceiling per grant measured from initial authorization, default `3 * refresh_token_ttl_secs`, capped at `31536000` (365 days) and at least `refresh_token_ttl_secs`.
+- `refresh_grace_secs`: `0..=86400` and `<= refresh_token_ttl_secs`, default `min(access_token_ttl_secs, refresh_token_ttl_secs)` (`3600` seconds by default, synced with `access_token_ttl_secs`).
+- `refresh_reuse_policy`: `"converge"` (default) or `"revoke"`.
 - `max_registered_clients`: `16..=4096`, default `512`.
 
-Key `upstream` settings:
+`upstream` settings:
 
 - `http`:
-  - `url`: upstream MCP endpoint URL (for example `"http://127.0.0.1:9000/mcp"`).
-  - `bearer_tokens`: optional non-empty strings. When non-empty, each OAuth grant pins one slot chosen by least-active-grant count at authorization time, and proxied `/mcp` requests carry `Authorization: Bearer <token>`. When empty, the inbound OAuth `Authorization` header is stripped and no upstream `Authorization` header is sent.
-  - `passthrough_prefixes`: optional path prefixes starting and ending with `/` (such as `["/t/"]`, never overlapping `/mcp/`, `/oauth/`, `/.well-known/`, `/healthz/`, or the path of `upstream.url`, matched case-insensitively). Matching paths with no `..`, backslash, NUL, or percent-encoded dot segments stream `GET`, `HEAD`, and `PUT` directly to the upstream origin without OAuth verification.
+  - `url`: upstream MCP endpoint URL (`http://` or `https://`, without userinfo, query, or fragment).
+  - `bearer_tokens`: optional pool of non-empty ASCII Bearer tokens. When non-empty, each OAuth grant pins the least-loaded slot at authorization time and sends `Authorization: Bearer <token>` on proxied MCP calls. When empty, the inbound OAuth `Authorization` header is stripped and no upstream `Authorization` header is sent.
+  - `passthrough_prefixes`: optional path prefixes starting and ending with `/` (such as `["/t/"]`). Prefixes cannot overlap `<resource_path>`, `/oauth/`, `/.well-known/`, `/healthz/`, or the path of `upstream.url` (matched case-insensitively).
+  - `request_timeout_secs`: `5..=3600`, default `300`.
 - `stdio`:
   - `command`: executable path or name.
-  - `args`: argument array, default `[]`.
-  - `env`: explicit environment overrides, default `{}`.
-  - `cwd`: optional working directory.
+  - `args`: argument list passed verbatim, default `[]`.
+  - `env`: explicit child environment variables, default `{}`.
+  - `cwd`: optional child working directory.
   - `max_sessions`: `1..=256`, default `32`.
   - `session_idle_secs`: `30..=86400`, default `1800`.
 
-## 3. OAuth 2.1 and client compatibility
+## 3. Request guards, OAuth 2.1, and single-tip refresh rotation
 
-The gateway exposes six OAuth routes:
+### 3.1 Host, Origin, and CORS discovery guards
 
-1. `GET /.well-known/oauth-protected-resource` and `GET /.well-known/oauth-protected-resource/{*path}` (RFC 9728):
-   - Root metadata reports `resource: "<public_url><resource_path>"` and `authorization_servers: ["<public_url>"]`.
-   - Path-scoped metadata `/.well-known/oauth-protected-resource<resource_path>` reports `resource: "<public_url><resource_path>"` so clients that resolve path-relative metadata (including Claude.ai Web) match exact resource identifiers.
+- `Host` header validation verifies incoming `Host` authorities and blocks DNS rebinding requests targeting loopback `http://` deployments.
+- `Origin` validation compares normalized `Origin` headers against `public_url` across `<resource_path>`, `/oauth/*`, and `passthrough_prefixes`, returning `403 Forbidden` on mismatches while permitting non-browser clients that omit `Origin`.
+- `/.well-known/*` routes answer `GET` and `OPTIONS` with read-only CORS headers so browser-based MCP clients can discover OAuth metadata before authorization.
+
+### 3.2 OAuth 2.1 endpoints (`src/oauth.rs`)
+
+1. `GET /.well-known/oauth-protected-resource` and `GET /.well-known/oauth-protected-resource<resource_path>` (RFC 9728):
+   - Both routes advertise `resource: "<public_url><resource_path>"` and `authorization_servers: ["<public_url>"]` so clients resolving either root or path-scoped metadata match exact resource URIs.
 2. `GET /.well-known/oauth-authorization-server` and `GET /.well-known/oauth-authorization-server<resource_path>` (RFC 8414):
-   - Follows the configured `resource_path` (returning `404` for other subpaths) and publishes `issuer: "<public_url>"`, `authorization_endpoint`, `token_endpoint`, `registration_endpoint`, `revocation_endpoint`, `response_types_supported: ["code"]`, `grant_types_supported: ["authorization_code", "refresh_token"]`, `token_endpoint_auth_methods_supported: ["none", "client_secret_post", "client_secret_basic"]`, `code_challenge_methods_supported: ["S256"]`, and `authorization_response_iss_parameter_supported: true`.
+   - Publish `issuer: "<public_url>"`, `authorization_endpoint`, `token_endpoint`, `registration_endpoint`, `revocation_endpoint`, `response_types_supported: ["code"]`, `response_modes_supported: ["query"]`, `grant_types_supported: ["authorization_code", "refresh_token"]`, `token_endpoint_auth_methods_supported: ["none", "client_secret_post", "client_secret_basic"]`, `code_challenge_methods_supported: ["S256"]`, and `authorization_response_iss_parameter_supported: true`. Unconfigured subpaths return `404`.
 3. `POST /oauth/register` (RFC 7591):
-   - Validates every `redirect_uri`. Rejects relative URLs, fragments, userinfo, OAuth response query keys, non-loopback `http://`, and hosts outside `allowed_redirect_hosts` when configured.
-   - Applies RFC 7591 defaults when omitted (`grant_types: ["authorization_code", "refresh_token"]`, `response_types: ["code"]`, `token_endpoint_auth_method: "none"`). Issues a random `client_secret` (storing only its SHA-256 hash) when `token_endpoint_auth_method` is `client_secret_post` or `client_secret_basic`.
-   - Evicts the oldest ungranted dynamically registered client when `max_registered_clients` is reached, so unauthenticated registration floods cannot exhaust storage or evict active grants.
+   - Validates each `redirect_uri` (rejecting relative URLs, fragments, userinfo, reserved OAuth response query parameters, non-loopback `http://`, and hosts outside `allowed_redirect_hosts`).
+   - Applies RFC 7591 defaults (`grant_types: ["authorization_code", "refresh_token"]`, `response_types: ["code"]`, `token_endpoint_auth_method: "none"`), mints a secret for confidential clients (persisting only its SHA-256 digest), and evicts only the oldest client with no active grants, pending logins, or authorization codes when `max_registered_clients` is full.
 4. `GET /oauth/authorize` and `POST /oauth/authorize`:
-   - Requires `response_type=code`, registered `client_id`, exact registered `redirect_uri`, `code_challenge_method=S256`, and valid base64url `code_challenge` (43 to 128 ASCII characters) for every client, both public and confidential.
-   - Validates optional RFC 8707 `resource`: accepts `<public_url>`, `<public_url>/`, or `<public_url><resource_path>`, normalizing to the full resource URL; rejects any other target with `invalid_target`.
-   - Binds the pending authorization request (`ar_id`, 5 minute TTL, max 256 pending entries) to the browser via an `HttpOnly; SameSite=Lax; Path=/oauth/authorize` CSRF cookie (`Secure` when `public_url` uses `https`) paired with a hidden form field.
-   - Rate-limits failed password submissions (max 10 failures per 15 minutes) and verifies the owner password with constant-time comparison.
-   - Renders a minimal HTML form with `Content-Security-Policy: default-src 'none'; style-src 'unsafe-inline'; form-action 'self'` and `X-Frame-Options: DENY`, showing only the client identifier, redirect URI, scopes, password input, and `Authorize` submit action.
-   - Returns `code`, `iss=<public_url>` (RFC 9207), and optional `state` to the validated callback. A browser receives a page that navigates to the callback as a fresh GET, outside the password form submission. Other clients get a `303 See Other` redirect.
+   - Require `response_type=code`, a registered `client_id`, an exact registered `redirect_uri`, and PKCE `S256` (`code_challenge` of 43 base64url characters, decoding to a 32-byte SHA-256 digest) for every client.
+   - Normalize optional RFC 8707 `resource` values (`<public_url>`, `<public_url>/`, or `<public_url><resource_path>`) to `<public_url><resource_path>`, rejecting any other target with `invalid_target`.
+   - Bind each pending login form (`5` minute TTL, up to `512` pending sessions total and `32` per client IP) to the browser using an `HttpOnly; SameSite=Lax` CSRF cookie: `__Host-mcp_ar_<id>` (`Secure; Path=/`) when `public_url` uses `https://`, or `mcp_ar_<id>` (`Path=/oauth/authorize`) on loopback `http://`.
+   - Render a self-contained login form with `Content-Security-Policy: default-src 'none'; style-src 'unsafe-inline'; form-action 'self'` and `X-Frame-Options: DENY`. The form displays client identity, callback URI, and requested scopes, provides both `Authorize` and `Cancel`/`Deny` (`error=access_denied`), caps password retries at 3 per form session, and rate-limits password failures per client IP using constant-time PBKDF2 verification.
+   - Issue a single-use authorization code (`5` minute TTL) and return `code`, `iss=<public_url>` (RFC 9207), and optional `state` to the callback.
 5. `POST /oauth/token`:
-   - `authorization_code`: consumes the single-use code (5 minute TTL), verifies client secret if confidential, verifies exact `redirect_uri` and `resource`, verifies `BASE64URL_NOPAD(SHA256(code_verifier)) == code_challenge`, selects the least-loaded `pool_slot`, persists SHA-256 digests of the new 256-bit `access_token` and `refresh_token`, and returns `Cache-Control: no-store`.
-   - `refresh_token`: supports concurrent multi-agent refresh bursts without weakening theft detection:
-     - First exchange of refresh token `R0` at time `t0` atomically marks `R0` rotated with `grace_until = min(R0.expires_at, t0 + refresh_grace_secs)`, mints `(A1, R1)` under the same `grant_id` and `pool_slot`, and caches the serialized token response in memory keyed by `hash(R0)` until `grace_until`.
-     - Retries within the grace window validate the client, resource, and current scope. They return the cached pair when its scope matches the current grant, regardless of scope order. Otherwise they mint a sibling pair without extending the grace window or the grant’s refresh ceiling.
-     - Any presentation of `R0` after `grace_until` triggers RFC 9700 reuse detection, revokes the entire `grant_id` (invalidating `A1`, `R1`, and all tokens in that grant), and immediately terminates any active `stdio` sessions bound to that grant.
+   - `authorization_code`: consumes the single-use code, authenticates confidential clients, checks `redirect_uri`, `resource`, and `BASE64URL_NOPAD(SHA256(code_verifier)) == code_challenge`, assigns the least-loaded `pool_slot`, records the grant creation timestamp for `max_grant_lifetime_secs`, persists SHA-256 digests of the initial access token and generation-0 refresh token, and responds with `Cache-Control: no-store`.
+   - `refresh_token`: implements single-tip generation-tracked rotation using structured tokens (`rt1.<grant_id>.<gen>.<nonce>.<tag>`):
+     - Rotating the active tip generation `G` advances the grant to `G + 1`, bounds expiry by both `refresh_token_ttl_secs` and the grant's `max_grant_lifetime_secs` deadline, persists SHA-256 digests of the active `G + 1` token and (during `refresh_grace_secs`) the grace `G` token in `state.json`, and caches the current tip token response in process memory until `grace_until`.
+     - Concurrent subagents presenting the grace token within `refresh_grace_secs` validate client credentials, resource, and scope, then receive the current tip response from memory so parallel callers converge on the latest tip even across multi-hop refreshes.
+     - Presenting a valid family refresh token from an older generation after `refresh_grace_secs` expires follows `refresh_reuse_policy`: `"converge"` (default) verifies client credentials, resource, HMAC family tag, and active grant lifetime, then returns the live tip response (or rotates the tip if memory cache is absent or expired) so paused parent or child MCP agents resume without tearing down sibling sessions; `"revoke"` triggers strict RFC 9700 reuse detection, revokes the entire `grant_id`, and terminates all bound HTTP and `stdio` sessions.
 6. `POST /oauth/revoke` (RFC 7009):
-   - Authenticates confidential clients, revokes the matching grant if found, immediately terminates any active `stdio` sessions bound to that grant, and returns `200 OK`.
+   - Requires client authentication (`client_id` matching the grant for public clients, or `client_secret_basic` / `client_secret_post` for confidential clients), revokes the owning grant when present, terminates all bound HTTP and `stdio` sessions, and returns `200 OK`.
 
-OAuth POST requests have a 64 KiB body limit and a 10-second body read deadline. Changing the public resource URL requires clients to authorize again. A retry of an already rotated refresh token within its grace period cannot narrow the current scope.
+OAuth `POST` endpoints enforce a `64 KiB` body limit and a `10` second read deadline. Changing `public_url` or `resource_path` invalidates existing resource-bound grants and requires re-authorization.
 
 ## 4. Upstream transport semantics
 
-When an `Origin` header is present on `/mcp` (both HTTP and `stdio` upstreams) or `/oauth/*` requests, the gateway validates it against `public_url` and rejects disallowed browser origins with `403 Forbidden`; non-browser clients omitting `Origin` are permitted.
-
 ### 4.1 HTTP upstream (`src/upstream_http.rs`)
 
-- Unauthenticated `/mcp` requests receive `401 Unauthorized` with `WWW-Authenticate: Bearer resource_metadata="<public_url>/.well-known/oauth-protected-resource<resource_path>"` and `Connection: close` before reading the request body.
-- Authenticated `/mcp` requests enforce a `16 MiB` JSON-RPC request body limit, strip hop-by-hop headers, incoming `Authorization`, and `Cookie` on the forwarded request, strip `Set-Cookie` on the upstream response, inject `Authorization: Bearer <bearer_tokens[grant.pool_slot]>` (when `bearer_tokens` is non-empty), set `X-Forwarded-Proto` from `public_url`, and stream the upstream response with `X-Accel-Buffering: no`.
-- When upstream responds with `Content-Type: text/event-stream`, the stream filter drops leading SSE blocks that contain no `data:` field (such as bare `retry:` or priming comment blocks) before the first JSON-RPC event, preventing Gemini Web connectors from failing on empty initial SSE events. All subsequent frames stream through unchanged.
-- Requests matching `passthrough_prefixes` verify path safety (rejecting `..`, `\`, NUL, and percent-encoded dot segments regardless of case), strip any incoming `Authorization` and `Cookie` headers as well as upstream `Set-Cookie` headers, and stream `GET`, `HEAD`, and `PUT` bodies directly in both directions with no body size cap and no memory buffering.
+- Unauthenticated requests on `<resource_path>` receive `401 Unauthorized` with `WWW-Authenticate: Bearer resource_metadata="<public_url>/.well-known/oauth-protected-resource<resource_path>"` and `Connection: close` before reading the request body.
+- Authenticated `<resource_path>` requests buffer JSON-RPC bodies up to `16 MiB` in full before forwarding upstream. When `upstream.url` uses `https://`, the connector enforces `.https_only()` verified against OS native TLS root certificates.
+- The bridge binds upstream `Mcp-Session-Id` values to the caller's OAuth `grant_id` and rejects cross-grant session access. Forwarded requests and responses strip hop-by-hop headers, client OAuth `Authorization`, `Origin`, `Cookie`, `Set-Cookie`, upstream `WWW-Authenticate`, and spoofed `X-User-*` headers, inject `Authorization: Bearer <bearer_tokens[grant.pool_slot]>` when `bearer_tokens` is non-empty, set `X-Forwarded-Proto` from `public_url`, and add `X-Accel-Buffering: no`.
+- On `Content-Type: text/event-stream` responses, the stream filter drops leading SSE blocks that carry no `data:` field (such as bare `retry:` lines or comment keepalives) before forwarding the event stream.
+- When a grant is revoked (by `POST /oauth/revoke` or refresh reuse detection), `HttpUpstream` cancels active response streams for that grant and dispatches upstream `DELETE` requests for its bound `Mcp-Session-Id` sessions.
+- Requests matching `passthrough_prefixes` reject path traversal (`..`, `\`, NUL bytes, and percent-encoded dot segments), enforce normalized `Origin` validation when `Origin` is present, strip `Authorization`, `Origin`, `Cookie`, `Set-Cookie`, and `X-User-*` headers, and stream `GET`, `HEAD`, and `PUT` bodies directly in both directions without buffering in memory.
 
 ### 4.2 Stdio upstream (`src/upstream_stdio.rs`)
 
-- Each `initialize` request without `Mcp-Session-Id` spawns an isolated child process (in its own `setsid` process group on Unix, or assigned to a Job Object on Windows to terminate the child process tree on close), forwards `initialize`, returns the upstream response verbatim with a newly generated `Mcp-Session-Id` header, and retains the live child under that session ID.
-- Subsequent `POST /mcp` requests carrying `Mcp-Session-Id` route JSON-RPC requests and notifications to that session's child stdin as single-line JSON. While a request is in flight, server-initiated notifications targeting that request (such as `notifications/progress`) and matching JSON-RPC responses stream out as `text/event-stream` `data: <json>\n\n` events (with no empty priming frame). If the HTTP client disconnects before the response arrives, the gateway writes `notifications/cancelled` for that request ID to the child.
-- Sessionless requests carrying `MCP-Protocol-Version: 2026-07-28` or `_meta["io.modelcontextprotocol/protocolVersion"] = "2026-07-28"` without `Mcp-Session-Id` run on an ephemeral initialized child process, stream matching notifications and the final JSON-RPC response live as `text/event-stream`, and terminate the child as soon as the response completes.
-- `DELETE /mcp` with `Mcp-Session-Id`, grant revocation (via `POST /oauth/revoke` or refresh-token reuse detection), idle session expiry (`session_idle_secs`), or gateway shutdown terminates the session immediately: on Unix it closes child stdin, sends `SIGTERM` to the child's process group after `200 ms`, escalates to `SIGKILL` after `2 s`, and reaps the child; on Windows it closes the Job Object to terminate the child process tree.
+- Every spawned child starts with `env_clear()`, receiving only minimal OS runtime variables alongside explicit `upstream.env` entries.
+- On `initialize` without `Mcp-Session-Id`, the gateway spawns a dedicated child process, assigns it to a fresh `setsid` process group on Unix or a mandatory Job Object configured with `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE` on Windows (working as a nested Job Object without `CREATE_BREAKAWAY_FROM_JOB`), forwards `initialize`, and binds the returned `Mcp-Session-Id` to the caller's `grant_id`.
+- Subsequent `POST <resource_path>` calls rewrite JSON-RPC `id`, cancellation `requestId`, `_meta.relatedRequestId`, and `_meta.progressToken` per wire request so concurrent calls on one session cannot collide, then restore the caller's identifiers on matching `text/event-stream` notifications and responses while leaving tool schemas and payloads untouched.
+- The stdout reader answers child-initiated `ping` requests directly and returns JSON-RPC method-not-found errors for unsupported server-to-client requests so children never block waiting for a client reply. If an HTTP caller disconnects before its response arrives, the gateway writes `notifications/cancelled` with the mapped wire `requestId` to child stdin.
+- Sessionless requests carrying `MCP-Protocol-Version: 2026-07-28` or `_meta["io.modelcontextprotocol/protocolVersion"] = "2026-07-28"` without `Mcp-Session-Id` run on an ephemeral initialized child process, stream SSE events as they arrive, and terminate the child when the response finishes.
+- `DELETE <resource_path>`, grant revocation, idle expiry (`session_idle_secs`), or gateway shutdown immediately terminates bound stateful, initializing, and sessionless children. On Unix, the gateway keeps child group leaders unreaped via `waitid(..., WNOWAIT)` while signaling the process group (`SIGTERM` after stdin close, escalating to `SIGKILL`) and reaps the leader only after group termination completes; on Windows, closing the Job Object terminates the entire child process tree.

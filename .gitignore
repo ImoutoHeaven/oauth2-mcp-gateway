@@ -2,3 +2,9 @@
 **/*.rs.bk
 *.swp
 .DS_Store
+/ci-*.log
+/ci-freebsd-exit-code.txt
+/ci-freebsd-run.*
+/gateway.json
+/state.json
+.*.tmp.*
