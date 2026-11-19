@@ -1,9 +1,8 @@
 use crate::config::StdioUpstreamSettings;
 use crate::crypto::{constant_time_eq_str, random_token_b64};
-use crate::types::{HttpReply, VerifiedToken, bytes_body, empty_body};
+use crate::types::{HttpReply, VerifiedToken, bytes_body, empty_body, method_not_allowed};
 use crate::upstream_http::{
     ContentLengthCheck, MAX_MCP_BODY_BYTES, check_content_length_limit, close_empty_reply,
-    method_not_allowed,
 };
 use bytes::Bytes;
 use http::{HeaderMap, HeaderName, Method, Request, Response, StatusCode, header};

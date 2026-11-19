@@ -1,9 +1,7 @@
 use crate::config::{GatewayConfig, UpstreamSettings, is_loopback_host};
 use crate::oauth::OAuthEngine;
-use crate::types::{HttpReply, ReplyBody, empty_body, json_reply};
-use crate::upstream_http::{
-    HttpUpstream, close_empty_reply, is_safe_request_path, method_not_allowed,
-};
+use crate::types::{HttpReply, ReplyBody, empty_body, json_reply, method_not_allowed};
+use crate::upstream_http::{HttpUpstream, close_empty_reply, is_safe_request_path};
 use crate::upstream_stdio::StdioUpstream;
 use bytes::Bytes;
 use http::{HeaderMap, HeaderValue, Method, Request, Response, StatusCode, header};

@@ -1,6 +1,8 @@
 use crate::config::HttpUpstreamSettings;
 use crate::crypto::constant_time_eq_str;
-use crate::types::{HttpReply, ReplyBody, VerifiedToken, bytes_body, empty_body};
+use crate::types::{
+    HttpReply, ReplyBody, VerifiedToken, bytes_body, empty_body, hex_nibble, method_not_allowed,
+};
 use bytes::{Bytes, BytesMut};
 use http::{
     HeaderMap, HeaderName, HeaderValue, Method, Request, Response, StatusCode, Uri, header,
@@ -919,15 +921,6 @@ fn is_safe_path_slice(bytes: &[u8]) -> bool {
     true
 }
 
-fn hex_nibble(b: u8) -> Option<u8> {
-    match b {
-        b'0'..=b'9' => Some(b - b'0'),
-        b'a'..=b'f' => Some(b - b'a' + 10),
-        b'A'..=b'F' => Some(b - b'A' + 10),
-        _ => None,
-    }
-}
-
 pub(crate) enum ContentLengthCheck {
     Ok,
     Invalid,
@@ -1064,15 +1057,6 @@ fn empty_status_reply(status: StatusCode) -> HttpReply {
         .header(header::CACHE_CONTROL, "no-store")
         .body(empty_body())
         .expect("valid status reply")
-}
-
-pub(crate) fn method_not_allowed(allow: &'static str) -> HttpReply {
-    Response::builder()
-        .status(StatusCode::METHOD_NOT_ALLOWED)
-        .header(header::ALLOW, allow)
-        .header(header::CACHE_CONTROL, "no-store")
-        .body(empty_body())
-        .expect("valid 405 reply")
 }
 
 struct SsePrimingFilterBody<B> {

@@ -652,6 +652,7 @@ async fn e2e_ten_way_concurrent_refresh_rotation_and_replay_breach() {
             "owner_password_hash": fast_owner_hash(),
             "scopes": ["mcp"],
             "refresh_grace_secs": 2,
+            "refresh_reuse_policy": "revoke",
         },
         "upstream": {
             "transport": "http",
