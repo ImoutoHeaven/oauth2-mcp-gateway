@@ -6,28 +6,32 @@ on:
   pull_request:
     branches: [main]
   workflow_dispatch:
+  workflow_call:
 
 permissions:
   contents: read
 
 concurrency:
   group: ci-${{ github.ref }}
-  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+  cancel-in-progress: ${{ startsWith(github.ref, 'refs/heads/wip/') || startsWith(github.ref, 'refs/heads/fix/') || github.event_name == 'pull_request' }}
 
 env:
   CARGO_TERM_COLOR: always
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
 
 jobs:
   test:
     name: test (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
-    timeout-minutes: 45
+    timeout-minutes: 60
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, windows-latest, macos-latest]
+        os: [ubuntu-latest, windows-latest, windows-11-arm, macos-latest]
     steps:
       - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
 
       - uses: dtolnay/rust-toolchain@stable
         with:
@@ -38,36 +42,97 @@ jobs:
       - name: cargo fmt --check
         run: cargo fmt --check
 
-      - name: cargo clippy -D warnings
+      - name: cargo clippy
         run: cargo clippy --locked --all-targets -- -D warnings
 
-      - name: cargo test
-        run: cargo test --locked
+      - name: check x86_64-apple-darwin target
+        if: runner.os == 'macOS'
+        run: |
+          rustup target add x86_64-apple-darwin
+          cargo check --locked --all-targets --target x86_64-apple-darwin
+
+      - name: cargo build --release
+        run: cargo build --release --locked
+
+      - name: test (unix)
+        if: runner.os != 'Windows'
+        run: python3 scripts/ci/run-tests.py --timeout 600
+
+      - name: test (windows)
+        if: runner.os == 'Windows'
+        run: python scripts/ci/run-tests.py --timeout 600
+
+      - name: test log
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-log-${{ matrix.os }}
+          path: |
+            ci-test.log
+            ci-*.log
+          if-no-files-found: ignore
 
   debian:
     name: test (debian-bookworm)
     runs-on: ubuntu-24.04
-    timeout-minutes: 45
+    timeout-minutes: 60
     steps:
       - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
 
-      - name: Debian container build and tests
+      - name: Debian Bookworm container build and tests
         run: |
           docker run --rm --init -v "$GITHUB_WORKSPACE:/workspace" -w /workspace \
-            -e CARGO_BUILD_JOBS=2 -e CARGO_TERM_COLOR=always -e DEBIAN_FRONTEND=noninteractive \
-            rust:1.92-slim-bookworm sh -ec '
+            -e CARGO_BUILD_JOBS=2 \
+            -e CARGO_TERM_COLOR=always \
+            -e CARGO_TARGET_DIR=/tmp/oauth2-mcp-gateway-target \
+            -e DEBIAN_FRONTEND=noninteractive \
+            rust:1.92.0-slim-bookworm sh -ec '
               apt-get update
               apt-get install -y --no-install-recommends gcc libc6-dev python3 ca-certificates
               rustup component add rustfmt clippy
               cargo fmt --check
               cargo clippy --locked --all-targets -- -D warnings
-              cargo test --locked
+              cargo build --release --locked
+              cargo test --locked --no-run
+              # Drop root before running tests so Unix 0600 and 0700 permission checks apply.
+              log_dir=$(mktemp -d /tmp/oauth2-mcp-gateway-logs.XXXXXX)
+              cargo_home_nobody="$log_dir/cargo-home"
+              mkdir -p "$cargo_home_nobody"
+              ln -s /usr/local/cargo/bin "$cargo_home_nobody/bin"
+              ln -s /usr/local/cargo/registry "$cargo_home_nobody/registry"
+              [ -d /usr/local/cargo/git ] && ln -s /usr/local/cargo/git "$cargo_home_nobody/git"
+              chown -R nobody "$log_dir" "$CARGO_TARGET_DIR"
+              chmod -R o+rX /workspace /usr/local/rustup /usr/local/cargo
+              status=0
+              su -s /bin/sh nobody -c "
+                export PATH=/usr/local/cargo/bin:\$PATH
+                export RUSTUP_HOME=/usr/local/rustup
+                export CARGO_HOME=$cargo_home_nobody
+                export CARGO_TARGET_DIR=/tmp/oauth2-mcp-gateway-target
+                export CI_LOG_DIR=$log_dir
+                export HOME=$log_dir
+                python3 scripts/ci/run-tests.py --timeout 600
+              " || status=$?
+              cp -f "$log_dir"/ci-*.log /workspace/ 2>/dev/null || true
+              exit "$status"
             '
+
+      - name: test log
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-log-debian-bookworm
+          path: |
+            ci-test.log
+            ci-*.log
+          if-no-files-found: ignore
 
   alpine:
     name: test (alpine-${{ matrix.arch }})
     runs-on: ${{ matrix.runner }}
-    timeout-minutes: 45
+    timeout-minutes: 60
     strategy:
       fail-fast: false
       matrix:
@@ -76,18 +141,54 @@ jobs:
           - { arch: arm64, runner: ubuntu-24.04-arm }
     steps:
       - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
 
-      - name: Alpine container build and tests
+      - name: Alpine musl container build and tests
         run: |
           docker run --rm --init -v "$GITHUB_WORKSPACE:/workspace" -w /workspace \
-            -e CARGO_BUILD_JOBS=2 -e CARGO_TERM_COLOR=always \
+            -e CARGO_BUILD_JOBS=2 \
+            -e CARGO_TERM_COLOR=always \
+            -e CARGO_TARGET_DIR=/tmp/oauth2-mcp-gateway-target \
             rust:1.92.0-alpine3.23 sh -ec '
               apk add --no-cache build-base python3 ca-certificates
               rustup component add rustfmt clippy
               cargo fmt --check
               cargo clippy --locked --all-targets -- -D warnings
-              cargo test --locked
+              cargo build --release --locked
+              cargo test --locked --no-run
+              # Drop root before running tests so Unix 0600 and 0700 permission checks hold on musl.
+              log_dir=$(mktemp -d /tmp/oauth2-mcp-gateway-logs.XXXXXX)
+              cargo_home_nobody="$log_dir/cargo-home"
+              mkdir -p "$cargo_home_nobody"
+              ln -s /usr/local/cargo/bin "$cargo_home_nobody/bin"
+              ln -s /usr/local/cargo/registry "$cargo_home_nobody/registry"
+              [ -d /usr/local/cargo/git ] && ln -s /usr/local/cargo/git "$cargo_home_nobody/git"
+              chown -R nobody "$log_dir" "$CARGO_TARGET_DIR"
+              chmod -R o+rX /workspace /usr/local/rustup /usr/local/cargo
+              status=0
+              su -s /bin/sh nobody -c "
+                export PATH=/usr/local/cargo/bin:\$PATH
+                export RUSTUP_HOME=/usr/local/rustup
+                export CARGO_HOME=$cargo_home_nobody
+                export CARGO_TARGET_DIR=/tmp/oauth2-mcp-gateway-target
+                export CI_LOG_DIR=$log_dir
+                export HOME=$log_dir
+                python3 scripts/ci/run-tests.py --timeout 600
+              " || status=$?
+              cp -f "$log_dir"/ci-*.log /workspace/ 2>/dev/null || true
+              exit "$status"
             '
+
+      - name: test log
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-log-alpine-${{ matrix.arch }}
+          path: |
+            ci-test.log
+            ci-*.log
+          if-no-files-found: ignore
 
   freebsd:
     name: test (freebsd-15.1-amd64)
@@ -95,6 +196,8 @@ jobs:
     timeout-minutes: 60
     steps:
       - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
 
       - name: native FreeBSD build and tests
         uses: vmactions/freebsd-vm@c46abacb49f09938ca4e1702d15d836285d694cc # v1.5.9
@@ -104,7 +207,7 @@ jobs:
           mem: 6144
           cpu: 4
           prepare: |
-            pkg install -y rust python3
+            pkg install -y rust python3 ca_root_nss
           run: |
             set -eu
             run_script=$(mktemp ./ci-freebsd-run.XXXXXX)
@@ -117,8 +220,10 @@ jobs:
             rustc --version
             cargo fmt --check
             cargo clippy --locked --all-targets -- -D warnings
-            cargo test --locked
+            cargo build --release --locked
+            python3 scripts/ci/run-tests.py --timeout 600
             FREEBSD
+            # Record the guest exit code in a synced file before enforcing failure on the host.
             if sh "$run_script" > ci-freebsd.log 2>&1; then
               status=0
             else
@@ -145,6 +250,7 @@ jobs:
         with:
           name: test-log-freebsd-15.1-amd64
           path: |
-            ci-freebsd.log
+            ci-test.log
+            ci-*.log
             ci-freebsd-exit-code.txt
           if-no-files-found: ignore
