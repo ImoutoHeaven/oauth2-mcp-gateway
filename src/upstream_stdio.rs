@@ -17,13 +17,14 @@ use std::io;
 use std::pin::Pin;
 use std::process::Stdio;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, Weak};
 use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{Child, Command};
+use tokio::sync::mpsc::error::TrySendError;
 use tokio::sync::{mpsc, oneshot};
-use tokio::task::JoinSet;
+use tokio::task::{JoinHandle, JoinSet};
 use tokio_util::sync::CancellationToken;
 
 const BODY_READ_TIMEOUT: Duration = Duration::from_secs(30);
@@ -33,9 +34,45 @@ const STDIN_GRACE_WAIT: Duration = Duration::from_millis(200);
 const SIGTERM_WAIT: Duration = Duration::from_secs(2);
 const STDIN_CHANNEL_CAPACITY: usize = 64;
 const NOTIF_CHANNEL_CAPACITY: usize = 256;
-const MAX_STDOUT_LINE_BYTES: usize = 64 * 1024 * 1024;
+const MAX_IN_FLIGHT_PER_SESSION: usize = 64;
+const MAX_STDOUT_LINE_BYTES: usize = MAX_MCP_BODY_BYTES;
+const MAX_GRANT_EPOCHS: usize = 4096;
 const SESSIONLESS_META_KEY: &str = "io.modelcontextprotocol/protocolVersion";
 const MIN_SESSIONLESS_PROTOCOL_VERSION: &str = "2026-07-28";
+
+const SAFE_ENV_ALLOWLIST: &[&str] = &[
+    "PATH",
+    "HOME",
+    "TMPDIR",
+    "TZ",
+    "LANG",
+    "LC_ALL",
+    "LC_CTYPE",
+    "USER",
+    "LOGNAME",
+    "XDG_RUNTIME_DIR",
+    "XDG_CACHE_HOME",
+    "XDG_CONFIG_HOME",
+    "SSL_CERT_FILE",
+    "SSL_CERT_DIR",
+    "SYSTEMROOT",
+    "SystemRoot",
+    "WINDIR",
+    "COMSPEC",
+    "PATHEXT",
+    "TEMP",
+    "TMP",
+    "USERPROFILE",
+    "APPDATA",
+    "LOCALAPPDATA",
+    "ProgramFiles",
+    "ProgramFiles(x86)",
+    "ProgramData",
+    "CommonProgramFiles",
+    "SYSTEMDRIVE",
+];
+
+static NEXT_SESSION_UID: AtomicU64 = AtomicU64::new(1);
 
 pub struct StdioUpstream {
     inner: Arc<StdioInner>,
@@ -46,18 +83,51 @@ struct StdioInner {
     settings: StdioUpstreamSettings,
     epoch: Instant,
     table: Mutex<SessionTable>,
+    bg_terminations: Mutex<Vec<(String, JoinHandle<()>)>>,
 }
 
 struct SessionTable {
     sessions: HashMap<String, Arc<StdioSession>>,
+    live_sessions: Vec<Arc<StdioSession>>,
+    grant_epochs: HashMap<String, (u64, u64)>,
+    epoch_seq: u64,
     reserved_slots: usize,
     shutting_down: bool,
+}
+
+impl SessionTable {
+    fn grant_epoch(&self, grant_id: &str) -> u64 {
+        self.grant_epochs
+            .get(grant_id)
+            .map(|&(ep, _)| ep)
+            .unwrap_or(0)
+    }
+
+    fn bump_grant_epoch(&mut self, grant_id: &str) {
+        self.epoch_seq = self.epoch_seq.wrapping_add(1);
+        let seq = self.epoch_seq;
+        if let Some(entry) = self.grant_epochs.get_mut(grant_id) {
+            entry.0 = entry.0.wrapping_add(1);
+            entry.1 = seq;
+            return;
+        }
+        if self.grant_epochs.len() >= MAX_GRANT_EPOCHS
+            && let Some(oldest_key) = self
+                .grant_epochs
+                .iter()
+                .min_by_key(|(_, (_, s))| *s)
+                .map(|(k, _)| k.clone())
+        {
+            self.grant_epochs.remove(&oldest_key);
+        }
+        self.grant_epochs.insert(grant_id.to_owned(), (1, seq));
+    }
 }
 
 struct InFlightEntry {
     wire_id: u64,
     client_id: Value,
-    progress_token: Option<Value>,
+    client_progress_token: Option<Value>,
     notif_tx: mpsc::Sender<String>,
     resp_tx: oneshot::Sender<String>,
 }
@@ -73,18 +143,20 @@ unsafe impl Sync for WindowsJobObject {}
 
 #[cfg(windows)]
 impl WindowsJobObject {
-    fn create_and_assign(child: &Child) -> Option<Self> {
-        use windows_sys::Win32::Foundation::{CloseHandle, HANDLE};
+    fn create() -> Result<Self, String> {
+        use windows_sys::Win32::Foundation::CloseHandle;
         use windows_sys::Win32::System::JobObjects::{
-            AssignProcessToJobObject, CreateJobObjectW, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
+            CreateJobObjectW, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
             JOBOBJECT_EXTENDED_LIMIT_INFORMATION, JobObjectExtendedLimitInformation,
             SetInformationJobObject,
         };
 
-        let raw_handle = child.raw_handle()?;
         let job = unsafe { CreateJobObjectW(std::ptr::null(), std::ptr::null()) };
         if job.is_null() {
-            return None;
+            return Err(format!(
+                "CreateJobObjectW failed: {}",
+                io::Error::last_os_error()
+            ));
         }
 
         let mut info: JOBOBJECT_EXTENDED_LIMIT_INFORMATION = unsafe { std::mem::zeroed() };
@@ -98,21 +170,31 @@ impl WindowsJobObject {
             )
         };
         if ok == 0 {
+            let err = io::Error::last_os_error();
             unsafe {
                 CloseHandle(job);
             }
-            return None;
+            return Err(format!("SetInformationJobObject failed: {err}"));
         }
 
-        let assigned = unsafe { AssignProcessToJobObject(job, raw_handle as HANDLE) };
+        Ok(Self(job))
+    }
+
+    fn assign(&self, child: &Child) -> Result<(), String> {
+        use windows_sys::Win32::Foundation::HANDLE;
+        use windows_sys::Win32::System::JobObjects::AssignProcessToJobObject;
+
+        let raw_handle = child
+            .raw_handle()
+            .ok_or_else(|| "child process handle unavailable".to_owned())?;
+        let assigned = unsafe { AssignProcessToJobObject(self.0, raw_handle as HANDLE) };
         if assigned == 0 {
-            unsafe {
-                CloseHandle(job);
-            }
-            return None;
+            return Err(format!(
+                "AssignProcessToJobObject failed: {}",
+                io::Error::last_os_error()
+            ));
         }
-
-        Some(Self(job))
+        Ok(())
     }
 }
 
@@ -129,8 +211,11 @@ impl Drop for WindowsJobObject {
 }
 
 struct StdioSession {
+    uid: u64,
     grant_id: String,
-    stdin_tx: Mutex<Option<mpsc::Sender<Vec<u8>>>>,
+    weak_inner: Weak<StdioInner>,
+    writer_cancel: CancellationToken,
+    stdin_tx: Arc<Mutex<Option<mpsc::Sender<Vec<u8>>>>>,
     in_flight: Arc<Mutex<Vec<InFlightEntry>>>,
     next_wire_id: AtomicU64,
     alive: Arc<AtomicBool>,
@@ -149,9 +234,13 @@ impl StdioUpstream {
             epoch: Instant::now(),
             table: Mutex::new(SessionTable {
                 sessions: HashMap::new(),
+                live_sessions: Vec::new(),
+                grant_epochs: HashMap::new(),
+                epoch_seq: 0,
                 reserved_slots: 0,
                 shutting_down: false,
             }),
+            bg_terminations: Mutex::new(Vec::new()),
         });
         let reaper_cancel = CancellationToken::new();
 
@@ -194,31 +283,52 @@ impl StdioUpstream {
     pub async fn terminate_grant(&self, grant_id: &str) {
         let matched: Vec<Arc<StdioSession>> = {
             let mut tbl = self.inner.table.lock().unwrap_or_else(|p| p.into_inner());
+            tbl.bump_grant_epoch(grant_id);
             let keys: Vec<String> = tbl
                 .sessions
                 .iter()
                 .filter(|(_, s)| constant_time_eq_str(&s.grant_id, grant_id))
                 .map(|(k, _)| k.clone())
                 .collect();
-            keys.into_iter()
-                .filter_map(|k| tbl.sessions.remove(&k))
+            for k in keys {
+                tbl.sessions.remove(&k);
+            }
+            tbl.live_sessions
+                .iter()
+                .filter(|s| constant_time_eq_str(&s.grant_id, grant_id))
+                .cloned()
                 .collect()
         };
         terminate_all(matched).await;
+
+        let bg_handles = drain_bg_terminations(&self.inner, Some(grant_id));
+        for h in bg_handles {
+            let _ = h.await;
+        }
     }
 
     pub async fn shutdown(&self) {
         self.reaper_cancel.cancel();
-        let drained: Vec<Arc<StdioSession>> = {
-            let mut guard = self.inner.table.lock().unwrap_or_else(|p| p.into_inner());
-            guard.shutting_down = true;
-            guard.sessions.drain().map(|(_, s)| s).collect()
-        };
-        terminate_all(drained).await;
+        loop {
+            let live: Vec<Arc<StdioSession>> = {
+                let mut tbl = self.inner.table.lock().unwrap_or_else(|p| p.into_inner());
+                tbl.shutting_down = true;
+                tbl.sessions.clear();
+                tbl.live_sessions.clone()
+            };
+            let bg_handles = drain_bg_terminations(&self.inner, None);
+            if live.is_empty() && bg_handles.is_empty() {
+                break;
+            }
+            terminate_all(live).await;
+            for h in bg_handles {
+                let _ = h.await;
+            }
+        }
     }
 
     async fn handle_delete(&self, headers: &HeaderMap, token: &VerifiedToken) -> HttpReply {
-        let Some(sid) = extract_single_header(headers, "mcp-session-id") else {
+        let Some(sid) = extract_valid_session_id(headers) else {
             return close_empty_reply(StatusCode::BAD_REQUEST);
         };
         let removed = {
@@ -266,10 +376,10 @@ impl StdioUpstream {
                 "duplicate Mcp-Session-Id header",
             );
         }
-        let session_id_hdr = match parts.headers.get("mcp-session-id") {
-            Some(raw) => match raw.to_str() {
-                Ok(s) if !s.trim().is_empty() => Some(s.trim().to_owned()),
-                _ => {
+        let session_id_hdr = if parts.headers.contains_key("mcp-session-id") {
+            match extract_valid_session_id(&parts.headers) {
+                Some(sid) => Some(sid.to_owned()),
+                None => {
                     return jsonrpc_error_reply(
                         StatusCode::BAD_REQUEST,
                         Value::Null,
@@ -277,8 +387,9 @@ impl StdioUpstream {
                         "invalid Mcp-Session-Id header",
                     );
                 }
-            },
-            None => None,
+            }
+        } else {
+            None
         };
 
         let body_bytes = match tokio::time::timeout(
@@ -315,8 +426,64 @@ impl StdioUpstream {
             );
         };
 
-        let method = obj.get("method").and_then(Value::as_str);
-        let req_id = obj.get("id").filter(|v| !v.is_null()).cloned();
+        let fallback_err_id = obj
+            .get("id")
+            .filter(|v| v.is_string() || v.is_number())
+            .cloned()
+            .unwrap_or(Value::Null);
+
+        if obj.get("jsonrpc").and_then(Value::as_str) != Some("2.0") {
+            return jsonrpc_error_reply(
+                StatusCode::BAD_REQUEST,
+                fallback_err_id,
+                -32600,
+                "invalid JSON-RPC version",
+            );
+        }
+
+        let (method, req_id) = if let Some(raw_method) = obj.get("method") {
+            let Some(m) = raw_method.as_str().filter(|m| !m.is_empty()) else {
+                return jsonrpc_error_reply(
+                    StatusCode::BAD_REQUEST,
+                    fallback_err_id,
+                    -32600,
+                    "invalid JSON-RPC method",
+                );
+            };
+            let req_id = match obj.get("id") {
+                None => None,
+                Some(id) if id.is_string() || id.is_number() => Some(id.clone()),
+                Some(_) => {
+                    return jsonrpc_error_reply(
+                        StatusCode::BAD_REQUEST,
+                        Value::Null,
+                        -32600,
+                        "invalid JSON-RPC id",
+                    );
+                }
+            };
+            (Some(m), req_id)
+        } else {
+            if !obj.contains_key("result") && !obj.contains_key("error") {
+                return jsonrpc_error_reply(
+                    StatusCode::BAD_REQUEST,
+                    fallback_err_id,
+                    -32600,
+                    "invalid JSON-RPC message",
+                );
+            }
+            if let Some(id) = obj.get("id")
+                && !(id.is_string() || id.is_number() || id.is_null())
+            {
+                return jsonrpc_error_reply(
+                    StatusCode::BAD_REQUEST,
+                    Value::Null,
+                    -32600,
+                    "invalid JSON-RPC id",
+                );
+            }
+            (None, None)
+        };
 
         if let Some(sid) = session_id_hdr {
             return self
@@ -332,7 +499,7 @@ impl StdioUpstream {
 
         if let Some(proto_ver) = detect_sessionless_version(&parts.headers, obj) {
             return self
-                .handle_sessionless(&parts.headers, &proto_ver, &payload, method, req_id)
+                .handle_sessionless(&parts.headers, token, &proto_ver, &payload, method, req_id)
                 .await;
         }
 
@@ -360,6 +527,11 @@ impl StdioUpstream {
             );
         };
 
+        let start_epoch = {
+            let tbl = self.inner.table.lock().unwrap_or_else(|p| p.into_inner());
+            tbl.grant_epoch(&token.grant_id)
+        };
+
         let Some(reservation) = acquire_slot(&self.inner).await else {
             return jsonrpc_error_reply(
                 StatusCode::SERVICE_UNAVAILABLE,
@@ -369,17 +541,28 @@ impl StdioUpstream {
             );
         };
 
-        let session = match StdioSession::spawn(&self.inner, token.grant_id.clone()) {
-            Ok(s) => s,
-            Err(err) => {
-                drop(reservation);
-                return jsonrpc_error_reply(StatusCode::BAD_GATEWAY, id, -32000, &err);
-            }
-        };
+        let session =
+            match StdioSession::spawn(&self.inner, token.grant_id.clone(), start_epoch).await {
+                Ok(s) => s,
+                Err(err) => {
+                    drop(reservation);
+                    return jsonrpc_error_reply(StatusCode::BAD_GATEWAY, id, -32000, &err);
+                }
+            };
         let mut ephemeral = EphemeralGuard::new(Arc::clone(&session));
 
-        let (wire_id, mut guard, notif_rx, resp_rx) =
-            session.register_request(id.clone(), extract_progress_token(payload));
+        let Some((wire_id, mut guard, notif_rx, resp_rx)) =
+            session.register_request(id.clone(), extract_progress_token(payload))
+        else {
+            ephemeral.terminate_now().await;
+            drop(reservation);
+            return jsonrpc_error_reply(
+                StatusCode::SERVICE_UNAVAILABLE,
+                id,
+                -32000,
+                "too many concurrent requests in session",
+            );
+        };
         drop(notif_rx);
         if session.send_request_line(payload, wire_id).is_err() {
             guard.disarm();
@@ -422,6 +605,25 @@ impl StdioUpstream {
             }
         };
 
+        match classify_init_response(&init_line) {
+            InitOutcome::Ok => {}
+            InitOutcome::RpcError => {
+                ephemeral.terminate_now().await;
+                drop(reservation);
+                return single_rpc_reply(headers, None, init_line);
+            }
+            InitOutcome::Malformed => {
+                ephemeral.terminate_now().await;
+                drop(reservation);
+                return jsonrpc_error_reply(
+                    StatusCode::BAD_GATEWAY,
+                    id,
+                    -32000,
+                    "invalid initialize response from upstream",
+                );
+            }
+        }
+
         let session_id = match random_token_b64(24) {
             Ok(s) => s,
             Err(err) => {
@@ -433,7 +635,10 @@ impl StdioUpstream {
 
         let inserted = {
             let mut tbl = self.inner.table.lock().unwrap_or_else(|p| p.into_inner());
-            if tbl.shutting_down {
+            if tbl.shutting_down
+                || !session.alive.load(Ordering::Acquire)
+                || tbl.grant_epoch(&token.grant_id) != start_epoch
+            {
                 false
             } else {
                 tbl.sessions
@@ -449,7 +654,7 @@ impl StdioUpstream {
                 StatusCode::SERVICE_UNAVAILABLE,
                 id,
                 -32000,
-                "gateway is shutting down",
+                "session terminated during initialize",
             );
         }
 
@@ -480,6 +685,16 @@ impl StdioUpstream {
         let Some(session) = session else {
             return jsonrpc_error_reply(StatusCode::NOT_FOUND, err_id, -32001, "session not found");
         };
+
+        if method == Some("initialize") {
+            return jsonrpc_error_reply(
+                StatusCode::BAD_REQUEST,
+                err_id,
+                -32600,
+                "session is already initialized",
+            );
+        }
+
         session.touch();
 
         let is_request = method.is_some() && req_id.is_some();
@@ -517,8 +732,16 @@ impl StdioUpstream {
         }
 
         let id = req_id.unwrap();
-        let (wire_id, mut guard, notif_rx, resp_rx) =
-            session.register_request(id.clone(), extract_progress_token(payload));
+        let Some((wire_id, mut guard, notif_rx, resp_rx)) =
+            session.register_request(id.clone(), extract_progress_token(payload))
+        else {
+            return jsonrpc_error_reply(
+                StatusCode::SERVICE_UNAVAILABLE,
+                id,
+                -32000,
+                "too many concurrent requests in session",
+            );
+        };
         if session.send_request_line(payload, wire_id).is_err() {
             guard.disarm();
             if !session.alive.load(Ordering::Acquire) {
@@ -587,12 +810,18 @@ impl StdioUpstream {
     async fn handle_sessionless(
         &self,
         headers: &HeaderMap,
+        token: &VerifiedToken,
         protocol_version: &str,
         payload: &Value,
         method: Option<&str>,
         req_id: Option<Value>,
     ) -> HttpReply {
         let err_id = req_id.clone().unwrap_or(Value::Null);
+        let start_epoch = {
+            let tbl = self.inner.table.lock().unwrap_or_else(|p| p.into_inner());
+            tbl.grant_epoch(&token.grant_id)
+        };
+
         let Some(reservation) = acquire_slot(&self.inner).await else {
             return jsonrpc_error_reply(
                 StatusCode::SERVICE_UNAVAILABLE,
@@ -602,13 +831,14 @@ impl StdioUpstream {
             );
         };
 
-        let session = match StdioSession::spawn(&self.inner, String::new()) {
-            Ok(s) => s,
-            Err(err) => {
-                drop(reservation);
-                return jsonrpc_error_reply(StatusCode::BAD_GATEWAY, err_id, -32000, &err);
-            }
-        };
+        let session =
+            match StdioSession::spawn(&self.inner, token.grant_id.clone(), start_epoch).await {
+                Ok(s) => s,
+                Err(err) => {
+                    drop(reservation);
+                    return jsonrpc_error_reply(StatusCode::BAD_GATEWAY, err_id, -32000, &err);
+                }
+            };
         let mut ephemeral = EphemeralGuard::new(Arc::clone(&session));
 
         let synth_init = json!({
@@ -625,8 +855,18 @@ impl StdioUpstream {
             }
         });
 
-        let (init_wire_id, mut init_guard, init_notif_rx, init_resp_rx) =
-            session.register_request(json!(0), None);
+        let Some((init_wire_id, mut init_guard, init_notif_rx, init_resp_rx)) =
+            session.register_request(json!(0), None)
+        else {
+            ephemeral.terminate_now().await;
+            drop(reservation);
+            return jsonrpc_error_reply(
+                StatusCode::SERVICE_UNAVAILABLE,
+                err_id,
+                -32000,
+                "too many concurrent requests in session",
+            );
+        };
         drop(init_notif_rx);
         if session
             .send_request_line(&synth_init, init_wire_id)
@@ -643,8 +883,11 @@ impl StdioUpstream {
             );
         }
 
-        match tokio::time::timeout(INIT_TIMEOUT, init_resp_rx).await {
-            Ok(Ok(_)) => init_guard.mark_completed(),
+        let init_line = match tokio::time::timeout(INIT_TIMEOUT, init_resp_rx).await {
+            Ok(Ok(line)) => {
+                init_guard.mark_completed();
+                line
+            }
             Ok(Err(_)) => {
                 init_guard.disarm();
                 ephemeral.terminate_now().await;
@@ -667,6 +910,17 @@ impl StdioUpstream {
                     "ephemeral initialize timed out",
                 );
             }
+        };
+
+        if !matches!(classify_init_response(&init_line), InitOutcome::Ok) {
+            ephemeral.terminate_now().await;
+            drop(reservation);
+            return jsonrpc_error_reply(
+                StatusCode::BAD_GATEWAY,
+                err_id,
+                -32000,
+                "ephemeral initialize rejected by upstream",
+            );
         }
 
         let initialized_note = json!({
@@ -706,8 +960,18 @@ impl StdioUpstream {
         }
 
         let id = req_id.unwrap();
-        let (wire_id, mut guard, notif_rx, resp_rx) =
-            session.register_request(id.clone(), extract_progress_token(payload));
+        let Some((wire_id, mut guard, notif_rx, resp_rx)) =
+            session.register_request(id.clone(), extract_progress_token(payload))
+        else {
+            ephemeral.terminate_now().await;
+            drop(reservation);
+            return jsonrpc_error_reply(
+                StatusCode::SERVICE_UNAVAILABLE,
+                id,
+                -32000,
+                "too many concurrent requests in session",
+            );
+        };
         if session.send_request_line(payload, wire_id).is_err() {
             guard.disarm();
             ephemeral.terminate_now().await;
@@ -782,6 +1046,49 @@ impl Drop for StdioUpstream {
     }
 }
 
+enum InitOutcome {
+    Ok,
+    RpcError,
+    Malformed,
+}
+
+fn classify_init_response(raw_line: &str) -> InitOutcome {
+    let Ok(val) = serde_json::from_str::<Value>(raw_line) else {
+        return InitOutcome::Malformed;
+    };
+    let Some(obj) = val.as_object() else {
+        return InitOutcome::Malformed;
+    };
+    if obj.contains_key("result") && !obj.contains_key("error") {
+        InitOutcome::Ok
+    } else if obj.get("error").is_some_and(Value::is_object) && !obj.contains_key("result") {
+        InitOutcome::RpcError
+    } else {
+        InitOutcome::Malformed
+    }
+}
+
+fn drain_bg_terminations(inner: &StdioInner, only_grant: Option<&str>) -> Vec<JoinHandle<()>> {
+    let mut bg = inner
+        .bg_terminations
+        .lock()
+        .unwrap_or_else(|p| p.into_inner());
+    let mut out = Vec::new();
+    let mut i = 0;
+    while i < bg.len() {
+        if bg[i].1.is_finished() {
+            let (_, h) = bg.swap_remove(i);
+            drop(h);
+        } else if only_grant.is_none_or(|gid| constant_time_eq_str(&bg[i].0, gid)) {
+            let (_, h) = bg.swap_remove(i);
+            out.push(h);
+        } else {
+            i += 1;
+        }
+    }
+    out
+}
+
 struct EphemeralGuard {
     session: Option<Arc<StdioSession>>,
     slot: Option<SlotReservation>,
@@ -818,10 +1125,20 @@ impl Drop for EphemeralGuard {
         if let Some(sess) = self.session.take()
             && let Ok(handle) = tokio::runtime::Handle::try_current()
         {
-            handle.spawn(async move {
+            let weak_inner = sess.weak_inner.clone();
+            let grant_id = sess.grant_id.clone();
+            let jh = handle.spawn(async move {
                 sess.terminate().await;
                 drop(slot);
             });
+            if let Some(inner) = weak_inner.upgrade() {
+                let mut bg = inner
+                    .bg_terminations
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner());
+                bg.retain(|(_, h)| !h.is_finished());
+                bg.push((grant_id, jh));
+            }
         }
     }
 }
@@ -870,7 +1187,6 @@ fn try_reserve_slot(inner: &StdioInner) -> bool {
     if tbl.shutting_down {
         return false;
     }
-    tbl.sessions.retain(|_, s| s.alive.load(Ordering::Acquire));
     if tbl.sessions.len() + tbl.reserved_slots < inner.settings.max_sessions {
         tbl.reserved_slots += 1;
         true
@@ -908,7 +1224,7 @@ async fn remove_and_terminate(inner: &StdioInner, session_id: &str, session: &Ar
         if tbl
             .sessions
             .get(session_id)
-            .is_some_and(|cur| Arc::ptr_eq(cur, session))
+            .is_some_and(|cur| cur.uid == session.uid)
         {
             tbl.sessions.remove(session_id);
         }
@@ -930,8 +1246,21 @@ async fn terminate_all(sessions: Vec<Arc<StdioSession>>) {
 }
 
 impl StdioSession {
-    fn spawn(inner: &Arc<StdioInner>, grant_id: String) -> Result<Arc<Self>, String> {
+    async fn spawn(
+        inner: &Arc<StdioInner>,
+        grant_id: String,
+        expected_grant_epoch: u64,
+    ) -> Result<Arc<Self>, String> {
+        #[cfg(windows)]
+        let job = WindowsJobObject::create()?;
+
         let mut cmd = Command::new(&inner.settings.command);
+        cmd.env_clear();
+        for &key in SAFE_ENV_ALLOWLIST {
+            if let Some(val) = std::env::var_os(key) {
+                cmd.env(key, val);
+            }
+        }
         cmd.args(&inner.settings.args)
             .envs(&inner.settings.env)
             .stdin(Stdio::piped())
@@ -957,37 +1286,38 @@ impl StdioSession {
             .map_err(|e| format!("failed to spawn upstream process: {e}"))?;
 
         #[cfg(windows)]
-        let job = WindowsJobObject::create_and_assign(&child);
+        if let Err(err) = job.assign(&child) {
+            let _ = child.kill().await;
+            let _ = child.wait().await;
+            return Err(err);
+        }
 
-        let mut stdin = child
-            .stdin
-            .take()
-            .ok_or_else(|| "failed to capture child stdin".to_owned())?;
-        let stdout = child
-            .stdout
-            .take()
-            .ok_or_else(|| "failed to capture child stdout".to_owned())?;
+        let Some(mut stdin) = child.stdin.take() else {
+            let _ = child.kill().await;
+            let _ = child.wait().await;
+            return Err("failed to capture child stdin".to_owned());
+        };
+        let Some(stdout) = child.stdout.take() else {
+            let _ = child.kill().await;
+            let _ = child.wait().await;
+            return Err("failed to capture child stdout".to_owned());
+        };
 
         let (stdin_tx, mut stdin_rx) = mpsc::channel::<Vec<u8>>(STDIN_CHANNEL_CAPACITY);
+        let stdin_tx_arc = Arc::new(Mutex::new(Some(stdin_tx)));
+        let writer_cancel = CancellationToken::new();
         let alive = Arc::new(AtomicBool::new(true));
         let in_flight = Arc::new(Mutex::new(Vec::<InFlightEntry>::new()));
         let active_requests = Arc::new(AtomicUsize::new(0));
         let last_active_ms = Arc::new(AtomicU64::new(elapsed_ms(inner.epoch)));
-
-        let writer_alive = Arc::clone(&alive);
-        tokio::spawn(async move {
-            while let Some(buf) = stdin_rx.recv().await {
-                if stdin.write_all(&buf).await.is_err() || stdin.flush().await.is_err() {
-                    writer_alive.store(false, Ordering::Release);
-                    break;
-                }
-            }
-            drop(stdin);
-        });
+        let uid = NEXT_SESSION_UID.fetch_add(1, Ordering::Relaxed);
 
         let session = Arc::new(Self {
+            uid,
             grant_id,
-            stdin_tx: Mutex::new(Some(stdin_tx)),
+            weak_inner: Arc::downgrade(inner),
+            writer_cancel: writer_cancel.clone(),
+            stdin_tx: Arc::clone(&stdin_tx_arc),
             in_flight: Arc::clone(&in_flight),
             next_wire_id: AtomicU64::new(1),
             alive: Arc::clone(&alive),
@@ -995,12 +1325,52 @@ impl StdioSession {
             last_active_ms: Arc::clone(&last_active_ms),
             child: tokio::sync::Mutex::new(Some(child)),
             #[cfg(windows)]
-            job: Mutex::new(job),
+            job: Mutex::new(Some(job)),
             epoch: inner.epoch,
+        });
+
+        let rejected = {
+            let mut tbl = inner.table.lock().unwrap_or_else(|p| p.into_inner());
+            if tbl.shutting_down || tbl.grant_epoch(&session.grant_id) != expected_grant_epoch {
+                true
+            } else {
+                tbl.live_sessions.push(Arc::clone(&session));
+                false
+            }
+        };
+        if rejected {
+            drop(stdin);
+            drop(stdout);
+            session.terminate().await;
+            return Err("session aborted due to shutdown or grant revocation".to_owned());
+        }
+
+        let writer_alive = Arc::clone(&alive);
+        tokio::spawn(async move {
+            loop {
+                let Some(buf) = (tokio::select! {
+                    _ = writer_cancel.cancelled() => None,
+                    msg = stdin_rx.recv() => msg,
+                }) else {
+                    break;
+                };
+                let write_ok = tokio::select! {
+                    _ = writer_cancel.cancelled() => false,
+                    res = async {
+                        stdin.write_all(&buf).await.is_ok() && stdin.flush().await.is_ok()
+                    } => res,
+                };
+                if !write_ok {
+                    writer_alive.store(false, Ordering::Release);
+                    break;
+                }
+            }
+            drop(stdin);
         });
 
         let reader_inner = Arc::downgrade(inner);
         let reader_session = Arc::downgrade(&session);
+        let reader_stdin = Arc::clone(&stdin_tx_arc);
         let epoch = inner.epoch;
         tokio::spawn(async move {
             let mut lines = BufReader::new(stdout);
@@ -1014,7 +1384,7 @@ impl StdioSession {
                     if !trimmed.trim().is_empty() {
                         last_active_ms.store(elapsed_ms(epoch), Ordering::Release);
                         if let Ok(val) = serde_json::from_str::<Value>(trimmed) {
-                            dispatch_stdout_message(&in_flight, trimmed, val);
+                            dispatch_stdout_message(&in_flight, &reader_stdin, &alive, val);
                         }
                     }
                 }
@@ -1022,22 +1392,23 @@ impl StdioSession {
                     raw.shrink_to(64 * 1024);
                 }
             }
+            drop(lines);
             alive.store(false, Ordering::Release);
             in_flight.lock().unwrap_or_else(|p| p.into_inner()).clear();
             if let (Some(up), Some(sess)) = (reader_inner.upgrade(), reader_session.upgrade()) {
-                let matched_key = {
+                let matched = {
                     let mut tbl = up.table.lock().unwrap_or_else(|p| p.into_inner());
                     let found = tbl
                         .sessions
                         .iter()
-                        .find(|(_, v)| Arc::ptr_eq(v, &sess))
+                        .find(|(_, v)| v.uid == sess.uid)
                         .map(|(k, _)| k.clone());
                     if let Some(ref k) = found {
                         tbl.sessions.remove(k);
                     }
-                    found
+                    found.is_some()
                 };
-                if matched_key.is_some() {
+                if matched {
                     sess.terminate().await;
                 }
             }
@@ -1055,6 +1426,18 @@ impl StdioSession {
         let mut rewritten = payload.clone();
         if let Some(obj) = rewritten.as_object_mut() {
             obj.insert("id".to_owned(), Value::from(wire_id));
+            if let Some(meta) = obj
+                .get_mut("params")
+                .and_then(Value::as_object_mut)
+                .and_then(|p| p.get_mut("_meta"))
+                .and_then(Value::as_object_mut)
+                && meta.get("progressToken").is_some_and(|v| !v.is_null())
+            {
+                meta.insert(
+                    "progressToken".to_owned(),
+                    Value::String(format!("gw_pt_{wire_id}")),
+                );
+            }
         }
         self.send_json_line(&rewritten)
     }
@@ -1097,33 +1480,36 @@ impl StdioSession {
     fn register_request(
         self: &Arc<Self>,
         client_id: Value,
-        progress_token: Option<Value>,
-    ) -> (
+        client_progress_token: Option<Value>,
+    ) -> Option<(
         u64,
         RequestGuard,
         mpsc::Receiver<String>,
         oneshot::Receiver<String>,
-    ) {
+    )> {
+        let mut waiters = self.in_flight.lock().unwrap_or_else(|p| p.into_inner());
+        if waiters.len() >= MAX_IN_FLIGHT_PER_SESSION {
+            return None;
+        }
         let wire_id = self.next_wire_id.fetch_add(1, Ordering::Relaxed);
         let (notif_tx, notif_rx) = mpsc::channel(NOTIF_CHANNEL_CAPACITY);
         let (resp_tx, resp_rx) = oneshot::channel();
         self.active_requests.fetch_add(1, Ordering::AcqRel);
-        {
-            let mut waiters = self.in_flight.lock().unwrap_or_else(|p| p.into_inner());
-            waiters.push(InFlightEntry {
-                wire_id,
-                client_id,
-                progress_token,
-                notif_tx,
-                resp_tx,
-            });
-        }
+        waiters.push(InFlightEntry {
+            wire_id,
+            client_id,
+            client_progress_token,
+            notif_tx,
+            resp_tx,
+        });
+        drop(waiters);
+
         let guard = RequestGuard {
             session: Arc::clone(self),
             wire_id,
             state: GuardState::Armed,
         };
-        (wire_id, guard, notif_rx, resp_rx)
+        Some((wire_id, guard, notif_rx, resp_rx))
     }
 
     async fn terminate(&self) {
@@ -1132,90 +1518,82 @@ impl StdioSession {
             let mut tx_guard = self.stdin_tx.lock().unwrap_or_else(|p| p.into_inner());
             let _ = tx_guard.take();
         }
+        self.writer_cancel.cancel();
         self.in_flight
             .lock()
             .unwrap_or_else(|p| p.into_inner())
             .clear();
 
         let mut child_guard = self.child.lock().await;
-        let Some(mut child) = child_guard.take() else {
+        if let Some(mut child) = child_guard.take() {
+            #[cfg(unix)]
+            {
+                let raw_pid_opt = child
+                    .id()
+                    .and_then(|p| libc::pid_t::try_from(p).ok())
+                    .filter(|&p| p > 1);
+                if let Some(raw_pid) = raw_pid_opt {
+                    // Keep raw_pid unreaped via WNOWAIT until SIGKILL finishes so -raw_pid cannot be reused.
+                    wait_unreaped_exit(raw_pid, STDIN_GRACE_WAIT).await;
+                    signal_process_group(raw_pid, libc::SIGTERM);
+                    wait_unreaped_exit(raw_pid, SIGTERM_WAIT).await;
+                    signal_process_group(raw_pid, libc::SIGKILL);
+                    let _ = child.wait().await;
+                } else {
+                    let _ = child.wait().await;
+                }
+            }
+
+            #[cfg(windows)]
+            {
+                let job = self.job.lock().unwrap_or_else(|p| p.into_inner()).take();
+                if tokio::time::timeout(STDIN_GRACE_WAIT, child.wait())
+                    .await
+                    .is_err()
+                {
+                    drop(job);
+                    let _ = child.kill().await;
+                    let _ = child.wait().await;
+                } else {
+                    drop(job);
+                }
+            }
+        } else {
             #[cfg(windows)]
             {
                 let _ = self.job.lock().unwrap_or_else(|p| p.into_inner()).take();
             }
-            return;
-        };
-
-        #[cfg(unix)]
-        {
-            let raw_pid_opt = child
-                .id()
-                .and_then(|p| libc::pid_t::try_from(p).ok())
-                .filter(|&p| p > 1);
-            if let Some(raw_pid) = raw_pid_opt {
-                // Keep raw_pid unreaped via WNOWAIT until SIGTERM is sent to -raw_pid.
-                wait_unreaped_exit(raw_pid, STDIN_GRACE_WAIT).await;
-                signal_process_group(raw_pid, libc::SIGTERM);
-                if tokio::time::timeout(SIGTERM_WAIT, child.wait())
-                    .await
-                    .is_err()
-                {
-                    signal_process_group(raw_pid, libc::SIGKILL);
-                    let _ = child.wait().await;
-                }
-                cleanup_remaining_process_group(raw_pid).await;
-            } else {
-                let _ = child.wait().await;
-            }
         }
 
-        #[cfg(windows)]
-        {
-            let job = self.job.lock().unwrap_or_else(|p| p.into_inner()).take();
-            if tokio::time::timeout(STDIN_GRACE_WAIT, child.wait())
-                .await
-                .is_err()
-            {
-                drop(job);
-                let _ = child.kill().await;
-                let _ = child.wait().await;
-            } else {
-                drop(job);
-            }
-        }
-
-        #[cfg(not(any(unix, windows)))]
-        {
-            if tokio::time::timeout(STDIN_GRACE_WAIT, child.wait())
-                .await
-                .is_err()
-            {
-                let _ = child.kill().await;
-                let _ = child.wait().await;
-            }
+        if let Some(inner) = self.weak_inner.upgrade() {
+            let mut tbl = inner.table.lock().unwrap_or_else(|p| p.into_inner());
+            tbl.live_sessions.retain(|s| s.uid != self.uid);
         }
     }
 }
 
 #[cfg(unix)]
 fn poll_unreaped_exit(raw_pid: libc::pid_t) -> bool {
-    let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
-    let rc = unsafe {
-        libc::waitid(
-            libc::P_PID,
-            raw_pid as libc::id_t,
-            &mut info,
-            libc::WEXITED | libc::WNOHANG | libc::WNOWAIT,
-        )
-    };
-    if rc == 0 {
-        #[cfg(any(target_os = "linux", target_os = "android"))]
-        let has_pid = unsafe { info.si_pid() != 0 };
-        #[cfg(all(unix, not(any(target_os = "linux", target_os = "android"))))]
-        let has_pid = info.si_pid != 0;
-        info.si_signo != 0 || has_pid
-    } else {
-        io::Error::last_os_error().raw_os_error() != Some(libc::EINTR)
+    loop {
+        let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
+        let rc = unsafe {
+            libc::waitid(
+                libc::P_PID,
+                raw_pid as libc::id_t,
+                &mut info,
+                libc::WEXITED | libc::WNOHANG | libc::WNOWAIT,
+            )
+        };
+        if rc == 0 {
+            #[cfg(any(target_os = "linux", target_os = "android"))]
+            let has_pid = unsafe { info.si_pid() != 0 };
+            #[cfg(all(unix, not(any(target_os = "linux", target_os = "android"))))]
+            let has_pid = info.si_pid != 0;
+            return info.si_signo != 0 || has_pid;
+        }
+        if io::Error::last_os_error().raw_os_error() != Some(libc::EINTR) {
+            return true;
+        }
     }
 }
 
@@ -1239,26 +1617,6 @@ fn signal_process_group(raw_pid: libc::pid_t, sig: libc::c_int) {
         unsafe {
             let _ = libc::kill(-raw_pid, sig);
         }
-    }
-}
-
-#[cfg(unix)]
-async fn cleanup_remaining_process_group(raw_pid: libc::pid_t) {
-    if raw_pid <= 1 || unsafe { libc::kill(-raw_pid, 0) } != 0 {
-        return;
-    }
-    unsafe {
-        let _ = libc::kill(-raw_pid, libc::SIGTERM);
-    }
-    let deadline = Instant::now() + STDIN_GRACE_WAIT;
-    while Instant::now() < deadline {
-        if unsafe { libc::kill(-raw_pid, 0) } != 0 {
-            return;
-        }
-        tokio::time::sleep(Duration::from_millis(10)).await;
-    }
-    unsafe {
-        let _ = libc::kill(-raw_pid, libc::SIGKILL);
     }
 }
 
@@ -1337,11 +1695,14 @@ struct StdioSseStreamBody {
     resp_rx: Option<oneshot::Receiver<String>>,
     pending_resp: Option<String>,
     notif_done: bool,
-    guard: RequestGuard,
+    guard: Arc<Mutex<RequestGuard>>,
     session: Arc<StdioSession>,
     idle_timeout: Duration,
     idle_sleep: Pin<Box<tokio::time::Sleep>>,
-    ephemeral: Option<EphemeralGuard>,
+    last_frame_ms: Arc<AtomicU64>,
+    stream_done: CancellationToken,
+    timed_out_fut: Mutex<Pin<Box<dyn Future<Output = ()> + Send>>>,
+    ephemeral: Arc<Mutex<Option<EphemeralGuard>>>,
     finished: bool,
 }
 
@@ -1354,22 +1715,121 @@ impl StdioSseStreamBody {
         idle_timeout: Duration,
         ephemeral: Option<EphemeralGuard>,
     ) -> Self {
+        let guard_arc = Arc::new(Mutex::new(guard));
+        let ephem_arc = Arc::new(Mutex::new(ephemeral));
+        let last_frame_ms = Arc::new(AtomicU64::new(elapsed_ms(session.epoch)));
+        let stream_done = CancellationToken::new();
+        let timed_out = CancellationToken::new();
+        let timed_out_fut = Mutex::new(Box::pin(timed_out.clone().cancelled_owned())
+            as Pin<Box<dyn Future<Output = ()> + Send>>);
+
+        if let Ok(handle) = tokio::runtime::Handle::try_current() {
+            let wd_guard = Arc::clone(&guard_arc);
+            let wd_ephem = Arc::clone(&ephem_arc);
+            let wd_last = Arc::clone(&last_frame_ms);
+            let wd_done = stream_done.clone();
+            let wd_timed_out = timed_out;
+            let epoch = session.epoch;
+            let timeout_ms = u64::try_from(idle_timeout.as_millis()).unwrap_or(u64::MAX);
+            // Release active_requests and ephemeral child at call_timeout even if TCP stalls.
+            handle.spawn(async move {
+                loop {
+                    let last = wd_last.load(Ordering::Acquire);
+                    let now = elapsed_ms(epoch);
+                    let elapsed = now.saturating_sub(last);
+                    if elapsed >= timeout_ms {
+                        wd_guard
+                            .lock()
+                            .unwrap_or_else(|p| p.into_inner())
+                            .cancel("request timed out");
+                        let ephem_opt = wd_ephem.lock().unwrap_or_else(|p| p.into_inner()).take();
+                        if let Some(mut ephem) = ephem_opt {
+                            ephem.terminate_now().await;
+                        }
+                        wd_timed_out.cancel();
+                        break;
+                    }
+                    let wait = Duration::from_millis(timeout_ms - elapsed);
+                    tokio::select! {
+                        _ = wd_done.cancelled() => break,
+                        _ = tokio::time::sleep(wait) => {}
+                    }
+                }
+            });
+        }
+
         Self {
             notif_rx,
             resp_rx: Some(resp_rx),
             pending_resp: None,
             notif_done: false,
-            guard,
+            guard: guard_arc,
             session,
             idle_timeout,
             idle_sleep: Box::pin(tokio::time::sleep(idle_timeout)),
-            ephemeral,
+            last_frame_ms,
+            stream_done,
+            timed_out_fut,
+            ephemeral: ephem_arc,
             finished: false,
         }
     }
 
-    fn release_ephemeral(&mut self) {
-        let _ = self.ephemeral.take();
+    fn finish_completed(&mut self) {
+        self.finished = true;
+        self.stream_done.cancel();
+        self.guard
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .mark_completed();
+        let _ = self
+            .ephemeral
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .take();
+    }
+
+    fn finish_disarmed(&mut self) {
+        self.finished = true;
+        self.stream_done.cancel();
+        self.guard
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .disarm();
+        let _ = self
+            .ephemeral
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .take();
+    }
+
+    fn finish_timed_out(&mut self) {
+        self.finished = true;
+        self.stream_done.cancel();
+        self.guard
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .cancel("request timed out");
+        let _ = self
+            .ephemeral
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .take();
+    }
+}
+
+impl Drop for StdioSseStreamBody {
+    fn drop(&mut self) {
+        self.stream_done.cancel();
+        self.guard
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .cancel("client disconnected");
+        let _ = self
+            .ephemeral
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .take();
     }
 }
 
@@ -1387,10 +1847,24 @@ impl Body for StdioSseStreamBody {
                 return Poll::Ready(None);
             }
 
+            let timed_out_pin = this
+                .timed_out_fut
+                .get_mut()
+                .unwrap_or_else(|p| p.into_inner());
+            if timed_out_pin.as_mut().poll(cx).is_ready() {
+                this.finish_timed_out();
+                return Poll::Ready(Some(Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    "upstream SSE idle timeout",
+                ))));
+            }
+
             if !this.notif_done {
                 match this.notif_rx.poll_recv(cx) {
                     Poll::Ready(Some(line)) => {
                         this.session.touch();
+                        this.last_frame_ms
+                            .store(elapsed_ms(this.session.epoch), Ordering::Release);
                         this.idle_sleep
                             .as_mut()
                             .reset(tokio::time::Instant::now() + this.idle_timeout);
@@ -1421,9 +1895,7 @@ impl Body for StdioSseStreamBody {
                     }
                     Poll::Pending => {
                         if this.idle_sleep.as_mut().poll(cx).is_ready() {
-                            this.finished = true;
-                            this.guard.cancel("request timed out");
-                            this.release_ephemeral();
+                            this.finish_timed_out();
                             return Poll::Ready(Some(Err(io::Error::new(
                                 io::ErrorKind::TimedOut,
                                 "upstream SSE idle timeout",
@@ -1436,25 +1908,19 @@ impl Body for StdioSseStreamBody {
 
             if this.notif_done {
                 if let Some(line) = this.pending_resp.take() {
-                    this.finished = true;
-                    this.guard.mark_completed();
+                    this.finish_completed();
                     this.session.touch();
-                    this.release_ephemeral();
                     let formatted = format!("data: {line}\n\n");
                     return Poll::Ready(Some(Ok(Frame::data(Bytes::from(formatted)))));
                 }
                 if this.resp_rx.is_none() {
-                    this.finished = true;
-                    this.guard.disarm();
-                    this.release_ephemeral();
+                    this.finish_disarmed();
                     return Poll::Ready(None);
                 }
             }
 
             if this.idle_sleep.as_mut().poll(cx).is_ready() {
-                this.finished = true;
-                this.guard.cancel("request timed out");
-                this.release_ephemeral();
+                this.finish_timed_out();
                 return Poll::Ready(Some(Err(io::Error::new(
                     io::ErrorKind::TimedOut,
                     "upstream SSE idle timeout",
@@ -1470,69 +1936,171 @@ impl Body for StdioSseStreamBody {
     }
 }
 
-fn dispatch_stdout_message(in_flight: &Mutex<Vec<InFlightEntry>>, raw_line: &str, mut val: Value) {
+fn dispatch_stdout_message(
+    in_flight: &Mutex<Vec<InFlightEntry>>,
+    stdin_tx: &Mutex<Option<mpsc::Sender<Vec<u8>>>>,
+    alive: &AtomicBool,
+    mut val: Value,
+) {
     let Some(obj) = val.as_object() else {
         return;
     };
-    let has_method = obj.get("method").and_then(Value::as_str).is_some();
-    let resp_wire_id = obj.get("id").and_then(Value::as_u64);
+    let method_opt = obj.get("method").and_then(Value::as_str);
+    let has_method = method_opt.is_some();
 
-    let mut waiters = in_flight.lock().unwrap_or_else(|p| p.into_inner());
-    if !has_method && let Some(wire_id) = resp_wire_id {
-        if let Some(pos) = waiters.iter().position(|w| w.wire_id == wire_id) {
-            let entry = waiters.remove(pos);
-            if let Some(map) = val.as_object_mut() {
-                map.insert("id".to_owned(), entry.client_id);
-            }
-            let out = serde_json::to_string(&val).unwrap_or_else(|_| raw_line.to_owned());
-            let _ = entry.resp_tx.send(out);
-        }
+    if has_method && obj.contains_key("id") {
+        let id = obj.get("id").cloned().unwrap_or(Value::Null);
+        let reply = if method_opt == Some("ping") {
+            json!({
+                "jsonrpc": "2.0",
+                "id": id,
+                "result": {}
+            })
+        } else {
+            json!({
+                "jsonrpc": "2.0",
+                "id": id,
+                "error": {
+                    "code": -32601,
+                    "message": "client requests are not supported by gateway"
+                }
+            })
+        };
+        send_child_stdin_reply(stdin_tx, alive, &reply);
         return;
     }
 
     if !has_method {
+        let Some(wire_id) = obj.get("id").and_then(Value::as_u64) else {
+            return;
+        };
+        let entry = {
+            let mut waiters = in_flight.lock().unwrap_or_else(|p| p.into_inner());
+            waiters
+                .iter()
+                .position(|w| w.wire_id == wire_id)
+                .map(|pos| waiters.remove(pos))
+        };
+        if let Some(entry) = entry {
+            if let Some(map) = val.as_object_mut() {
+                map.insert("id".to_owned(), entry.client_id);
+            }
+            if let Ok(out) = serde_json::to_string(&val) {
+                let _ = entry.resp_tx.send(out);
+            }
+        }
         return;
     }
 
+    let is_progress = method_opt == Some("notifications/progress");
     if let Some(rel_wire_id) = obj
         .get("params")
         .and_then(|p| p.get("_meta"))
         .and_then(|m| m.get("relatedRequestId"))
         .and_then(Value::as_u64)
     {
-        if let Some(entry) = waiters.iter().find(|w| w.wire_id == rel_wire_id) {
-            let client_id = entry.client_id.clone();
-            if let Some(meta) = val
-                .get_mut("params")
-                .and_then(|p| p.get_mut("_meta"))
-                .and_then(Value::as_object_mut)
-            {
-                meta.insert("relatedRequestId".to_owned(), client_id);
+        let matched = {
+            let waiters = in_flight.lock().unwrap_or_else(|p| p.into_inner());
+            waiters.iter().find(|w| w.wire_id == rel_wire_id).map(|w| {
+                (
+                    w.client_id.clone(),
+                    w.client_progress_token.clone(),
+                    w.notif_tx.clone(),
+                )
+            })
+        };
+        if let Some((client_id, client_ptok, notif_tx)) = matched {
+            if let Some(params) = val.get_mut("params").and_then(Value::as_object_mut) {
+                if let Some(meta) = params.get_mut("_meta").and_then(Value::as_object_mut) {
+                    meta.insert("relatedRequestId".to_owned(), client_id);
+                }
+                if is_progress
+                    && let Some(orig_ptok) = client_ptok
+                    && params.get("progressToken").and_then(Value::as_str)
+                        == Some(&format!("gw_pt_{rel_wire_id}"))
+                {
+                    params.insert("progressToken".to_owned(), orig_ptok);
+                }
             }
-            let out = serde_json::to_string(&val).unwrap_or_else(|_| raw_line.to_owned());
-            let _ = entry.notif_tx.try_send(out);
+            if let Ok(out) = serde_json::to_string(&val) {
+                let _ = notif_tx.try_send(out);
+            }
         }
         return;
     }
 
-    if obj.get("method").and_then(Value::as_str) == Some("notifications/progress")
+    if is_progress
         && let Some(ptok) = obj
             .get("params")
             .and_then(|p| p.get("progressToken"))
             .filter(|v| !v.is_null())
     {
-        if let Some(entry) = waiters.iter().find(|w| {
-            w.progress_token
-                .as_ref()
-                .is_some_and(|t| json_id_eq(t, ptok))
-        }) {
-            let _ = entry.notif_tx.try_send(raw_line.to_owned());
+        let Some(wire_id) = ptok
+            .as_str()
+            .and_then(|s| s.strip_prefix("gw_pt_"))
+            .and_then(|s| s.parse::<u64>().ok())
+        else {
+            return;
+        };
+        let matched = {
+            let waiters = in_flight.lock().unwrap_or_else(|p| p.into_inner());
+            waiters.iter().find(|w| w.wire_id == wire_id).and_then(|w| {
+                w.client_progress_token
+                    .clone()
+                    .map(|orig| (orig, w.notif_tx.clone()))
+            })
+        };
+        if let Some((orig_ptok, notif_tx)) = matched {
+            if let Some(params) = val.get_mut("params").and_then(Value::as_object_mut) {
+                params.insert("progressToken".to_owned(), orig_ptok);
+            }
+            if let Ok(out) = serde_json::to_string(&val) {
+                let _ = notif_tx.try_send(out);
+            }
         }
         return;
     }
 
-    for entry in waiters.iter() {
-        let _ = entry.notif_tx.try_send(raw_line.to_owned());
+    let targets: Vec<mpsc::Sender<String>> = {
+        let waiters = in_flight.lock().unwrap_or_else(|p| p.into_inner());
+        waiters.iter().map(|w| w.notif_tx.clone()).collect()
+    };
+    if !targets.is_empty()
+        && let Ok(out) = serde_json::to_string(&val)
+    {
+        for tx in targets {
+            let _ = tx.try_send(out.clone());
+        }
+    }
+}
+
+fn send_child_stdin_reply(
+    stdin_tx: &Mutex<Option<mpsc::Sender<Vec<u8>>>>,
+    alive: &AtomicBool,
+    reply: &Value,
+) {
+    if !alive.load(Ordering::Acquire) {
+        return;
+    }
+    let Ok(mut line) = serde_json::to_vec(reply) else {
+        return;
+    };
+    line.push(b'\n');
+    let tx_clone = {
+        let guard = stdin_tx.lock().unwrap_or_else(|p| p.into_inner());
+        let Some(tx) = guard.as_ref() else {
+            return;
+        };
+        match tx.try_send(line) {
+            Ok(()) | Err(TrySendError::Closed(_)) => return,
+            Err(TrySendError::Full(unsent)) => (tx.clone(), unsent),
+        }
+    };
+    let (tx, unsent) = tx_clone;
+    if let Ok(handle) = tokio::runtime::Handle::try_current() {
+        handle.spawn(async move {
+            let _ = tokio::time::timeout(Duration::from_secs(5), tx.send(unsent)).await;
+        });
     }
 }
 
@@ -1578,6 +2146,14 @@ fn detect_sessionless_version(
         return Some(hdr.to_owned());
     }
     None
+}
+
+fn extract_valid_session_id(headers: &HeaderMap) -> Option<&str> {
+    let sid = extract_single_header(headers, "mcp-session-id")?;
+    if sid.len() > 1024 || !sid.bytes().all(|b| (0x21..=0x7E).contains(&b)) {
+        return None;
+    }
+    Some(sid)
 }
 
 fn extract_single_header<'a>(headers: &'a HeaderMap, name: &'static str) -> Option<&'a str> {
@@ -1727,8 +2303,11 @@ mod tests {
     async fn sse_stream_handles_resp_drop_before_notif_close_without_panic() {
         let now = Instant::now();
         let session = Arc::new(StdioSession {
+            uid: 1,
             grant_id: "g".to_owned(),
-            stdin_tx: Mutex::new(None),
+            weak_inner: Weak::new(),
+            writer_cancel: CancellationToken::new(),
+            stdin_tx: Arc::new(Mutex::new(None)),
             in_flight: Arc::new(Mutex::new(Vec::new())),
             next_wire_id: AtomicU64::new(2),
             alive: Arc::new(AtomicBool::new(false)),
