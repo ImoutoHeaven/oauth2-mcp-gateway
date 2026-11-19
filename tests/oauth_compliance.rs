@@ -28,6 +28,7 @@ const OWNER_SECRET: &str = "owner-battery-horse-staple-99";
 
 struct TestOpts<'a> {
     public_url: &'a str,
+    resource_path: Option<&'a str>,
     allowed_hosts: &'a [&'a str],
     scopes: &'a [&'a str],
     bearer_tokens: &'a [&'a str],
@@ -39,6 +40,7 @@ impl Default for TestOpts<'_> {
     fn default() -> Self {
         Self {
             public_url: "https://mcp.example.com",
+            resource_path: None,
             allowed_hosts: &[],
             scopes: &["mcp", "files"],
             bearer_tokens: &["up-slot-0"],
@@ -52,7 +54,7 @@ fn build_config(dir: &Path, opts: &TestOpts<'_>) -> Arc<GatewayConfig> {
     let pw_hash = PasswordVerifier::from_plaintext_with_iterations(OWNER_SECRET, 10_000)
         .expect("test hash")
         .encode();
-    let cfg_json = json!({
+    let mut cfg_json = json!({
         "listen": "127.0.0.1:0",
         "public_url": opts.public_url,
         "state_path": dir.join("state/oauth_state.json").to_string_lossy(),
@@ -71,6 +73,9 @@ fn build_config(dir: &Path, opts: &TestOpts<'_>) -> Arc<GatewayConfig> {
             "bearer_tokens": opts.bearer_tokens,
         }
     });
+    if let Some(path) = opts.resource_path {
+        cfg_json["resource_path"] = json!(path);
+    }
     Arc::new(
         GatewayConfig::from_json_str(&cfg_json.to_string(), dir).expect("valid gateway config"),
     )
@@ -286,11 +291,16 @@ async fn mint_public_grant(
 struct ChunkStream {
     chunks: Vec<Bytes>,
     pos: usize,
+    stall_after_chunks: bool,
 }
 
 impl ChunkStream {
     fn new(chunks: Vec<Bytes>) -> Self {
-        Self { chunks, pos: 0 }
+        Self {
+            chunks,
+            pos: 0,
+            stall_after_chunks: false,
+        }
     }
 }
 
@@ -305,12 +315,111 @@ impl http_body::Body for StreamAdapter {
         _cx: &mut Context<'_>,
     ) -> Poll<Option<Result<Frame<Self::Data>, Self::Error>>> {
         if self.0.pos >= self.0.chunks.len() {
-            return Poll::Ready(None);
+            return if self.0.stall_after_chunks {
+                Poll::Pending
+            } else {
+                Poll::Ready(None)
+            };
         }
         let idx = self.0.pos;
         self.0.pos += 1;
         Poll::Ready(Some(Ok(Frame::data(self.0.chunks[idx].clone()))))
     }
+}
+
+#[tokio::test]
+async fn incomplete_oauth_body_releases_its_connection() {
+    let tmp = TempDir::new().unwrap();
+    let engine = OAuthEngine::open(build_config(tmp.path(), &TestOpts::default())).unwrap();
+    let req = Request::builder()
+        .method(Method::POST)
+        .uri("/oauth/token")
+        .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+        .body(
+            StreamAdapter(ChunkStream {
+                chunks: vec![Bytes::from_static(b"grant_type=")],
+                pos: 0,
+                stall_after_chunks: true,
+            })
+            .boxed(),
+        )
+        .unwrap();
+    let (status, headers, _) =
+        tokio::time::timeout(Duration::from_secs(15), dispatch_box_body(&engine, req))
+            .await
+            .expect("gateway should time out the incomplete OAuth request");
+    assert_eq!(status, StatusCode::REQUEST_TIMEOUT);
+    assert_eq!(headers[header::CONNECTION], "close");
+}
+
+#[tokio::test]
+async fn custom_resource_path_drives_oauth_discovery_and_token_binding() {
+    let tmp = TempDir::new().unwrap();
+    let cfg = build_config(
+        tmp.path(),
+        &TestOpts {
+            resource_path: Some("/bridge/oauth2"),
+            ..Default::default()
+        },
+    );
+    let engine = OAuthEngine::open(cfg).unwrap();
+    let challenge = engine.unauthorized_reply(AuthChallenge::MissingToken);
+    assert_eq!(challenge.status(), StatusCode::UNAUTHORIZED);
+    assert_eq!(
+        challenge.headers()[header::WWW_AUTHENTICATE],
+        "Bearer resource_metadata=\"https://mcp.example.com/.well-known/oauth-protected-resource/bridge/oauth2\""
+    );
+    for (path, expected) in [
+        ("/.well-known/oauth-protected-resource", StatusCode::OK),
+        (
+            "/.well-known/oauth-protected-resource/bridge/oauth2",
+            StatusCode::OK,
+        ),
+        (
+            "/.well-known/oauth-protected-resource/mcp",
+            StatusCode::NOT_FOUND,
+        ),
+    ] {
+        let (status, _, body) = send_req(&engine, Method::GET, path, &[], Bytes::new()).await;
+        assert_eq!(status, expected, "{path}");
+        if status == StatusCode::OK {
+            assert_eq!(
+                parse_json(&body)["resource"],
+                "https://mcp.example.com/bridge/oauth2"
+            );
+        }
+    }
+    let redirect = "http://127.0.0.1:19000/cb";
+    let client = register_public_client(&engine, redirect, None).await;
+    let (access, refresh) = mint_public_grant(&engine, &client, redirect, "custom-resource").await;
+    let mut headers = HeaderMap::new();
+    headers.insert(
+        header::AUTHORIZATION,
+        HeaderValue::from_str(&format!("Bearer {access}")).unwrap(),
+    );
+    let verified = engine.verify_bearer(&headers).expect("valid access token");
+    assert_eq!(verified.resource, "https://mcp.example.com/bridge/oauth2");
+
+    drop(engine);
+    let engine = OAuthEngine::open(build_config(tmp.path(), &TestOpts::default())).unwrap();
+    assert_eq!(
+        engine.verify_bearer(&headers),
+        Err(AuthChallenge::InvalidToken)
+    );
+    let (status, _, body) = send_req(
+        &engine,
+        Method::POST,
+        "/oauth/token",
+        &[("content-type", "application/x-www-form-urlencoded")],
+        form_encode(&[
+            ("grant_type", "refresh_token"),
+            ("client_id", &client),
+            ("refresh_token", &refresh),
+        ]),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(parse_json(&body)["error"], "invalid_grant");
 }
 
 #[tokio::test]
@@ -444,6 +553,7 @@ async fn dcr_redirect_whitelist_and_idle_client_eviction() {
         json!({ "redirect_uris": ["https://claude.ai/cb#frag"] }),
         json!({ "redirect_uris": ["https://user:pw@claude.ai/cb"] }),
         json!({ "redirect_uris": ["https://unlisted.example.org/cb"] }),
+        json!({ "redirect_uris": ["https://claude.ai/cb?%73tate=old"] }),
         json!({ "redirect_uris": (0..17).map(|i| format!("http://127.0.0.1:8000/cb/{i}")).collect::<Vec<_>>() }),
     ] {
         let (st, _, b) = send_req(
@@ -775,7 +885,9 @@ async fn xss_escaping_security_headers_and_csrf_cookie_enforcement() {
     let engine = OAuthEngine::open(cfg).unwrap();
 
     let xss_name = "<script>alert(1)</script>\"'&client";
-    let cb_uri = "http://127.0.0.1:19000/cb?x=1&y=2";
+    let cb_uri = "http://127.0.0.1:19000/cb;part,more?x=1&y=2";
+    let other_uri = "https://other.example/callback";
+    let _other_client = register_public_client(&engine, other_uri, None).await;
     let client_id = register_public_client(&engine, cb_uri, Some(xss_name)).await;
     let (_, challenge) = pkce_pair("xss-csrf");
 
@@ -796,8 +908,27 @@ async fn xss_escaping_security_headers_and_csrf_cookie_enforcement() {
     )
     .await;
     assert_eq!(status, StatusCode::OK);
+    let expected_csp = "default-src 'none'; style-src 'unsafe-inline'; form-action 'self'";
     assert_eq!(
         headers.get(header::CONTENT_SECURITY_POLICY).unwrap(),
+        expected_csp
+    );
+    let (unregistered_status, unregistered_headers, _) = send_req(
+        &engine,
+        Method::GET,
+        &format!(
+            "/oauth/authorize?{}",
+            form_encode(&[("client_id", &client_id), ("redirect_uri", other_uri)])
+        ),
+        &[],
+        Bytes::new(),
+    )
+    .await;
+    assert_eq!(unregistered_status, StatusCode::BAD_REQUEST);
+    assert_eq!(
+        unregistered_headers
+            .get(header::CONTENT_SECURITY_POLICY)
+            .unwrap(),
         "default-src 'none'; style-src 'unsafe-inline'; form-action 'self'"
     );
     assert_eq!(headers.get(header::X_FRAME_OPTIONS).unwrap(), "DENY");
@@ -813,7 +944,7 @@ async fn xss_escaping_security_headers_and_csrf_cookie_enforcement() {
     let html = std::str::from_utf8(&body).unwrap();
     assert!(!html.contains("<script>"));
     assert!(html.contains("&lt;script&gt;alert(1)&lt;/script&gt;&quot;&#x27;&amp;client"));
-    assert!(html.contains("http://127.0.0.1:19000/cb?x=1&amp;y=2"));
+    assert!(html.contains("http://127.0.0.1:19000/cb;part,more?x=1&amp;y=2"));
 
     let ar_id = extract_hidden_input(html, "ar_id");
     let csrf_token = extract_hidden_input(html, "csrf_token");
@@ -824,6 +955,27 @@ async fn xss_escaping_security_headers_and_csrf_cookie_enforcement() {
         ("csrf_token", &csrf_token),
         ("password", OWNER_SECRET),
     ]);
+    let (retry_status, retry_headers, _) = send_req(
+        &engine,
+        Method::POST,
+        "/oauth/authorize",
+        &[
+            ("content-type", "application/x-www-form-urlencoded"),
+            ("cookie", &cookie_pair),
+        ],
+        form_encode(&[
+            ("ar_id", &ar_id),
+            ("csrf_token", &csrf_token),
+            ("password", "wrong-password"),
+        ]),
+    )
+    .await;
+    assert_eq!(retry_status, StatusCode::UNAUTHORIZED);
+    assert_eq!(
+        retry_headers.get(header::CONTENT_SECURITY_POLICY).unwrap(),
+        expected_csp
+    );
+
     let (no_cookie_st, _, _) = send_req(
         &engine,
         Method::POST,
@@ -865,18 +1017,38 @@ async fn xss_escaping_security_headers_and_csrf_cookie_enforcement() {
     .await;
     assert_eq!(bad_form_st, StatusCode::FORBIDDEN);
 
-    let (ok_st, _, _) = send_req(
+    let (ok_st, completed_headers, completed_body) = send_req(
         &engine,
         Method::POST,
         "/oauth/authorize",
         &[
             ("content-type", "application/x-www-form-urlencoded"),
             ("cookie", &cookie_pair),
+            ("sec-fetch-mode", "navigate"),
         ],
         valid_form.clone(),
     )
     .await;
-    assert_eq!(ok_st, StatusCode::SEE_OTHER);
+    assert_eq!(ok_st, StatusCode::OK);
+    assert_eq!(
+        completed_headers
+            .get(header::CONTENT_SECURITY_POLICY)
+            .unwrap(),
+        expected_csp
+    );
+    assert_eq!(
+        completed_headers.get(header::REFERRER_POLICY).unwrap(),
+        "no-referrer"
+    );
+    assert!(completed_headers.get(header::LOCATION).is_none());
+    let completed_html = std::str::from_utf8(&completed_body).unwrap();
+    assert!(
+        completed_html
+            .contains("content=\"0;url=http://127.0.0.1:19000/cb;part,more?x=1&amp;y=2&amp;code=")
+    );
+    assert!(completed_html.contains("&amp;state=csrf-state"));
+    assert!(!completed_html.contains(other_uri));
+    assert!(!completed_html.contains(OWNER_SECRET));
 
     let (reused_ar_st, _, _) = send_req(
         &engine,
@@ -1024,6 +1196,54 @@ async fn ten_concurrent_refreshes_converge_and_post_grace_replay_revokes_all() {
         HeaderValue::from_str(&format!("Bearer {a1}")).unwrap(),
     );
     assert!(engine.verify_bearer(&a1_hdr).is_ok());
+
+    let (narrow_status, _, narrow_body) = send_req(
+        &engine,
+        Method::POST,
+        "/oauth/token",
+        &[("content-type", "application/x-www-form-urlencoded")],
+        form_encode(&[
+            ("grant_type", "refresh_token"),
+            ("client_id", &client_id),
+            ("refresh_token", &r0),
+            ("scope", "mcp"),
+        ]),
+    )
+    .await;
+    assert_eq!(narrow_status, StatusCode::BAD_REQUEST);
+    assert_eq!(parse_json(&narrow_body)["error"], "invalid_scope");
+
+    let (reordered_status, _, _) = send_req(
+        &engine,
+        Method::POST,
+        "/oauth/token",
+        &[("content-type", "application/x-www-form-urlencoded")],
+        form_encode(&[
+            ("grant_type", "refresh_token"),
+            ("client_id", &client_id),
+            ("refresh_token", r1),
+            ("scope", "files mcp"),
+        ]),
+    )
+    .await;
+    assert_eq!(reordered_status, StatusCode::OK);
+
+    let (retry_status, _, retry_body) = send_req(
+        &engine,
+        Method::POST,
+        "/oauth/token",
+        &[("content-type", "application/x-www-form-urlencoded")],
+        form_encode(&[
+            ("grant_type", "refresh_token"),
+            ("client_id", &client_id),
+            ("refresh_token", &r0),
+        ]),
+    )
+    .await;
+    assert_eq!(retry_status, StatusCode::OK);
+    let retried = parse_json(&retry_body);
+    assert_eq!(retried["access_token"], *a1);
+    assert_eq!(retried["refresh_token"], *r1);
 
     tokio::time::sleep(Duration::from_millis(3150)).await;
 
@@ -1175,6 +1395,23 @@ async fn disk_persistence_security_restart_recovery_and_rotated_retention() {
         unauth.headers().get(header::WWW_AUTHENTICATE).unwrap(),
         "Bearer resource_metadata=\"https://mcp.example.com/.well-known/oauth-protected-resource/mcp\""
     );
+
+    let (narrow_status, _, narrow_body) = send_req(
+        &reopened,
+        Method::POST,
+        "/oauth/token",
+        &[("content-type", "application/x-www-form-urlencoded")],
+        form_encode(&[
+            ("grant_type", "refresh_token"),
+            ("client_id", &client_id),
+            ("client_secret", &client_secret),
+            ("refresh_token", &r0),
+            ("scope", "mcp"),
+        ]),
+    )
+    .await;
+    assert_eq!(narrow_status, StatusCode::BAD_REQUEST);
+    assert_eq!(parse_json(&narrow_body)["error"], "invalid_scope");
 
     let (mid_grace_st, _, mid_grace_b) = send_req(
         &reopened,

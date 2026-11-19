@@ -9,6 +9,7 @@ use url::{Host, Url};
 pub struct GatewayConfig {
     pub listen: SocketAddr,
     pub public_url: String,
+    pub resource_path: String,
     pub public_is_https: bool,
     pub state_path: PathBuf,
     pub oauth: OAuthSettings,
@@ -66,6 +67,7 @@ pub struct StdioUpstreamSettings {
 struct RawConfig {
     listen: String,
     public_url: String,
+    resource_path: Option<String>,
     state_path: String,
     oauth: RawOAuth,
     upstream: RawUpstream,
@@ -267,6 +269,33 @@ impl GatewayConfig {
         let pub_str = expand_env_reference(&raw.public_url, "public_url")?;
         let (public_url, public_is_https) = validate_public_url(&pub_str)?;
 
+        let resource_path = expand_env_reference(
+            raw.resource_path.as_deref().unwrap_or("/mcp"),
+            "resource_path",
+        )?;
+        let valid_segment = |segment: &str| {
+            !segment.is_empty()
+                && segment != "."
+                && segment != ".."
+                && segment
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || b"-._~".contains(&byte))
+        };
+        if !resource_path
+            .strip_prefix('/')
+            .is_some_and(|path| path.split('/').all(valid_segment))
+        {
+            return Err("resource_path must be an absolute path with nonempty segments".to_owned());
+        }
+
+        let resource_dir = format!("{}/", resource_path.to_ascii_lowercase());
+        if ["/oauth/", "/.well-known/", "/healthz/"]
+            .iter()
+            .any(|reserved| resource_dir.starts_with(reserved))
+        {
+            return Err("resource_path overlaps a reserved gateway route".to_owned());
+        }
+
         let state_str = expand_env_reference(&raw.state_path, "state_path")?;
         if state_str.trim().is_empty()
             || state_str.contains('\0')
@@ -405,6 +434,11 @@ impl GatewayConfig {
                         &format!("upstream.passthrough_prefixes[{idx}]"),
                     )?;
                     validate_passthrough_prefix(&expanded, parsed.path())?;
+                    if resource_dir.starts_with(&expanded.to_ascii_lowercase()) {
+                        return Err(format!(
+                            "resource_path overlaps passthrough prefix {expanded:?}"
+                        ));
+                    }
                     prefixes.push(expanded);
                 }
                 if !(5..=3600).contains(&request_timeout_secs) {
@@ -478,6 +512,7 @@ impl GatewayConfig {
         Ok(Self {
             listen,
             public_url,
+            resource_path,
             public_is_https,
             state_path,
             oauth,
@@ -486,7 +521,7 @@ impl GatewayConfig {
     }
 
     pub fn mcp_resource_url(&self) -> String {
-        format!("{}/mcp", self.public_url)
+        format!("{}{}", self.public_url, self.resource_path)
     }
 }
 
@@ -585,6 +620,23 @@ mod tests {
 
         let upstream_overlap = ok_json.replace("\"/t/\"", "\"/api/\"");
         assert!(GatewayConfig::from_json_str(&upstream_overlap, Path::new("/tmp")).is_err());
+
+        for invalid_resource_path in [
+            "/oauth",
+            "/oauth/token",
+            "/.well-known/oauth-protected-resource",
+            "/healthz",
+            "/t",
+            "/t/download",
+            "/api/../mcp",
+        ] {
+            let json = ok_json.replace(
+                "\"state_path\":",
+                &format!("\"resource_path\": {invalid_resource_path:?}, \"state_path\":"),
+            );
+            let error = GatewayConfig::from_json_str(&json, Path::new("/tmp")).unwrap_err();
+            assert!(error.starts_with("resource_path"), "{error}");
+        }
 
         let wildcard_host = ok_json.replace("\"Claude.AI\"", "\"*.claude.ai\"");
         assert!(GatewayConfig::from_json_str(&wildcard_host, Path::new("/tmp")).is_err());

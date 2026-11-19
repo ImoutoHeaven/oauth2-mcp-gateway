@@ -7,7 +7,7 @@
 One gateway process sits in front of one upstream MCP service:
 
 - Handles OAuth 2.1 discovery metadata, Dynamic Client Registration (RFC 7591), PKCE `S256` authorization code grants, refresh token rotation, and token revocation (RFC 7009).
-- Verifies Bearer access tokens on `/mcp` and binds each grant to the configured public resource URL (`<public_url>/mcp`).
+- Verifies Bearer access tokens on `/mcp` and binds each grant to the configured public resource URL (`<public_url><resource_path>`).
 - Bridges `/mcp` traffic to an upstream HTTP MCP server (with optional static Bearer token pooling and unauthenticated byte-stream passthrough prefixes such as `/t/`) or to per-session `stdio` MCP subprocesses.
 
 Out of scope by design:
@@ -61,6 +61,7 @@ Unknown JSON fields fail startup. Any string field set to `"${VAR}"` (except ent
 | :--- | :--- | :--- |
 | `listen` | yes | Local `IP:PORT` socket address to bind, such as `"127.0.0.1:8080"`. |
 | `public_url` | yes | External origin without path, query, fragment, or userinfo, such as `"https://mcp.example.com"`. Plain `http://` is allowed only on `localhost`, `127.0.0.1`, and `[::1]`. |
+| `resource_path` | no | Public MCP path. Defaults to `/mcp`. Use an absolute path with nonempty segments made of ASCII letters, digits, or `-._~`. Dot and dot-dot segments, reserved gateway namespaces and configured passthrough prefix overlaps are rejected. |
 | `state_path` | yes | File path for persisted OAuth clients and hashed token grants. Created with mode `0600`. |
 | `oauth` | yes | OAuth 2.1 owner credential and token lifetime settings. |
 | `upstream` | yes | Upstream MCP bridge configuration (`"transport": "http"` or `"transport": "stdio"`). |
@@ -74,7 +75,7 @@ Provide either `owner_password_hash` or `owner_password`. Setting both fails sta
 | `owner_password_hash` | none | Output of `hash-password` (`pbkdf2-sha256$<iter>$<salt>$<hash>`). |
 | `owner_password` | none | Plaintext secret (typically `"${OWNER_PASSWORD}"`), hashed with PBKDF2-HMAC-SHA256 in memory at startup. |
 | `scopes` | `["mcp"]` | Non-empty list of whitespace-free OAuth scope tokens. |
-| `allowed_redirect_hosts` | `[]` | Optional hostname allowlist for Dynamic Client Registration `redirect_uris`. Loopback `http://` callbacks remain allowed; when non-empty, `https://` callbacks must match a listed host. Wildcards are rejected. |
+| `allowed_redirect_hosts` | `[]` | Optional hostname allowlist for Dynamic Client Registration `redirect_uris`. Loopback `http://` callbacks remain allowed; when non-empty, `https://` callbacks must match a listed host. Wildcards are rejected. Callback query strings must leave OAuth response keys free. |
 | `access_token_ttl_secs` | `3600` | Access token lifetime in seconds (`60..=86400`). |
 | `refresh_token_ttl_secs` | `2592000` | Refresh token lifetime in seconds (`300..=7776000`, at least `access_token_ttl_secs`). |
 | `refresh_grace_secs` | `120` | Concurrency grace window in seconds (`0..=600`) for parallel refresh requests using a rotated refresh token. |
@@ -131,15 +132,17 @@ server {
 }
 ```
 
+To publish the gateway at `https://mcp.example.com/oauth2`, set `"resource_path": "/oauth2"` and proxy that exact path to the gateway at `/mcp`. Forward `/.well-known/oauth-protected-resource/oauth2`, `/.well-known/oauth-authorization-server` and `/oauth/` requests to the gateway with their paths intact. OAuth clients should connect to the public path. When the public resource URL changes, clients must authorize again.
+
 ## Protocol behavior
 
 ### OAuth 2.1 endpoints
 
-- `GET /.well-known/oauth-protected-resource` and `GET /.well-known/oauth-protected-resource/mcp` (RFC 9728): advertise `resource: "<public_url>/mcp"` and `authorization_servers: ["<public_url>"]`. Unauthenticated `/mcp` requests return `401` with `WWW-Authenticate: Bearer resource_metadata="<public_url>/.well-known/oauth-protected-resource/mcp"`.
+- `GET /.well-known/oauth-protected-resource` and `GET /.well-known/oauth-protected-resource<resource_path>` (RFC 9728): advertise `resource: "<public_url><resource_path>"` and `authorization_servers: ["<public_url>"]`. Unauthenticated `/mcp` requests return `401` with `WWW-Authenticate: Bearer resource_metadata="<public_url>/.well-known/oauth-protected-resource<resource_path>"`.
 - `GET /.well-known/oauth-authorization-server` (RFC 8414): advertises endpoints, `code_challenge_methods_supported: ["S256"]`, and `authorization_response_iss_parameter_supported: true`.
 - `POST /oauth/register` (RFC 7591): registers public (`none`) or confidential (`client_secret_post`, `client_secret_basic`) clients. Client secrets and issued tokens are stored only as SHA-256 digests.
-- `GET /oauth/authorize` and `POST /oauth/authorize`: enforces PKCE `S256` for all clients, binds the login form with an `HttpOnly; SameSite=Lax` `mcp_ar_<id>` CSRF cookie and strict `Content-Security-Policy`, throttles failed password attempts (10 failures per 15 minutes), and redirects `303 See Other` with `code`, `iss` (RFC 9207), and `state`.
-- `POST /oauth/token`: exchanges single-use authorization codes and rotates refresh tokens. During `refresh_grace_secs` after a refresh token `R0` rotates to `(A1, R1)`, concurrent refresh requests presenting `R0` receive the same `(A1, R1)` response so parallel subagents converge on `R1`. Presenting `R0` after `refresh_grace_secs` expires triggers RFC 9700 reuse detection and revokes the entire grant.
+- `GET /oauth/authorize` and `POST /oauth/authorize`: enforces PKCE `S256` for all clients, binds the login form with an `HttpOnly; SameSite=Lax` `mcp_ar_<id>` CSRF cookie and strict `Content-Security-Policy`, throttles failed password attempts (10 failures per 15 minutes), and returns `code`, `iss` (RFC 9207), and `state` to the verified callback. Browser form submissions get a page that navigates to the callback without forwarding the password. Other clients receive `303 See Other`.
+- `POST /oauth/token`: exchanges single-use authorization codes and rotates refresh tokens. During `refresh_grace_secs` after a refresh token `R0` rotates to `(A1, R1)`, concurrent refresh requests presenting `R0` can reuse `(A1, R1)` while the cached scope matches the current grant. If the grant has changed or the cache was lost, the gateway can issue a sibling pair under the current scope. Presenting `R0` after `refresh_grace_secs` expires triggers RFC 9700 reuse detection and revokes the entire grant.
 - `POST /oauth/revoke` (RFC 7009): revokes the grant owning the submitted access or refresh token.
 - `GET /healthz`: unauthenticated liveness check returning `{"ok":true}`.
 

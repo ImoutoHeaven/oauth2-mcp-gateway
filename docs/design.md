@@ -23,10 +23,11 @@ Responsibilities outside scope:
 
 The gateway reads one JSON configuration file selected via `--config <path>` (default `gateway.json`). Unknown fields are rejected (`deny_unknown_fields`). String fields equal to `"${VAR}"` expand from the process environment at startup (except `upstream.args`, whose items pass verbatim as command arguments); missing or empty referenced variables fail startup.
 
-Required top-level fields:
+Top-level fields:
 
 - `listen`: local socket address to bind, such as `"127.0.0.1:8080"`.
 - `public_url`: canonical external origin without path, query, fragment, or userinfo, such as `"https://mcp.example.com"`. Plain `http://` is accepted only when the host is `localhost`, `127.0.0.1`, or `[::1]`.
+- `resource_path`: optional public MCP path, default `/mcp`. The proxy maps this path to the gateway’s `/mcp` route and forwards the public discovery paths unchanged.
 - `state_path`: regular file path for persisted OAuth clients and hashed token grants (created with mode `0600`, updated via sibling temporary file `fsync` and atomic `rename`).
 - `oauth`: owner credential and token lifetimes.
 - `upstream`: tagged union (`"transport": "http"` or `"transport": "stdio"`).
@@ -60,35 +61,37 @@ Key `upstream` settings:
 The gateway exposes six OAuth routes:
 
 1. `GET /.well-known/oauth-protected-resource` and `GET /.well-known/oauth-protected-resource/{*path}` (RFC 9728):
-   - Root metadata reports `resource: "<public_url>/mcp"` and `authorization_servers: ["<public_url>"]`.
-   - Path-scoped metadata `/.well-known/oauth-protected-resource/mcp` reports `resource: "<public_url>/mcp"` so clients that resolve path-relative metadata (including Claude.ai Web) match exact resource identifiers.
+   - Root metadata reports `resource: "<public_url><resource_path>"` and `authorization_servers: ["<public_url>"]`.
+   - Path-scoped metadata `/.well-known/oauth-protected-resource<resource_path>` reports `resource: "<public_url><resource_path>"` so clients that resolve path-relative metadata (including Claude.ai Web) match exact resource identifiers.
 2. `GET /.well-known/oauth-authorization-server` and `GET /.well-known/oauth-authorization-server/{*path}` (RFC 8414):
    - Publishes `issuer: "<public_url>"`, `authorization_endpoint`, `token_endpoint`, `registration_endpoint`, `revocation_endpoint`, `response_types_supported: ["code"]`, `grant_types_supported: ["authorization_code", "refresh_token"]`, `token_endpoint_auth_methods_supported: ["none", "client_secret_post", "client_secret_basic"]`, `code_challenge_methods_supported: ["S256"]`, and `authorization_response_iss_parameter_supported: true`.
 3. `POST /oauth/register` (RFC 7591):
-   - Validates every `redirect_uri`. Rejects relative URLs, fragments, userinfo, non-loopback `http://`, and hosts outside `allowed_redirect_hosts` when configured.
+   - Validates every `redirect_uri`. Rejects relative URLs, fragments, userinfo, OAuth response query keys, non-loopback `http://`, and hosts outside `allowed_redirect_hosts` when configured.
    - Applies RFC 7591 defaults when omitted (`grant_types: ["authorization_code", "refresh_token"]`, `response_types: ["code"]`, `token_endpoint_auth_method: "none"`). Issues a random `client_secret` (storing only its SHA-256 hash) when `token_endpoint_auth_method` is `client_secret_post` or `client_secret_basic`.
    - Evicts the oldest ungranted dynamically registered client when `max_registered_clients` is reached, so unauthenticated registration floods cannot exhaust storage or evict active grants.
 4. `GET /oauth/authorize` and `POST /oauth/authorize`:
    - Requires `response_type=code`, registered `client_id`, exact registered `redirect_uri`, `code_challenge_method=S256`, and valid base64url `code_challenge` (43 to 128 ASCII characters) for every client, both public and confidential.
-   - Validates optional RFC 8707 `resource`: accepts `<public_url>`, `<public_url>/`, or `<public_url>/mcp`, normalizing to `<public_url>/mcp`; rejects any other target with `invalid_target`.
+   - Validates optional RFC 8707 `resource`: accepts `<public_url>`, `<public_url>/`, or `<public_url><resource_path>`, normalizing to the full resource URL; rejects any other target with `invalid_target`.
    - Binds the pending authorization request (`ar_id`, 5 minute TTL, max 256 pending entries) to the browser via an `HttpOnly; SameSite=Lax; Path=/oauth/authorize` CSRF cookie (`Secure` when `public_url` uses `https`) paired with a hidden form field.
    - Rate-limits failed password submissions (max 10 failures per 15 minutes) and verifies the owner password with constant-time comparison.
    - Renders a minimal HTML form with `Content-Security-Policy: default-src 'none'; style-src 'unsafe-inline'; form-action 'self'` and `X-Frame-Options: DENY`, showing only the client identifier, redirect URI, scopes, password input, and `Authorize` submit action.
-   - Redirects `303 See Other` to `redirect_uri` with `code`, `iss=<public_url>` (RFC 9207, checked by ChatGPT and OAuth 2.1 clients), and `state` when supplied.
+   - Returns `code`, `iss=<public_url>` (RFC 9207), and optional `state` to the validated callback. A browser receives a page that navigates to the callback as a fresh GET, outside the password form submission. Other clients get a `303 See Other` redirect.
 5. `POST /oauth/token`:
    - `authorization_code`: consumes the single-use code (5 minute TTL), verifies client secret if confidential, verifies exact `redirect_uri` and `resource`, verifies `BASE64URL_NOPAD(SHA256(code_verifier)) == code_challenge`, selects the least-loaded `pool_slot`, persists SHA-256 digests of the new 256-bit `access_token` and `refresh_token`, and returns `Cache-Control: no-store`.
    - `refresh_token`: supports concurrent multi-agent refresh bursts without weakening theft detection:
      - First exchange of refresh token `R0` at time `t0` atomically marks `R0` rotated with `grace_until = min(R0.expires_at, t0 + refresh_grace_secs)`, mints `(A1, R1)` under the same `grant_id` and `pool_slot`, and caches the serialized token response in memory keyed by `hash(R0)` until `grace_until`.
-     - Concurrent retries of `R0` before `grace_until` validate client and scope/resource rules and return the cached `(A1, R1)` (or mint a sibling access token within the same grant if the gateway restarted mid-grace, without extending `R0`'s `grace_until` or the grant's refresh ceiling). All concurrent subagents converge on `R1`.
+     - Retries within the grace window validate the client, resource, and current scope. They return the cached pair when its scope matches the current grant, regardless of scope order. Otherwise they mint a sibling pair without extending the grace window or the grant’s refresh ceiling.
      - Any presentation of `R0` after `grace_until` triggers RFC 9700 reuse detection and revokes the entire `grant_id` (invalidating `A1`, `R1`, and all tokens in that grant).
 6. `POST /oauth/revoke` (RFC 7009):
    - Authenticates confidential clients and revokes the matching grant if found, returning `200 OK`.
+
+OAuth POST requests have a 64 KiB body limit and a 10-second body read deadline. Changing the public resource URL requires clients to authorize again. A retry of an already rotated refresh token within its grace period cannot narrow the current scope.
 
 ## 4. Upstream transport semantics
 
 ### 4.1 HTTP upstream (`src/upstream_http.rs`)
 
-- Unauthenticated `/mcp` requests receive `401 Unauthorized` with `WWW-Authenticate: Bearer resource_metadata="<public_url>/.well-known/oauth-protected-resource/mcp"` and `Connection: close` before reading the request body.
+- Unauthenticated `/mcp` requests receive `401 Unauthorized` with `WWW-Authenticate: Bearer resource_metadata="<public_url>/.well-known/oauth-protected-resource<resource_path>"` and `Connection: close` before reading the request body.
 - Authenticated `/mcp` requests enforce a `16 MiB` JSON-RPC request body limit, remove hop-by-hop headers and incoming `Authorization`, inject `Authorization: Bearer <bearer_tokens[grant.pool_slot]>` (when `bearer_tokens` is non-empty), set `X-Forwarded-Proto` from `public_url`, and stream the upstream response with `X-Accel-Buffering: no`.
 - When upstream responds with `Content-Type: text/event-stream`, the stream filter drops leading SSE blocks that contain no `data:` field (such as bare `retry:` or priming comment blocks) before the first JSON-RPC event, preventing Gemini Web connectors from failing on empty initial SSE events. All subsequent frames stream through unchanged.
 - Requests matching `passthrough_prefixes` verify path safety (rejecting `..`, `\`, NUL, and percent-encoded dot segments regardless of case), strip any incoming `Authorization`, and stream `GET`, `HEAD`, and `PUT` bodies directly in both directions with no body size cap and no memory buffering.

@@ -19,9 +19,11 @@ use serde::Deserialize;
 use serde_json::json;
 use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 use url::Url;
 
 const MAX_POST_BODY_BYTES: usize = 64 * 1024;
+const OAUTH_BODY_TIMEOUT: Duration = Duration::from_secs(10);
 const MAX_REDIRECT_URIS: usize = 16;
 const MAX_CLIENT_NAME_CHARS: usize = 256;
 const PENDING_AUTH_TTL_SECS: u64 = 300;
@@ -183,8 +185,10 @@ impl OAuthEngine {
     pub async fn handle(&self, req: Request<Incoming>) -> HttpReply {
         let path = req.uri().path().to_owned();
         match path.as_str() {
-            "/.well-known/oauth-protected-resource"
-            | "/.well-known/oauth-protected-resource/mcp" => {
+            p if p == "/.well-known/oauth-protected-resource"
+                || p.strip_prefix("/.well-known/oauth-protected-resource")
+                    == Some(self.config.resource_path.as_str()) =>
+            {
                 if req.method() != Method::GET {
                     return method_not_allowed("GET");
                 }
@@ -282,8 +286,8 @@ impl OAuthEngine {
 
     pub fn www_authenticate_value(&self, challenge: AuthChallenge) -> String {
         let meta_url = format!(
-            "{}/.well-known/oauth-protected-resource/mcp",
-            self.config.public_url
+            "{}/.well-known/oauth-protected-resource{}",
+            self.config.public_url, self.config.resource_path
         );
         match challenge {
             AuthChallenge::MissingToken => format!("Bearer resource_metadata=\"{meta_url}\""),
@@ -626,7 +630,9 @@ impl OAuthEngine {
         let Some(client) = client_meta else {
             return html_status_reply(StatusCode::BAD_REQUEST, "Unknown client_id");
         };
-        if !client.redirect_uris.iter().any(|u| u == redirect_uri) {
+        if !client.redirect_uris.iter().any(|u| u == redirect_uri)
+            || !self.is_allowed_redirect_uri(redirect_uri)
+        {
             return html_status_reply(StatusCode::BAD_REQUEST, "Unregistered redirect_uri");
         }
 
@@ -892,6 +898,21 @@ impl OAuthEngine {
             if let Some(st) = &consumed.state {
                 pairs.append_pair("state", st);
             }
+        }
+
+        if req_headers
+            .get("sec-fetch-mode")
+            .is_some_and(|mode| mode == "navigate")
+        {
+            // Chromium applies form-action to the POST redirect chain. A new document
+            // can navigate to the registered callback without sending the form body.
+            let callback = escape_html(location.as_str());
+            let html = format!(
+                "<!DOCTYPE html><html lang=\"en\"><head><meta charset=\"utf-8\">\
+                 <title>Return to the app</title><meta http-equiv=\"refresh\" content=\"0;url={callback}\">\
+                 </head><body><a href=\"{callback}\">Return to the app</a></body></html>"
+            );
+            return html_reply_with_cookie(StatusCode::OK, html, Some(&clear_cookie));
         }
 
         Response::builder()
@@ -1198,6 +1219,14 @@ impl OAuthEngine {
             );
         }
 
+        if guard.persisted.grants[grant_idx].resource != self.config.mcp_resource_url() {
+            return oauth_error(
+                StatusCode::BAD_REQUEST,
+                "invalid_grant",
+                "refresh token targets a previous resource URL",
+            );
+        }
+
         let existing_grace = guard.persisted.grants[grant_idx].refresh_tokens[rt_idx].grace_until;
         let r0_expires_at = guard.persisted.grants[grant_idx].refresh_tokens[rt_idx].expires_at;
         let grant_id = guard.persisted.grants[grant_idx].grant_id.clone();
@@ -1223,14 +1252,26 @@ impl OAuthEngine {
                 );
             }
 
-            if let Err(reply) =
-                self.validate_refresh_scope_and_resource(&guard.persisted.grants[grant_idx], form)
-            {
-                return *reply;
+            let grant = &guard.persisted.grants[grant_idx];
+            let effective_scopes = match self.validate_refresh_scope_and_resource(grant, form) {
+                Ok(scopes) => scopes,
+                Err(reply) => return *reply,
+            };
+            if effective_scopes.len() != grant.scopes.len() {
+                return oauth_error(
+                    StatusCode::BAD_REQUEST,
+                    "invalid_scope",
+                    "refresh retry cannot narrow the current scope",
+                );
             }
 
             if let Some(cached) = guard.grace_cache.get(&rt_hash).cloned()
                 && cached.a1_expires_at > now
+                && cached.scopes.len() == grant.scopes.len()
+                && cached
+                    .scopes
+                    .iter()
+                    .all(|scope| grant.scopes.contains(scope))
             {
                 let rem_ttl = cached.a1_expires_at.saturating_sub(now).max(1);
                 return token_success_reply(
@@ -1639,6 +1680,12 @@ impl OAuthEngine {
         if parsed.fragment().is_some()
             || !parsed.username().is_empty()
             || parsed.password().is_some()
+            || parsed.query_pairs().any(|(key, _)| {
+                matches!(
+                    key.as_ref(),
+                    "code" | "iss" | "state" | "error" | "error_description" | "error_uri"
+                )
+            })
         {
             return false;
         }
@@ -1902,18 +1949,30 @@ async fn read_limited_body(req: Request<Incoming>) -> Result<Bytes, HttpReply> {
     }
 
     let limited = Limited::new(req.into_body(), MAX_POST_BODY_BYTES);
-    match limited.collect().await {
-        Ok(collected) => Ok(collected.to_bytes()),
-        Err(err) if err.is::<LengthLimitError>() => Err(oauth_error(
+    match tokio::time::timeout(OAUTH_BODY_TIMEOUT, limited.collect()).await {
+        Ok(Ok(collected)) => Ok(collected.to_bytes()),
+        Ok(Err(err)) if err.is::<LengthLimitError>() => Err(oauth_error(
             StatusCode::PAYLOAD_TOO_LARGE,
             "invalid_request",
             "request body exceeds 64 KiB limit",
         )),
-        Err(_) => Err(oauth_error(
+        Ok(Err(_)) => Err(oauth_error(
             StatusCode::BAD_REQUEST,
             "invalid_request",
             "failed to read request body",
         )),
+        Err(_) => {
+            let mut reply = oauth_error(
+                StatusCode::REQUEST_TIMEOUT,
+                "invalid_request",
+                "OAuth request body read timed out",
+            );
+            reply.headers_mut().insert(
+                header::CONNECTION,
+                header::HeaderValue::from_static("close"),
+            );
+            Err(reply)
+        }
     }
 }
 
