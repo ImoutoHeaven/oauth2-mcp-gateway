@@ -8,7 +8,7 @@ use http_body::{Body, Frame, SizeHint};
 use http_body_util::{BodyExt, LengthLimitError, Limited};
 use hyper::body::Incoming;
 use hyper_rustls::HttpsConnector;
-use hyper_util::client::legacy::{Client, connect::HttpConnector};
+use hyper_util::client::legacy::{Client, ResponseFuture, connect::HttpConnector};
 use hyper_util::rt::TokioExecutor;
 use std::collections::HashSet;
 use std::io;
@@ -20,8 +20,23 @@ use std::time::Duration;
 
 pub const MAX_MCP_BODY_BYTES: usize = 16 * 1024 * 1024;
 const MAX_PRIMING_BUFFER_BYTES: usize = 1024 * 1024;
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+const TCP_KEEPALIVE: Duration = Duration::from_secs(30);
+const POOL_MAX_IDLE_PER_HOST: usize = 64;
 
-type HttpClient = Client<HttpsConnector<HttpConnector>, ReplyBody>;
+enum HttpClient {
+    Plain(Client<HttpConnector, ReplyBody>),
+    Tls(Client<HttpsConnector<HttpConnector>, ReplyBody>),
+}
+
+impl HttpClient {
+    fn request(&self, req: Request<ReplyBody>) -> ResponseFuture {
+        match self {
+            Self::Plain(c) => c.request(req),
+            Self::Tls(c) => c.request(req),
+        }
+    }
+}
 
 pub struct HttpUpstream {
     settings: HttpUpstreamSettings,
@@ -34,13 +49,31 @@ pub struct HttpUpstream {
 
 impl HttpUpstream {
     pub fn new(settings: HttpUpstreamSettings) -> Result<Self, String> {
-        let connector = hyper_rustls::HttpsConnectorBuilder::new()
-            .with_native_roots()
-            .map_err(|e| format!("failed to load native TLS roots: {e}"))?
-            .https_or_http()
-            .enable_http1()
-            .build();
-        let client = Client::builder(TokioExecutor::new()).build(connector);
+        let mut http_connector = HttpConnector::new();
+        http_connector.set_connect_timeout(Some(CONNECT_TIMEOUT));
+        http_connector.set_nodelay(true);
+        http_connector.set_keepalive(Some(TCP_KEEPALIVE));
+
+        let client = if settings.url.scheme() == "http" {
+            HttpClient::Plain(
+                Client::builder(TokioExecutor::new())
+                    .pool_max_idle_per_host(POOL_MAX_IDLE_PER_HOST)
+                    .build(http_connector),
+            )
+        } else {
+            http_connector.enforce_http(false);
+            let https_connector = hyper_rustls::HttpsConnectorBuilder::new()
+                .with_native_roots()
+                .map_err(|e| format!("failed to load native TLS roots: {e}"))?
+                .https_or_http()
+                .enable_http1()
+                .wrap_connector(http_connector);
+            HttpClient::Tls(
+                Client::builder(TokioExecutor::new())
+                    .pool_max_idle_per_host(POOL_MAX_IDLE_PER_HOST)
+                    .build(https_connector),
+            )
+        };
 
         let host_str = settings
             .url
@@ -416,7 +449,7 @@ fn is_event_stream(headers: &HeaderMap) -> bool {
         })
 }
 
-fn copy_filtered_headers(src: &HeaderMap, dst: &mut HeaderMap, strip_authorization: bool) {
+fn copy_filtered_headers(src: &HeaderMap, dst: &mut HeaderMap, is_request: bool) {
     let mut connection_tokens: HashSet<String> = HashSet::new();
     for val in src.get_all(header::CONNECTION) {
         if let Ok(s) = val.to_str() {
@@ -430,17 +463,31 @@ fn copy_filtered_headers(src: &HeaderMap, dst: &mut HeaderMap, strip_authorizati
     }
 
     for (name, value) in src.iter() {
-        if is_hop_by_hop_header(name.as_str()) {
+        let lower = name.as_str();
+        if is_hop_by_hop_header(lower) || connection_tokens.contains(lower) {
             continue;
         }
-        if strip_authorization && name == header::AUTHORIZATION {
+        if is_request && is_stripped_request_header(lower) {
             continue;
         }
-        if connection_tokens.contains(name.as_str()) {
+        if !is_request && lower == "set-cookie" {
             continue;
         }
         dst.append(name.clone(), value.clone());
     }
+}
+
+fn is_stripped_request_header(lower_name: &str) -> bool {
+    matches!(
+        lower_name,
+        "authorization"
+            | "cookie"
+            | "forwarded"
+            | "x-forwarded-for"
+            | "x-forwarded-host"
+            | "x-forwarded-proto"
+            | "x-real-ip"
+    )
 }
 
 fn is_hop_by_hop_header(lower_name: &str) -> bool {
@@ -488,6 +535,7 @@ struct SsePrimingFilterBody<B> {
     inner: B,
     buf: BytesMut,
     filtering: bool,
+    pending_frame: Option<Frame<Bytes>>,
 }
 
 impl<B> SsePrimingFilterBody<B> {
@@ -496,6 +544,7 @@ impl<B> SsePrimingFilterBody<B> {
             inner,
             buf: BytesMut::new(),
             filtering: true,
+            pending_frame: None,
         }
     }
 }
@@ -517,6 +566,9 @@ where
             if !this.filtering && !this.buf.is_empty() {
                 let out = this.buf.split().freeze();
                 return Poll::Ready(Some(Ok(Frame::data(out))));
+            }
+            if let Some(frame) = this.pending_frame.take() {
+                return Poll::Ready(Some(Ok(frame)));
             }
 
             match Pin::new(&mut this.inner).poll_frame(cx) {
@@ -543,7 +595,7 @@ where
                         Err(non_data_frame) => {
                             this.filtering = false;
                             if block_has_data_line(&this.buf) {
-                                // Flush pending data block first; trailers are rare on SSE.
+                                this.pending_frame = Some(non_data_frame);
                                 let out = this.buf.split().freeze();
                                 return Poll::Ready(Some(Ok(Frame::data(out))));
                             }

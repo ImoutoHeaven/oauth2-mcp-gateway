@@ -26,6 +26,7 @@ use tokio::sync::{mpsc, oneshot};
 use tokio::task::JoinSet;
 use tokio_util::sync::CancellationToken;
 
+const BODY_READ_TIMEOUT: Duration = Duration::from_secs(30);
 const INIT_TIMEOUT: Duration = Duration::from_secs(30);
 const STDIN_GRACE_WAIT: Duration = Duration::from_millis(200);
 const SIGTERM_WAIT: Duration = Duration::from_secs(2);
@@ -33,6 +34,7 @@ const STDIN_CHANNEL_CAPACITY: usize = 64;
 const NOTIF_CHANNEL_CAPACITY: usize = 256;
 const MAX_STDOUT_LINE_BYTES: usize = 64 * 1024 * 1024;
 const SESSIONLESS_META_KEY: &str = "io.modelcontextprotocol/protocolVersion";
+const MIN_SESSIONLESS_PROTOCOL_VERSION: &str = "2026-07-28";
 
 pub struct StdioUpstream {
     inner: Arc<StdioInner>,
@@ -52,20 +54,90 @@ struct SessionTable {
 }
 
 struct InFlightEntry {
-    id: Value,
+    wire_id: u64,
+    client_id: Value,
     progress_token: Option<Value>,
     notif_tx: mpsc::Sender<String>,
     resp_tx: oneshot::Sender<String>,
+}
+
+#[cfg(windows)]
+struct WindowsJobObject(windows_sys::Win32::Foundation::HANDLE);
+
+#[cfg(windows)]
+unsafe impl Send for WindowsJobObject {}
+
+#[cfg(windows)]
+unsafe impl Sync for WindowsJobObject {}
+
+#[cfg(windows)]
+impl WindowsJobObject {
+    fn create_and_assign(child: &Child) -> Option<Self> {
+        use windows_sys::Win32::Foundation::{CloseHandle, HANDLE};
+        use windows_sys::Win32::System::JobObjects::{
+            AssignProcessToJobObject, CreateJobObjectW, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
+            JOBOBJECT_EXTENDED_LIMIT_INFORMATION, JobObjectExtendedLimitInformation,
+            SetInformationJobObject,
+        };
+
+        let raw_handle = child.raw_handle()?;
+        let job = unsafe { CreateJobObjectW(std::ptr::null(), std::ptr::null()) };
+        if job.is_null() {
+            return None;
+        }
+
+        let mut info: JOBOBJECT_EXTENDED_LIMIT_INFORMATION = unsafe { std::mem::zeroed() };
+        info.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+        let ok = unsafe {
+            SetInformationJobObject(
+                job,
+                JobObjectExtendedLimitInformation,
+                (&raw const info).cast(),
+                std::mem::size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32,
+            )
+        };
+        if ok == 0 {
+            unsafe {
+                CloseHandle(job);
+            }
+            return None;
+        }
+
+        let assigned = unsafe { AssignProcessToJobObject(job, raw_handle as HANDLE) };
+        if assigned == 0 {
+            unsafe {
+                CloseHandle(job);
+            }
+            return None;
+        }
+
+        Some(Self(job))
+    }
+}
+
+#[cfg(windows)]
+impl Drop for WindowsJobObject {
+    fn drop(&mut self) {
+        if !self.0.is_null() {
+            unsafe {
+                windows_sys::Win32::Foundation::CloseHandle(self.0);
+            }
+            self.0 = std::ptr::null_mut();
+        }
+    }
 }
 
 struct StdioSession {
     grant_id: String,
     stdin_tx: Mutex<Option<mpsc::Sender<Vec<u8>>>>,
     in_flight: Arc<Mutex<Vec<InFlightEntry>>>,
+    next_wire_id: AtomicU64,
     alive: Arc<AtomicBool>,
     active_requests: Arc<AtomicUsize>,
     last_active_ms: Arc<AtomicU64>,
     child: tokio::sync::Mutex<Option<Child>>,
+    #[cfg(windows)]
+    job: Mutex<Option<WindowsJobObject>>,
     epoch: Instant,
 }
 
@@ -118,10 +190,26 @@ impl StdioUpstream {
         }
     }
 
+    pub async fn terminate_grant(&self, grant_id: &str) {
+        let matched: Vec<Arc<StdioSession>> = {
+            let mut tbl = self.inner.table.lock().unwrap_or_else(|p| p.into_inner());
+            let keys: Vec<String> = tbl
+                .sessions
+                .iter()
+                .filter(|(_, s)| constant_time_eq_str(&s.grant_id, grant_id))
+                .map(|(k, _)| k.clone())
+                .collect();
+            keys.into_iter()
+                .filter_map(|k| tbl.sessions.remove(&k))
+                .collect()
+        };
+        terminate_all(matched).await;
+    }
+
     pub async fn shutdown(&self) {
         self.reaper_cancel.cancel();
         let drained: Vec<Arc<StdioSession>> = {
-            let mut guard = self.inner.table.lock().unwrap();
+            let mut guard = self.inner.table.lock().unwrap_or_else(|p| p.into_inner());
             guard.shutting_down = true;
             guard.sessions.drain().map(|(_, s)| s).collect()
         };
@@ -133,7 +221,7 @@ impl StdioUpstream {
             return close_empty_reply(StatusCode::BAD_REQUEST);
         };
         let removed = {
-            let mut guard = self.inner.table.lock().unwrap();
+            let mut guard = self.inner.table.lock().unwrap_or_else(|p| p.into_inner());
             match guard.sessions.get(sid) {
                 Some(sess) if constant_time_eq_str(&sess.grant_id, &token.grant_id) => {
                     guard.sessions.remove(sid)
@@ -192,12 +280,18 @@ impl StdioUpstream {
             None => None,
         };
 
-        let body_bytes = match Limited::new(incoming, MAX_MCP_BODY_BYTES).collect().await {
-            Ok(collected) => collected.to_bytes(),
-            Err(err) if err.is::<LengthLimitError>() => {
+        let body_bytes = match tokio::time::timeout(
+            BODY_READ_TIMEOUT,
+            Limited::new(incoming, MAX_MCP_BODY_BYTES).collect(),
+        )
+        .await
+        {
+            Ok(Ok(collected)) => collected.to_bytes(),
+            Ok(Err(err)) if err.is::<LengthLimitError>() => {
                 return close_empty_reply(StatusCode::PAYLOAD_TOO_LARGE);
             }
-            Err(_) => return close_empty_reply(StatusCode::BAD_REQUEST),
+            Ok(Err(_)) => return close_empty_reply(StatusCode::BAD_REQUEST),
+            Err(_) => return close_empty_reply(StatusCode::REQUEST_TIMEOUT),
         };
 
         let payload: Value = match serde_json::from_slice(&body_bytes) {
@@ -281,13 +375,14 @@ impl StdioUpstream {
                 return jsonrpc_error_reply(StatusCode::BAD_GATEWAY, id, -32000, &err);
             }
         };
+        let mut ephemeral = EphemeralGuard::new(Arc::clone(&session));
 
-        let (mut guard, notif_rx, resp_rx) =
+        let (wire_id, mut guard, notif_rx, resp_rx) =
             session.register_request(id.clone(), extract_progress_token(payload));
         drop(notif_rx);
-        if session.send_json_line(payload).is_err() {
+        if session.send_request_line(payload, wire_id).is_err() {
             guard.disarm();
-            session.terminate().await;
+            ephemeral.terminate_now().await;
             drop(reservation);
             return jsonrpc_error_reply(
                 StatusCode::BAD_GATEWAY,
@@ -304,7 +399,7 @@ impl StdioUpstream {
             }
             Ok(Err(_)) => {
                 guard.disarm();
-                session.terminate().await;
+                ephemeral.terminate_now().await;
                 drop(reservation);
                 return jsonrpc_error_reply(
                     StatusCode::BAD_GATEWAY,
@@ -315,7 +410,7 @@ impl StdioUpstream {
             }
             Err(_) => {
                 guard.disarm();
-                session.terminate().await;
+                ephemeral.terminate_now().await;
                 drop(reservation);
                 return jsonrpc_error_reply(
                     StatusCode::GATEWAY_TIMEOUT,
@@ -329,25 +424,26 @@ impl StdioUpstream {
         let session_id = match random_token_b64(24) {
             Ok(s) => s,
             Err(err) => {
-                session.terminate().await;
+                ephemeral.terminate_now().await;
                 drop(reservation);
                 return jsonrpc_error_reply(StatusCode::INTERNAL_SERVER_ERROR, id, -32603, &err);
             }
         };
 
         let inserted = {
-            let mut tbl = self.inner.table.lock().unwrap();
+            let mut tbl = self.inner.table.lock().unwrap_or_else(|p| p.into_inner());
             if tbl.shutting_down {
                 false
             } else {
                 tbl.sessions
                     .insert(session_id.clone(), Arc::clone(&session));
                 reservation.commit(&mut tbl);
+                ephemeral.disarm();
                 true
             }
         };
         if !inserted {
-            session.terminate().await;
+            ephemeral.terminate_now().await;
             return jsonrpc_error_reply(
                 StatusCode::SERVICE_UNAVAILABLE,
                 id,
@@ -369,7 +465,7 @@ impl StdioUpstream {
         req_id: Option<Value>,
     ) -> HttpReply {
         let session = {
-            let tbl = self.inner.table.lock().unwrap();
+            let tbl = self.inner.table.lock().unwrap_or_else(|p| p.into_inner());
             tbl.sessions
                 .get(session_id)
                 .filter(|s| {
@@ -387,7 +483,13 @@ impl StdioUpstream {
 
         let is_request = method.is_some() && req_id.is_some();
         if !is_request {
-            if session.send_json_line(payload).is_err() {
+            let rewritten = if method == Some("notifications/cancelled") {
+                session.rewrite_cancel_notification(payload)
+            } else {
+                None
+            };
+            let outbound = rewritten.as_ref().unwrap_or(payload);
+            if session.send_json_line(outbound).is_err() {
                 if !session.alive.load(Ordering::Acquire) {
                     remove_and_terminate(&self.inner, session_id, &session).await;
                     return jsonrpc_error_reply(
@@ -414,9 +516,9 @@ impl StdioUpstream {
         }
 
         let id = req_id.unwrap();
-        let (mut guard, notif_rx, resp_rx) =
+        let (wire_id, mut guard, notif_rx, resp_rx) =
             session.register_request(id.clone(), extract_progress_token(payload));
-        if session.send_json_line(payload).is_err() {
+        if session.send_request_line(payload, wire_id).is_err() {
             guard.disarm();
             if !session.alive.load(Ordering::Acquire) {
                 remove_and_terminate(&self.inner, session_id, &session).await;
@@ -435,16 +537,11 @@ impl StdioUpstream {
             );
         }
 
+        let call_timeout = Duration::from_secs(self.inner.settings.session_idle_secs);
+
         if client_accepts_sse(headers) {
-            let stream = StdioSseStreamBody {
-                notif_rx,
-                resp_rx: Some(resp_rx),
-                pending_resp: None,
-                notif_done: false,
-                guard,
-                session,
-                finished: false,
-            };
+            let stream =
+                StdioSseStreamBody::new(notif_rx, resp_rx, guard, session, call_timeout, None);
             return Response::builder()
                 .status(StatusCode::OK)
                 .header(header::CONTENT_TYPE, "text/event-stream")
@@ -456,20 +553,31 @@ impl StdioUpstream {
         }
 
         drop(notif_rx);
-        match resp_rx.await {
-            Ok(line) => {
+        match tokio::time::timeout(call_timeout, resp_rx).await {
+            Ok(Ok(line)) => {
                 guard.mark_completed();
                 session.touch();
                 single_rpc_reply(headers, Some(session_id), line)
             }
-            Err(_) => {
+            Ok(Err(_)) => {
                 guard.disarm();
-                remove_and_terminate(&self.inner, session_id, &session).await;
+                if !session.alive.load(Ordering::Acquire) {
+                    remove_and_terminate(&self.inner, session_id, &session).await;
+                }
                 jsonrpc_error_reply(
                     StatusCode::BAD_GATEWAY,
                     id,
                     -32000,
                     "upstream child exited before responding",
+                )
+            }
+            Err(_) => {
+                guard.cancel("request timed out");
+                jsonrpc_error_reply(
+                    StatusCode::GATEWAY_TIMEOUT,
+                    id,
+                    -32000,
+                    "upstream request timed out",
                 )
             }
         }
@@ -484,7 +592,7 @@ impl StdioUpstream {
         req_id: Option<Value>,
     ) -> HttpReply {
         let err_id = req_id.clone().unwrap_or(Value::Null);
-        let Some(_reservation) = acquire_slot(&self.inner).await else {
+        let Some(reservation) = acquire_slot(&self.inner).await else {
             return jsonrpc_error_reply(
                 StatusCode::SERVICE_UNAVAILABLE,
                 err_id,
@@ -496,19 +604,15 @@ impl StdioUpstream {
         let session = match StdioSession::spawn(&self.inner, String::new()) {
             Ok(s) => s,
             Err(err) => {
+                drop(reservation);
                 return jsonrpc_error_reply(StatusCode::BAD_GATEWAY, err_id, -32000, &err);
             }
         };
-        let mut ephemeral = EphemeralGuard(Some(Arc::clone(&session)));
+        let mut ephemeral = EphemeralGuard::new(Arc::clone(&session));
 
-        let init_id = if req_id.as_ref().is_some_and(|v| json_id_eq(v, &json!(0))) {
-            json!(-1)
-        } else {
-            json!(0)
-        };
         let synth_init = json!({
             "jsonrpc": "2.0",
-            "id": init_id,
+            "id": 0,
             "method": "initialize",
             "params": {
                 "protocolVersion": protocol_version,
@@ -520,11 +624,16 @@ impl StdioUpstream {
             }
         });
 
-        let (mut init_guard, init_notif_rx, init_resp_rx) = session.register_request(init_id, None);
+        let (init_wire_id, mut init_guard, init_notif_rx, init_resp_rx) =
+            session.register_request(json!(0), None);
         drop(init_notif_rx);
-        if session.send_json_line(&synth_init).is_err() {
+        if session
+            .send_request_line(&synth_init, init_wire_id)
+            .is_err()
+        {
             init_guard.disarm();
             ephemeral.terminate_now().await;
+            drop(reservation);
             return jsonrpc_error_reply(
                 StatusCode::BAD_GATEWAY,
                 err_id,
@@ -538,6 +647,7 @@ impl StdioUpstream {
             Ok(Err(_)) => {
                 init_guard.disarm();
                 ephemeral.terminate_now().await;
+                drop(reservation);
                 return jsonrpc_error_reply(
                     StatusCode::BAD_GATEWAY,
                     err_id,
@@ -548,6 +658,7 @@ impl StdioUpstream {
             Err(_) => {
                 init_guard.disarm();
                 ephemeral.terminate_now().await;
+                drop(reservation);
                 return jsonrpc_error_reply(
                     StatusCode::GATEWAY_TIMEOUT,
                     err_id,
@@ -563,6 +674,7 @@ impl StdioUpstream {
         });
         if session.send_json_line(&initialized_note).is_err() {
             ephemeral.terminate_now().await;
+            drop(reservation);
             return jsonrpc_error_reply(
                 StatusCode::BAD_GATEWAY,
                 err_id,
@@ -575,6 +687,7 @@ impl StdioUpstream {
         if !is_request {
             let send_res = session.send_json_line(payload);
             ephemeral.terminate_now().await;
+            drop(reservation);
             if send_res.is_err() {
                 return jsonrpc_error_reply(
                     StatusCode::BAD_GATEWAY,
@@ -592,11 +705,12 @@ impl StdioUpstream {
         }
 
         let id = req_id.unwrap();
-        let (mut guard, mut notif_rx, resp_rx) =
+        let (wire_id, mut guard, notif_rx, resp_rx) =
             session.register_request(id.clone(), extract_progress_token(payload));
-        if session.send_json_line(payload).is_err() {
+        if session.send_request_line(payload, wire_id).is_err() {
             guard.disarm();
             ephemeral.terminate_now().await;
+            drop(reservation);
             return jsonrpc_error_reply(
                 StatusCode::BAD_GATEWAY,
                 id,
@@ -605,31 +719,34 @@ impl StdioUpstream {
             );
         }
 
-        let wants_sse = client_prefers_sse_only(headers) || client_accepts_sse(headers);
-        let mut events: Vec<String> = Vec::new();
-        let mut buffered_bytes: usize = 0;
         let call_timeout = Duration::from_secs(self.inner.settings.session_idle_secs);
 
-        let wait_res = tokio::time::timeout(call_timeout, async {
-            if !wants_sse {
-                drop(notif_rx);
-                return resp_rx.await.ok();
-            }
-            while let Some(line) = notif_rx.recv().await {
-                if buffered_bytes.saturating_add(line.len()) <= MAX_MCP_BODY_BYTES {
-                    buffered_bytes += line.len();
-                    events.push(line);
-                }
-            }
-            resp_rx.await.ok()
-        })
-        .await;
+        if client_accepts_sse(headers) {
+            ephemeral.attach_slot(reservation);
+            let stream = StdioSseStreamBody::new(
+                notif_rx,
+                resp_rx,
+                guard,
+                session,
+                call_timeout,
+                Some(ephemeral),
+            );
+            return Response::builder()
+                .status(StatusCode::OK)
+                .header(header::CONTENT_TYPE, "text/event-stream")
+                .header(header::CACHE_CONTROL, "no-store")
+                .header(HeaderName::from_static("x-accel-buffering"), "no")
+                .body(stream.boxed())
+                .expect("valid SSE reply");
+        }
 
-        let resp_line = match wait_res {
-            Ok(Some(line)) => line,
-            Ok(None) => {
+        drop(notif_rx);
+        let resp_line = match tokio::time::timeout(call_timeout, resp_rx).await {
+            Ok(Ok(line)) => line,
+            Ok(Err(_)) => {
                 guard.disarm();
                 ephemeral.terminate_now().await;
+                drop(reservation);
                 return jsonrpc_error_reply(
                     StatusCode::BAD_GATEWAY,
                     id,
@@ -638,8 +755,9 @@ impl StdioUpstream {
                 );
             }
             Err(_) => {
-                guard.disarm();
+                guard.cancel("request timed out");
                 ephemeral.terminate_now().await;
+                drop(reservation);
                 return jsonrpc_error_reply(
                     StatusCode::GATEWAY_TIMEOUT,
                     id,
@@ -651,25 +769,7 @@ impl StdioUpstream {
 
         guard.mark_completed();
         ephemeral.terminate_now().await;
-
-        if client_prefers_sse_only(headers) || (!events.is_empty() && client_accepts_sse(headers)) {
-            let mut body = String::new();
-            for note in events {
-                body.push_str("data: ");
-                body.push_str(&note);
-                body.push_str("\n\n");
-            }
-            body.push_str("data: ");
-            body.push_str(&resp_line);
-            body.push_str("\n\n");
-            return Response::builder()
-                .status(StatusCode::OK)
-                .header(header::CONTENT_TYPE, "text/event-stream")
-                .header(header::CACHE_CONTROL, "no-store")
-                .header(HeaderName::from_static("x-accel-buffering"), "no")
-                .body(bytes_body(Bytes::from(body)))
-                .expect("valid SSE reply");
-        }
+        drop(reservation);
 
         single_rpc_reply(headers, None, resp_line)
     }
@@ -681,60 +781,82 @@ impl Drop for StdioUpstream {
     }
 }
 
-struct EphemeralGuard(Option<Arc<StdioSession>>);
+struct EphemeralGuard {
+    session: Option<Arc<StdioSession>>,
+    slot: Option<SlotReservation>,
+}
 
 impl EphemeralGuard {
+    fn new(session: Arc<StdioSession>) -> Self {
+        Self {
+            session: Some(session),
+            slot: None,
+        }
+    }
+
+    fn attach_slot(&mut self, slot: SlotReservation) {
+        self.slot = Some(slot);
+    }
+
+    fn disarm(&mut self) {
+        self.session = None;
+        self.slot = None;
+    }
+
     async fn terminate_now(&mut self) {
-        if let Some(sess) = self.0.take() {
+        if let Some(sess) = self.session.take() {
             sess.terminate().await;
         }
+        let _ = self.slot.take();
     }
 }
 
 impl Drop for EphemeralGuard {
     fn drop(&mut self) {
-        if let Some(sess) = self.0.take()
+        let slot = self.slot.take();
+        if let Some(sess) = self.session.take()
             && let Ok(handle) = tokio::runtime::Handle::try_current()
         {
             handle.spawn(async move {
                 sess.terminate().await;
+                drop(slot);
             });
         }
     }
 }
 
-struct SlotReservation<'a> {
-    inner: &'a StdioInner,
+struct SlotReservation {
+    inner: Arc<StdioInner>,
     committed: bool,
 }
 
-impl<'a> SlotReservation<'a> {
+impl SlotReservation {
     fn commit(mut self, tbl: &mut SessionTable) {
         tbl.reserved_slots = tbl.reserved_slots.saturating_sub(1);
         self.committed = true;
     }
 }
 
-impl Drop for SlotReservation<'_> {
+impl Drop for SlotReservation {
     fn drop(&mut self) {
         if !self.committed {
-            let mut tbl = self.inner.table.lock().unwrap();
+            let mut tbl = self.inner.table.lock().unwrap_or_else(|p| p.into_inner());
             tbl.reserved_slots = tbl.reserved_slots.saturating_sub(1);
         }
     }
 }
 
-async fn acquire_slot(inner: &StdioInner) -> Option<SlotReservation<'_>> {
+async fn acquire_slot(inner: &Arc<StdioInner>) -> Option<SlotReservation> {
     if try_reserve_slot(inner) {
         return Some(SlotReservation {
-            inner,
+            inner: Arc::clone(inner),
             committed: false,
         });
     }
     evict_idle_sessions(inner).await;
     if try_reserve_slot(inner) {
         Some(SlotReservation {
-            inner,
+            inner: Arc::clone(inner),
             committed: false,
         })
     } else {
@@ -743,7 +865,7 @@ async fn acquire_slot(inner: &StdioInner) -> Option<SlotReservation<'_>> {
 }
 
 fn try_reserve_slot(inner: &StdioInner) -> bool {
-    let mut tbl = inner.table.lock().unwrap();
+    let mut tbl = inner.table.lock().unwrap_or_else(|p| p.into_inner());
     if tbl.shutting_down {
         return false;
     }
@@ -760,7 +882,7 @@ async fn evict_idle_sessions(inner: &StdioInner) {
     let now_ms = elapsed_ms(inner.epoch);
     let idle_limit_ms = inner.settings.session_idle_secs.saturating_mul(1000);
     let evicted: Vec<Arc<StdioSession>> = {
-        let mut tbl = inner.table.lock().unwrap();
+        let mut tbl = inner.table.lock().unwrap_or_else(|p| p.into_inner());
         let mut stale_ids = Vec::new();
         for (sid, sess) in &tbl.sessions {
             let dead = !sess.alive.load(Ordering::Acquire);
@@ -781,7 +903,7 @@ async fn evict_idle_sessions(inner: &StdioInner) {
 
 async fn remove_and_terminate(inner: &StdioInner, session_id: &str, session: &Arc<StdioSession>) {
     {
-        let mut tbl = inner.table.lock().unwrap();
+        let mut tbl = inner.table.lock().unwrap_or_else(|p| p.into_inner());
         if tbl
             .sessions
             .get(session_id)
@@ -832,6 +954,10 @@ impl StdioSession {
         let mut child = cmd
             .spawn()
             .map_err(|e| format!("failed to spawn upstream process: {e}"))?;
+
+        #[cfg(windows)]
+        let job = WindowsJobObject::create_and_assign(&child);
+
         let mut stdin = child
             .stdin
             .take()
@@ -862,10 +988,13 @@ impl StdioSession {
             grant_id,
             stdin_tx: Mutex::new(Some(stdin_tx)),
             in_flight: Arc::clone(&in_flight),
+            next_wire_id: AtomicU64::new(1),
             alive: Arc::clone(&alive),
             active_requests,
             last_active_ms: Arc::clone(&last_active_ms),
             child: tokio::sync::Mutex::new(Some(child)),
+            #[cfg(windows)]
+            job: Mutex::new(job),
             epoch: inner.epoch,
         });
 
@@ -884,7 +1013,7 @@ impl StdioSession {
                     if !trimmed.trim().is_empty() {
                         last_active_ms.store(elapsed_ms(epoch), Ordering::Release);
                         if let Ok(val) = serde_json::from_str::<Value>(trimmed) {
-                            dispatch_stdout_message(&in_flight, trimmed, &val);
+                            dispatch_stdout_message(&in_flight, trimmed, val);
                         }
                     }
                 }
@@ -893,10 +1022,10 @@ impl StdioSession {
                 }
             }
             alive.store(false, Ordering::Release);
-            in_flight.lock().unwrap().clear();
+            in_flight.lock().unwrap_or_else(|p| p.into_inner()).clear();
             if let (Some(up), Some(sess)) = (reader_inner.upgrade(), reader_session.upgrade()) {
                 let matched_key = {
-                    let mut tbl = up.table.lock().unwrap();
+                    let mut tbl = up.table.lock().unwrap_or_else(|p| p.into_inner());
                     let found = tbl
                         .sessions
                         .iter()
@@ -921,6 +1050,14 @@ impl StdioSession {
             .store(elapsed_ms(self.epoch), Ordering::Release);
     }
 
+    fn send_request_line(&self, payload: &Value, wire_id: u64) -> Result<(), ()> {
+        let mut rewritten = payload.clone();
+        if let Some(obj) = rewritten.as_object_mut() {
+            obj.insert("id".to_owned(), Value::from(wire_id));
+        }
+        self.send_json_line(&rewritten)
+    }
+
     fn send_json_line(&self, value: &Value) -> Result<(), ()> {
         if !self.alive.load(Ordering::Acquire) {
             return Err(());
@@ -930,8 +1067,26 @@ impl StdioSession {
         self.send_raw_line(line)
     }
 
+    fn rewrite_cancel_notification(&self, payload: &Value) -> Option<Value> {
+        let client_req_id = payload.get("params")?.get("requestId")?;
+        let wire_id = {
+            let waiters = self.in_flight.lock().unwrap_or_else(|p| p.into_inner());
+            waiters
+                .iter()
+                .rev()
+                .find(|w| json_id_eq(&w.client_id, client_req_id))
+                .map(|w| w.wire_id)
+        }?;
+        let mut cloned = payload.clone();
+        cloned
+            .get_mut("params")?
+            .as_object_mut()?
+            .insert("requestId".to_owned(), json!(wire_id));
+        Some(cloned)
+    }
+
     fn send_raw_line(&self, line: Vec<u8>) -> Result<(), ()> {
-        let guard = self.stdin_tx.lock().unwrap();
+        let guard = self.stdin_tx.lock().unwrap_or_else(|p| p.into_inner());
         let Some(tx) = guard.as_ref() else {
             return Err(());
         };
@@ -940,21 +1095,23 @@ impl StdioSession {
 
     fn register_request(
         self: &Arc<Self>,
-        id: Value,
+        client_id: Value,
         progress_token: Option<Value>,
     ) -> (
+        u64,
         RequestGuard,
         mpsc::Receiver<String>,
         oneshot::Receiver<String>,
     ) {
+        let wire_id = self.next_wire_id.fetch_add(1, Ordering::Relaxed);
         let (notif_tx, notif_rx) = mpsc::channel(NOTIF_CHANNEL_CAPACITY);
         let (resp_tx, resp_rx) = oneshot::channel();
         self.active_requests.fetch_add(1, Ordering::AcqRel);
         {
-            let mut waiters = self.in_flight.lock().unwrap();
-            waiters.retain(|w| !json_id_eq(&w.id, &id));
+            let mut waiters = self.in_flight.lock().unwrap_or_else(|p| p.into_inner());
             waiters.push(InFlightEntry {
-                id: id.clone(),
+                wire_id,
+                client_id,
                 progress_token,
                 notif_tx,
                 resp_tx,
@@ -962,22 +1119,29 @@ impl StdioSession {
         }
         let guard = RequestGuard {
             session: Arc::clone(self),
-            request_id: id,
+            wire_id,
             state: GuardState::Armed,
         };
-        (guard, notif_rx, resp_rx)
+        (wire_id, guard, notif_rx, resp_rx)
     }
 
     async fn terminate(&self) {
         self.alive.store(false, Ordering::Release);
         {
-            let mut tx_guard = self.stdin_tx.lock().unwrap();
+            let mut tx_guard = self.stdin_tx.lock().unwrap_or_else(|p| p.into_inner());
             let _ = tx_guard.take();
         }
-        self.in_flight.lock().unwrap().clear();
+        self.in_flight
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .clear();
 
         let mut child_guard = self.child.lock().await;
         let Some(mut child) = child_guard.take() else {
+            #[cfg(windows)]
+            {
+                let _ = self.job.lock().unwrap_or_else(|p| p.into_inner()).take();
+            }
             return;
         };
 
@@ -1004,7 +1168,22 @@ impl StdioSession {
             }
         }
 
-        #[cfg(not(unix))]
+        #[cfg(windows)]
+        {
+            let job = self.job.lock().unwrap_or_else(|p| p.into_inner()).take();
+            if tokio::time::timeout(STDIN_GRACE_WAIT, child.wait())
+                .await
+                .is_err()
+            {
+                drop(job);
+                let _ = child.kill().await;
+                let _ = child.wait().await;
+            } else {
+                drop(job);
+            }
+        }
+
+        #[cfg(not(any(unix, windows)))]
         {
             if tokio::time::timeout(STDIN_GRACE_WAIT, child.wait())
                 .await
@@ -1029,7 +1208,11 @@ fn poll_unreaped_exit(raw_pid: libc::pid_t) -> bool {
         )
     };
     if rc == 0 {
-        info.si_signo != 0 || unsafe { info.si_pid() != 0 }
+        #[cfg(any(target_os = "linux", target_os = "android"))]
+        let has_pid = unsafe { info.si_pid() != 0 };
+        #[cfg(all(unix, not(any(target_os = "linux", target_os = "android"))))]
+        let has_pid = info.si_pid != 0;
+        info.si_signo != 0 || has_pid
     } else {
         io::Error::last_os_error().raw_os_error() != Some(libc::EINTR)
     }
@@ -1086,7 +1269,7 @@ enum GuardState {
 
 struct RequestGuard {
     session: Arc<StdioSession>,
-    request_id: Value,
+    wire_id: u64,
     state: GuardState,
 }
 
@@ -1101,22 +1284,29 @@ impl RequestGuard {
     fn disarm(&mut self) {
         if matches!(self.state, GuardState::Armed) {
             self.state = GuardState::Disarmed;
-            let mut waiters = self.session.in_flight.lock().unwrap();
-            waiters.retain(|w| !json_id_eq(&w.id, &self.request_id));
+            let mut waiters = self
+                .session
+                .in_flight
+                .lock()
+                .unwrap_or_else(|p| p.into_inner());
+            waiters.retain(|w| w.wire_id != self.wire_id);
             drop(waiters);
             self.session.active_requests.fetch_sub(1, Ordering::AcqRel);
         }
     }
-}
 
-impl Drop for RequestGuard {
-    fn drop(&mut self) {
+    fn cancel(&mut self, reason: &str) {
         if !matches!(self.state, GuardState::Armed) {
             return;
         }
+        self.state = GuardState::Disarmed;
         {
-            let mut waiters = self.session.in_flight.lock().unwrap();
-            waiters.retain(|w| !json_id_eq(&w.id, &self.request_id));
+            let mut waiters = self
+                .session
+                .in_flight
+                .lock()
+                .unwrap_or_else(|p| p.into_inner());
+            waiters.retain(|w| w.wire_id != self.wire_id);
         }
         self.session.active_requests.fetch_sub(1, Ordering::AcqRel);
         self.session.touch();
@@ -1126,12 +1316,18 @@ impl Drop for RequestGuard {
                 "jsonrpc": "2.0",
                 "method": "notifications/cancelled",
                 "params": {
-                    "requestId": self.request_id,
-                    "reason": "client disconnected"
+                    "requestId": self.wire_id,
+                    "reason": reason
                 }
             });
             let _ = self.session.send_json_line(&cancel);
         }
+    }
+}
+
+impl Drop for RequestGuard {
+    fn drop(&mut self) {
+        self.cancel("client disconnected");
     }
 }
 
@@ -1142,7 +1338,38 @@ struct StdioSseStreamBody {
     notif_done: bool,
     guard: RequestGuard,
     session: Arc<StdioSession>,
+    idle_timeout: Duration,
+    idle_sleep: Pin<Box<tokio::time::Sleep>>,
+    ephemeral: Option<EphemeralGuard>,
     finished: bool,
+}
+
+impl StdioSseStreamBody {
+    fn new(
+        notif_rx: mpsc::Receiver<String>,
+        resp_rx: oneshot::Receiver<String>,
+        guard: RequestGuard,
+        session: Arc<StdioSession>,
+        idle_timeout: Duration,
+        ephemeral: Option<EphemeralGuard>,
+    ) -> Self {
+        Self {
+            notif_rx,
+            resp_rx: Some(resp_rx),
+            pending_resp: None,
+            notif_done: false,
+            guard,
+            session,
+            idle_timeout,
+            idle_sleep: Box::pin(tokio::time::sleep(idle_timeout)),
+            ephemeral,
+            finished: false,
+        }
+    }
+
+    fn release_ephemeral(&mut self) {
+        let _ = self.ephemeral.take();
+    }
 }
 
 impl Body for StdioSseStreamBody {
@@ -1163,6 +1390,9 @@ impl Body for StdioSseStreamBody {
                 match this.notif_rx.poll_recv(cx) {
                     Poll::Ready(Some(line)) => {
                         this.session.touch();
+                        this.idle_sleep
+                            .as_mut()
+                            .reset(tokio::time::Instant::now() + this.idle_timeout);
                         let formatted = format!("data: {line}\n\n");
                         return Poll::Ready(Some(Ok(Frame::data(Bytes::from(formatted)))));
                     }
@@ -1188,7 +1418,18 @@ impl Body for StdioSseStreamBody {
                             continue;
                         }
                     }
-                    Poll::Pending => return Poll::Pending,
+                    Poll::Pending => {
+                        if this.idle_sleep.as_mut().poll(cx).is_ready() {
+                            this.finished = true;
+                            this.guard.cancel("request timed out");
+                            this.release_ephemeral();
+                            return Poll::Ready(Some(Err(io::Error::new(
+                                io::ErrorKind::TimedOut,
+                                "upstream SSE idle timeout",
+                            ))));
+                        }
+                        return Poll::Pending;
+                    }
                 }
             }
 
@@ -1197,14 +1438,26 @@ impl Body for StdioSseStreamBody {
                     this.finished = true;
                     this.guard.mark_completed();
                     this.session.touch();
+                    this.release_ephemeral();
                     let formatted = format!("data: {line}\n\n");
                     return Poll::Ready(Some(Ok(Frame::data(Bytes::from(formatted)))));
                 }
                 if this.resp_rx.is_none() {
                     this.finished = true;
                     this.guard.disarm();
+                    this.release_ephemeral();
                     return Poll::Ready(None);
                 }
+            }
+
+            if this.idle_sleep.as_mut().poll(cx).is_ready() {
+                this.finished = true;
+                this.guard.cancel("request timed out");
+                this.release_ephemeral();
+                return Poll::Ready(Some(Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    "upstream SSE idle timeout",
+                ))));
             }
 
             return Poll::Pending;
@@ -1216,18 +1469,22 @@ impl Body for StdioSseStreamBody {
     }
 }
 
-fn dispatch_stdout_message(in_flight: &Mutex<Vec<InFlightEntry>>, raw_line: &str, val: &Value) {
+fn dispatch_stdout_message(in_flight: &Mutex<Vec<InFlightEntry>>, raw_line: &str, mut val: Value) {
     let Some(obj) = val.as_object() else {
         return;
     };
     let has_method = obj.get("method").and_then(Value::as_str).is_some();
-    let resp_id = obj.get("id").filter(|v| !v.is_null());
+    let resp_wire_id = obj.get("id").and_then(Value::as_u64);
 
-    let mut waiters = in_flight.lock().unwrap();
-    if !has_method && let Some(id) = resp_id {
-        if let Some(pos) = waiters.iter().position(|w| json_id_eq(&w.id, id)) {
+    let mut waiters = in_flight.lock().unwrap_or_else(|p| p.into_inner());
+    if !has_method && let Some(wire_id) = resp_wire_id {
+        if let Some(pos) = waiters.iter().position(|w| w.wire_id == wire_id) {
             let entry = waiters.remove(pos);
-            let _ = entry.resp_tx.send(raw_line.to_owned());
+            if let Some(map) = val.as_object_mut() {
+                map.insert("id".to_owned(), entry.client_id);
+            }
+            let out = serde_json::to_string(&val).unwrap_or_else(|_| raw_line.to_owned());
+            let _ = entry.resp_tx.send(out);
         }
         return;
     }
@@ -1236,13 +1493,23 @@ fn dispatch_stdout_message(in_flight: &Mutex<Vec<InFlightEntry>>, raw_line: &str
         return;
     }
 
-    if let Some(rel_id) = obj
+    if let Some(rel_wire_id) = obj
         .get("params")
         .and_then(|p| p.get("_meta"))
         .and_then(|m| m.get("relatedRequestId"))
+        .and_then(Value::as_u64)
     {
-        if let Some(entry) = waiters.iter().find(|w| json_id_eq(&w.id, rel_id)) {
-            let _ = entry.notif_tx.try_send(raw_line.to_owned());
+        if let Some(entry) = waiters.iter().find(|w| w.wire_id == rel_wire_id) {
+            let client_id = entry.client_id.clone();
+            if let Some(meta) = val
+                .get_mut("params")
+                .and_then(|p| p.get_mut("_meta"))
+                .and_then(Value::as_object_mut)
+            {
+                meta.insert("relatedRequestId".to_owned(), client_id);
+            }
+            let out = serde_json::to_string(&val).unwrap_or_else(|_| raw_line.to_owned());
+            let _ = entry.notif_tx.try_send(out);
         }
         return;
     }
@@ -1277,6 +1544,18 @@ fn extract_progress_token(payload: &Value) -> Option<Value> {
         .cloned()
 }
 
+fn supports_sessionless_version(ver: &str) -> bool {
+    let bytes = ver.as_bytes();
+    bytes.len() == 10
+        && bytes[4] == b'-'
+        && bytes[7] == b'-'
+        && bytes
+            .iter()
+            .enumerate()
+            .all(|(i, b)| i == 4 || i == 7 || b.is_ascii_digit())
+        && ver >= MIN_SESSIONLESS_PROTOCOL_VERSION
+}
+
 fn detect_sessionless_version(
     headers: &HeaderMap,
     obj: &serde_json::Map<String, Value>,
@@ -1288,11 +1567,13 @@ fn detect_sessionless_version(
         .and_then(Value::as_str)
     {
         let trimmed = meta_ver.trim();
-        if !trimmed.is_empty() {
+        if supports_sessionless_version(trimmed) {
             return Some(trimmed.to_owned());
         }
     }
-    if let Some(hdr) = extract_single_header(headers, "mcp-protocol-version") {
+    if let Some(hdr) = extract_single_header(headers, "mcp-protocol-version")
+        && supports_sessionless_version(hdr)
+    {
         return Some(hdr.to_owned());
     }
     None
@@ -1448,10 +1729,13 @@ mod tests {
             grant_id: "g".to_owned(),
             stdin_tx: Mutex::new(None),
             in_flight: Arc::new(Mutex::new(Vec::new())),
+            next_wire_id: AtomicU64::new(2),
             alive: Arc::new(AtomicBool::new(false)),
             active_requests: Arc::new(AtomicUsize::new(1)),
             last_active_ms: Arc::new(AtomicU64::new(0)),
             child: tokio::sync::Mutex::new(None),
+            #[cfg(windows)]
+            job: Mutex::new(None),
             epoch: now,
         });
 
@@ -1459,19 +1743,18 @@ mod tests {
         let (resp_tx, resp_rx) = oneshot::channel::<String>();
         drop(resp_tx);
 
-        let mut body = StdioSseStreamBody {
+        let mut body = StdioSseStreamBody::new(
             notif_rx,
-            resp_rx: Some(resp_rx),
-            pending_resp: None,
-            notif_done: false,
-            guard: RequestGuard {
+            resp_rx,
+            RequestGuard {
                 session: Arc::clone(&session),
-                request_id: json!(1),
+                wire_id: 1,
                 state: GuardState::Armed,
             },
-            session: Arc::clone(&session),
-            finished: false,
-        };
+            Arc::clone(&session),
+            Duration::from_secs(30),
+            None,
+        );
 
         let waker = Waker::noop();
         let mut cx = Context::from_waker(waker);

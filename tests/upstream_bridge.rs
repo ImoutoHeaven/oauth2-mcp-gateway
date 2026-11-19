@@ -1,44 +1,37 @@
+mod common;
+
 use bytes::Bytes;
+use common::{channel_body, make_client, process_exists, python_executable, wait_process_gone};
 use http::{Method, Request, Response, StatusCode, header};
 use http_body::Frame;
 use http_body_util::BodyExt;
 use hyper::body::Incoming;
 use hyper::server::conn::http1;
 use hyper::service::service_fn;
-use hyper_util::client::legacy::{Client, connect::HttpConnector};
-use hyper_util::rt::{TokioExecutor, TokioIo};
+use hyper_util::rt::TokioIo;
 use oauth2_mcp_gateway::config::{
     GatewayConfig, HttpUpstreamSettings, StdioUpstreamSettings, UpstreamSettings,
 };
 use oauth2_mcp_gateway::crypto::PasswordVerifier;
 use oauth2_mcp_gateway::server;
-use oauth2_mcp_gateway::types::{HttpReply, ReplyBody, VerifiedToken, bytes_body, empty_body};
+use oauth2_mcp_gateway::types::{HttpReply, VerifiedToken, bytes_body, empty_body};
 use oauth2_mcp_gateway::upstream_http::HttpUpstream;
 use oauth2_mcp_gateway::upstream_stdio::StdioUpstream;
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
 use std::convert::Infallible;
-use std::io;
 use std::net::SocketAddr;
 use std::path::Path;
-use std::pin::Pin;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
-use std::task::{Context, Poll};
 use std::time::Duration;
 use tempfile::TempDir;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::oneshot;
 use tokio_util::sync::CancellationToken;
 use url::Url;
-
-type TestClient = Client<HttpConnector, ReplyBody>;
-
-fn make_client() -> TestClient {
-    Client::builder(TokioExecutor::new()).build_http()
-}
 
 fn make_token(grant_id: &str, pool_slot: usize) -> VerifiedToken {
     VerifiedToken {
@@ -48,29 +41,6 @@ fn make_token(grant_id: &str, pool_slot: usize) -> VerifiedToken {
         scopes: vec!["mcp".to_owned()],
         resource: "https://mcp.example.com/mcp".to_owned(),
     }
-}
-
-struct ReceiverBody {
-    rx: mpsc::Receiver<Result<Frame<Bytes>, io::Error>>,
-}
-
-impl http_body::Body for ReceiverBody {
-    type Data = Bytes;
-    type Error = io::Error;
-
-    fn poll_frame(
-        mut self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-    ) -> Poll<Option<Result<Frame<Self::Data>, Self::Error>>> {
-        self.rx.poll_recv(cx)
-    }
-}
-
-type FrameSender = mpsc::Sender<Result<Frame<Bytes>, io::Error>>;
-
-fn channel_body(buffer: usize) -> (FrameSender, ReplyBody) {
-    let (tx, rx) = mpsc::channel(buffer);
-    (tx, ReceiverBody { rx }.boxed())
 }
 
 async fn spawn_http1_harness<F, Fut>(handler: F) -> (SocketAddr, CancellationToken)
@@ -726,14 +696,19 @@ async fn http_mcp_rejects_oversized_payload_with_413() {
 
 fn write_mock_mcp_python_script(dir: &Path) -> std::path::PathBuf {
     let script_path = dir.join("mock_mcp_server.py");
-    let script = r##"import json, os, signal, subprocess, sys, threading, time
+    let script = r##"import json, os, subprocess, sys, threading, time
 
 state_dir = os.environ["MOCK_STATE_DIR"]
 pid = os.getpid()
-pgid = os.getpgrp()
+pgid = pid if sys.platform == "win32" else os.getpgrp()
+bg_code = (
+    "import time; time.sleep(120)"
+    if sys.platform == "win32"
+    else "import signal, time; signal.signal(signal.SIGHUP, signal.SIG_IGN); time.sleep(120)"
+)
 
 bg = subprocess.Popen(
-    [sys.executable, "-c", "import signal, time; signal.signal(signal.SIGHUP, signal.SIG_IGN); time.sleep(120)"],
+    [sys.executable, "-c", bg_code],
     stdin=subprocess.DEVNULL,
     stdout=subprocess.DEVNULL,
     stderr=subprocess.DEVNULL,
@@ -929,19 +904,17 @@ for raw in sys.stdin:
             })
             time.sleep(0.01)
             os._exit(1)
+        elif name == "delayed_echo":
+            args = msg.get("params", {}).get("arguments", {})
+            delay_ms = args.get("delay_ms", 0)
+            tag = args.get("tag", "")
+            def run_delayed(rid, ms, t):
+                time.sleep(ms / 1000.0)
+                emit({"jsonrpc": "2.0", "id": rid, "result": {"tag": t, "pid": pid}})
+            threading.Thread(target=run_delayed, args=(req_id, delay_ms, tag), daemon=True).start()
 "##;
     std::fs::write(&script_path, script).unwrap();
     script_path
-}
-
-fn process_exists(pid: i32) -> bool {
-    let status_path = format!("/proc/{pid}/status");
-    if let Ok(content) = std::fs::read_to_string(&status_path)
-        && content.lines().any(|l| l.starts_with("State:\tZ"))
-    {
-        return false;
-    }
-    unsafe { libc::kill(pid, 0) == 0 }
 }
 
 fn build_stdio_upstream(
@@ -955,7 +928,7 @@ fn build_stdio_upstream(
         state_dir.to_str().unwrap().to_owned(),
     );
     let settings = StdioUpstreamSettings {
-        command: "python3".to_owned(),
+        command: python_executable().to_owned(),
         args: vec!["-u".to_owned(), script_path.to_str().unwrap().to_owned()],
         env,
         cwd: Some(state_dir.to_path_buf()),
@@ -1046,11 +1019,11 @@ async fn stdio_isolation_grant_binding_schema_progress_cancel_delete_and_session
         init_json_a["result"]["instructions"],
         "Keep exact multiline\ninstructions & symbols: <>[]{}"
     );
-    let pid_a = init_json_a["result"]["_meta"]["pid"].as_i64().unwrap() as i32;
-    let pgid_a = init_json_a["result"]["_meta"]["pgid"].as_i64().unwrap() as i32;
+    let pid_a = init_json_a["result"]["_meta"]["pid"].as_u64().unwrap() as u32;
+    let pgid_a = init_json_a["result"]["_meta"]["pgid"].as_u64().unwrap() as u32;
     let grandchild_a = init_json_a["result"]["_meta"]["grandchild_pid"]
-        .as_i64()
-        .unwrap() as i32;
+        .as_u64()
+        .unwrap() as u32;
     assert_eq!(pid_a, pgid_a, "child must lead its own process group");
     assert!(process_exists(pid_a));
     assert!(process_exists(grandchild_a));
@@ -1090,7 +1063,7 @@ async fn stdio_isolation_grant_binding_schema_progress_cancel_delete_and_session
     assert!(sse_init_b.starts_with("data: {"));
     let init_json_b: Value =
         serde_json::from_str(sse_init_b.trim().strip_prefix("data: ").unwrap()).unwrap();
-    let pid_b = init_json_b["result"]["_meta"]["pid"].as_i64().unwrap() as i32;
+    let pid_b = init_json_b["result"]["_meta"]["pid"].as_u64().unwrap() as u32;
     assert_ne!(pid_a, pid_b);
 
     // 3. Max sessions reached returns 503
@@ -1328,7 +1301,10 @@ async fn stdio_isolation_grant_binding_schema_progress_cancel_delete_and_session
     let cancelled =
         cancelled_msg.expect("child must receive notifications/cancelled on disconnect");
     assert_eq!(cancelled["method"], "notifications/cancelled");
-    assert_eq!(cancelled["params"]["requestId"], "req-cancel-42");
+    assert!(
+        cancelled["params"]["requestId"].is_u64(),
+        "cancelled requestId must be internal wire_id: {cancelled}"
+    );
     assert_eq!(cancelled["params"]["reason"], "client disconnected");
 
     // 9. DELETE /mcp kills session A's entire process group including background grandchild
@@ -1345,9 +1321,12 @@ async fn stdio_isolation_grant_binding_schema_progress_cancel_delete_and_session
         .await
         .unwrap();
     assert_eq!(del_a.status(), StatusCode::OK);
-    assert!(!process_exists(pid_a), "session child must be reaped");
     assert!(
-        !process_exists(grandchild_a),
+        wait_process_gone(pid_a).await,
+        "session child must be reaped"
+    );
+    assert!(
+        wait_process_gone(grandchild_a).await,
         "background grandchild in process group must be killed"
     );
 
@@ -1385,11 +1364,11 @@ async fn stdio_isolation_grant_binding_schema_progress_cancel_delete_and_session
     let sl_val: Value =
         serde_json::from_slice(&sl_resp.into_body().collect().await.unwrap().to_bytes()).unwrap();
     let sl_pid = sl_val["result"]["structuredContent"]["pid"]
-        .as_i64()
-        .unwrap() as i32;
+        .as_u64()
+        .unwrap() as u32;
     assert_eq!(sl_val["result"]["structuredContent"]["count"], 1);
     assert!(
-        !process_exists(sl_pid),
+        wait_process_gone(sl_pid).await,
         "ephemeral child must be reaped before returning sessionless response"
     );
 
@@ -1397,8 +1376,8 @@ async fn stdio_isolation_grant_binding_schema_progress_cancel_delete_and_session
         &std::fs::read_to_string(tmp.path().join(format!("pids_{sl_pid}.json"))).unwrap(),
     )
     .unwrap();
-    let sl_grandchild = pid_meta["grandchild_pid"].as_i64().unwrap() as i32;
-    assert!(!process_exists(sl_grandchild));
+    let sl_grandchild = pid_meta["grandchild_pid"].as_u64().unwrap() as u32;
+    assert!(wait_process_gone(sl_grandchild).await);
 
     let sl_hdr_resp = client
         .request(
@@ -1420,7 +1399,7 @@ async fn stdio_isolation_grant_binding_schema_progress_cancel_delete_and_session
 
     // 11. Shutdown cleans up remaining session B and its process group
     stdio_up.shutdown().await;
-    assert!(!process_exists(pid_b));
+    assert!(wait_process_gone(pid_b).await);
 
     gw_cancel.cancel();
 }
@@ -1431,6 +1410,7 @@ async fn server_routing_order_healthz_unauth_mcp_404_and_shutdown() {
     let hash = PasswordVerifier::from_plaintext_with_iterations("secret123", 10_000)
         .unwrap()
         .encode();
+    let py = python_executable();
     let cfg_json = format!(
         r#"{{
           "listen": "127.0.0.1:0",
@@ -1439,8 +1419,8 @@ async fn server_routing_order_healthz_unauth_mcp_404_and_shutdown() {
           "oauth": {{ "owner_password_hash": "{hash}" }},
           "upstream": {{
             "transport": "stdio",
-            "command": "sh",
-            "args": ["-c", "exit 0"]
+            "command": "{py}",
+            "args": ["-c", "import sys; sys.exit(0)"]
           }}
         }}"#
     );
@@ -1544,7 +1524,7 @@ async fn stdio_idle_session_eviction_reclaims_slot_and_process_group() {
         tmp.path().to_str().unwrap().to_owned(),
     );
     let settings = StdioUpstreamSettings {
-        command: "python3".to_owned(),
+        command: python_executable().to_owned(),
         args: vec!["-u".to_owned(), script_path.to_str().unwrap().to_owned()],
         env,
         cwd: Some(tmp.path().to_path_buf()),
@@ -1587,10 +1567,10 @@ async fn stdio_idle_session_eviction_reclaims_slot_and_process_group() {
     assert_eq!(first.status(), StatusCode::OK);
     let first_val: Value =
         serde_json::from_slice(&first.into_body().collect().await.unwrap().to_bytes()).unwrap();
-    let pid1 = first_val["result"]["_meta"]["pid"].as_i64().unwrap() as i32;
+    let pid1 = first_val["result"]["_meta"]["pid"].as_u64().unwrap() as u32;
     let grand1 = first_val["result"]["_meta"]["grandchild_pid"]
-        .as_i64()
-        .unwrap() as i32;
+        .as_u64()
+        .unwrap() as u32;
     assert!(process_exists(pid1));
     assert!(process_exists(grand1));
 
@@ -1610,13 +1590,13 @@ async fn stdio_idle_session_eviction_reclaims_slot_and_process_group() {
     assert_eq!(second.status(), StatusCode::OK);
     let second_val: Value =
         serde_json::from_slice(&second.into_body().collect().await.unwrap().to_bytes()).unwrap();
-    let pid2 = second_val["result"]["_meta"]["pid"].as_i64().unwrap() as i32;
+    let pid2 = second_val["result"]["_meta"]["pid"].as_u64().unwrap() as u32;
     assert_ne!(pid1, pid2);
-    assert!(!process_exists(pid1));
-    assert!(!process_exists(grand1));
+    assert!(wait_process_gone(pid1).await);
+    assert!(wait_process_gone(grand1).await);
 
     stdio_up.shutdown().await;
-    assert!(!process_exists(pid2));
+    assert!(wait_process_gone(pid2).await);
     gw_cancel.cancel();
 }
 
@@ -1630,7 +1610,7 @@ async fn stdio_sessionless_timeout_returns_504_and_releases_slot() {
         tmp.path().to_str().unwrap().to_owned(),
     );
     let settings = StdioUpstreamSettings {
-        command: "python3".to_owned(),
+        command: python_executable().to_owned(),
         args: vec!["-u".to_owned(), script_path.to_str().unwrap().to_owned()],
         env,
         cwd: Some(tmp.path().to_path_buf()),
@@ -1670,10 +1650,10 @@ async fn stdio_sessionless_timeout_returns_504_and_releases_slot() {
     let hung_meta: Value =
         serde_json::from_str(&std::fs::read_to_string(tmp.path().join("hung_pid.json")).unwrap())
             .unwrap();
-    let hung_pid = hung_meta["pid"].as_i64().unwrap() as i32;
-    let hung_grandchild = hung_meta["grandchild_pid"].as_i64().unwrap() as i32;
-    assert!(!process_exists(hung_pid));
-    assert!(!process_exists(hung_grandchild));
+    let hung_pid = hung_meta["pid"].as_u64().unwrap() as u32;
+    let hung_grandchild = hung_meta["grandchild_pid"].as_u64().unwrap() as u32;
+    assert!(wait_process_gone(hung_pid).await);
+    assert!(wait_process_gone(hung_grandchild).await);
 
     let next_resp = client
         .request(
@@ -1850,8 +1830,8 @@ async fn stdio_sse_abrupt_exit_and_concurrent_delete_close_stream_cleanly() {
     let init1_val: Value =
         serde_json::from_slice(&init1.into_body().collect().await.unwrap().to_bytes()).unwrap();
     let grand1 = init1_val["result"]["_meta"]["grandchild_pid"]
-        .as_i64()
-        .unwrap() as i32;
+        .as_u64()
+        .unwrap() as u32;
 
     let crash_resp = client
         .request(
@@ -1882,13 +1862,7 @@ async fn stdio_sse_abrupt_exit_and_concurrent_delete_close_stream_cleanly() {
     assert!(crash_text.contains("\"progress\":33"));
     assert!(!crash_text.contains("\"id\":\"req-crash\""));
 
-    for _ in 0..40 {
-        if !process_exists(grand1) {
-            break;
-        }
-        tokio::time::sleep(Duration::from_millis(15)).await;
-    }
-    assert!(!process_exists(grand1));
+    assert!(wait_process_gone(grand1).await);
 
     // 2. Concurrent DELETE /mcp while SSE stream is actively waiting (repeated across race windows)
     for round in 0..8 {
@@ -1978,5 +1952,425 @@ async fn stdio_sse_abrupt_exit_and_concurrent_delete_close_stream_cleanly() {
     assert_eq!(verify_resp.status(), StatusCode::OK);
 
     stdio_up.shutdown().await;
+    gw_cancel.cancel();
+}
+
+#[tokio::test]
+async fn stdio_concurrent_duplicate_jsonrpc_id_preserves_session_and_routes_both_responses() {
+    let tmp = TempDir::new().unwrap();
+    let script_path = write_mock_mcp_python_script(tmp.path());
+    let stdio_up = build_stdio_upstream(&script_path, tmp.path(), 2);
+    let bridge = Arc::clone(&stdio_up);
+
+    let (gw_addr, gw_cancel) = spawn_http1_harness(move |req: Request<Incoming>| {
+        let up = Arc::clone(&bridge);
+        async move { up.handle_mcp(req, &make_token("grant-dup-id", 0)).await }
+    })
+    .await;
+
+    let client = make_client();
+    let init_resp = client
+        .request(
+            Request::builder()
+                .method(Method::POST)
+                .uri(format!("http://{gw_addr}/mcp"))
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(bytes_body(
+                    r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"dup-id","version":"0.1"}}}"#,
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(init_resp.status(), StatusCode::OK);
+    let sid = init_resp
+        .headers()
+        .get("mcp-session-id")
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .to_owned();
+    let init_val: Value =
+        serde_json::from_slice(&init_resp.into_body().collect().await.unwrap().to_bytes()).unwrap();
+    let child_pid = init_val["result"]["_meta"]["pid"].as_u64().unwrap() as u32;
+
+    let c1 = client.clone();
+    let s1 = sid.clone();
+    let slow_task = tokio::spawn(async move {
+        let resp = c1
+            .request(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri(format!("http://{gw_addr}/mcp"))
+                    .header("mcp-session-id", &s1)
+                    .header(header::ACCEPT, "application/json")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(bytes_body(
+                        r#"{"jsonrpc":"2.0","id":42,"method":"tools/call","params":{"name":"delayed_echo","arguments":{"delay_ms":150,"tag":"slow"}}}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        serde_json::from_slice::<Value>(&resp.into_body().collect().await.unwrap().to_bytes())
+            .unwrap()
+    });
+
+    tokio::time::sleep(Duration::from_millis(20)).await;
+
+    let c2 = client.clone();
+    let s2 = sid.clone();
+    let fast_task = tokio::spawn(async move {
+        let resp = c2
+            .request(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri(format!("http://{gw_addr}/mcp"))
+                    .header("mcp-session-id", &s2)
+                    .header(header::ACCEPT, "application/json")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(bytes_body(
+                        r#"{"jsonrpc":"2.0","id":42,"method":"tools/call","params":{"name":"delayed_echo","arguments":{"delay_ms":20,"tag":"fast"}}}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        serde_json::from_slice::<Value>(&resp.into_body().collect().await.unwrap().to_bytes())
+            .unwrap()
+    });
+
+    let (slow_val, fast_val) = tokio::join!(slow_task, fast_task);
+    let slow_val = slow_val.unwrap();
+    let fast_val = fast_val.unwrap();
+    assert_eq!(slow_val["id"], 42);
+    assert_eq!(slow_val["result"]["tag"], "slow");
+    assert_eq!(fast_val["id"], 42);
+    assert_eq!(fast_val["result"]["tag"], "fast");
+    assert!(process_exists(child_pid), "child must remain alive");
+
+    // Verify session still serves subsequent requests on the same child process.
+    let follow_resp = client
+        .request(
+            Request::builder()
+                .method(Method::POST)
+                .uri(format!("http://{gw_addr}/mcp"))
+                .header("mcp-session-id", &sid)
+                .header(header::ACCEPT, "application/json")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(bytes_body(
+                    r#"{"jsonrpc":"2.0","id":43,"method":"tools/call","params":{"name":"bump"}}"#,
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(follow_resp.status(), StatusCode::OK);
+    let follow_val: Value =
+        serde_json::from_slice(&follow_resp.into_body().collect().await.unwrap().to_bytes())
+            .unwrap();
+    assert_eq!(follow_val["result"]["structuredContent"]["pid"], child_pid);
+
+    stdio_up.shutdown().await;
+    assert!(wait_process_gone(child_pid).await);
+    gw_cancel.cancel();
+}
+
+#[tokio::test]
+async fn stdio_old_protocol_version_without_session_id_returns_400() {
+    let tmp = TempDir::new().unwrap();
+    let script_path = write_mock_mcp_python_script(tmp.path());
+    let stdio_up = build_stdio_upstream(&script_path, tmp.path(), 2);
+    let bridge = Arc::clone(&stdio_up);
+
+    let (gw_addr, gw_cancel) = spawn_http1_harness(move |req: Request<Incoming>| {
+        let up = Arc::clone(&bridge);
+        async move { up.handle_mcp(req, &make_token("grant-old-ver", 0)).await }
+    })
+    .await;
+
+    let client = make_client();
+    let resp = client
+        .request(
+            Request::builder()
+                .method(Method::POST)
+                .uri(format!("http://{gw_addr}/mcp"))
+                .header("MCP-Protocol-Version", "2025-06-18")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(bytes_body(
+                    r#"{"jsonrpc":"2.0","id":9,"method":"tools/call","params":{"name":"bump"}}"#,
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    let body: Value =
+        serde_json::from_slice(&resp.into_body().collect().await.unwrap().to_bytes()).unwrap();
+    assert_eq!(body["error"]["message"], "missing Mcp-Session-Id header");
+
+    stdio_up.shutdown().await;
+    gw_cancel.cancel();
+}
+
+#[tokio::test]
+async fn http_strips_cookie_set_cookie_and_forwarded_headers() {
+    let seen_headers: Arc<Mutex<Vec<(String, String)>>> = Arc::new(Mutex::new(Vec::new()));
+    let seen_ref = Arc::clone(&seen_headers);
+
+    let (up_addr, up_cancel) = spawn_http1_harness(move |req: Request<Incoming>| {
+        let seen = Arc::clone(&seen_ref);
+        async move {
+            let mut recorded = Vec::new();
+            for (k, v) in req.headers() {
+                recorded.push((k.as_str().to_owned(), v.to_str().unwrap_or("").to_owned()));
+            }
+            *seen.lock().unwrap() = recorded;
+            let _ = req.into_body().collect().await;
+            Response::builder()
+                .status(StatusCode::OK)
+                .header(header::CONTENT_TYPE, "application/json")
+                .header(header::SET_COOKIE, "upstream_sid=secret; HttpOnly")
+                .body(bytes_body(
+                    r#"{"jsonrpc":"2.0","id":1,"result":{"ok":true}}"#,
+                ))
+                .unwrap()
+        }
+    })
+    .await;
+
+    let settings = HttpUpstreamSettings {
+        url: Url::parse(&format!("http://{up_addr}/mcp")).unwrap(),
+        origin_base: Url::parse(&format!("http://{up_addr}")).unwrap(),
+        public_is_https: true,
+        bearer_tokens: vec!["tok".to_owned()],
+        passthrough_prefixes: Vec::new(),
+        request_timeout_secs: 30,
+    };
+    let http_up = Arc::new(HttpUpstream::new(settings).unwrap());
+    let (gw_addr, gw_cancel) = spawn_http1_harness(move |req: Request<Incoming>| {
+        let up = Arc::clone(&http_up);
+        async move { up.handle_mcp(req, &make_token("grant-cookie", 0)).await }
+    })
+    .await;
+
+    let client = make_client();
+    let resp = client
+        .request(
+            Request::builder()
+                .method(Method::POST)
+                .uri(format!("http://{gw_addr}/mcp"))
+                .header(header::COOKIE, "session=client-secret")
+                .header("x-forwarded-for", "1.2.3.4")
+                .header("x-forwarded-host", "evil.example")
+                .header("x-real-ip", "5.6.7.8")
+                .header("forwarded", "for=1.2.3.4;proto=http")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(bytes_body(r#"{"jsonrpc":"2.0","id":1,"method":"ping"}"#))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert!(
+        resp.headers().get(header::SET_COOKIE).is_none(),
+        "Set-Cookie from upstream must be stripped"
+    );
+
+    let recorded = seen_headers.lock().unwrap();
+    for forbidden in [
+        "cookie",
+        "x-forwarded-for",
+        "x-forwarded-host",
+        "x-real-ip",
+        "forwarded",
+    ] {
+        assert!(
+            !recorded.iter().any(|(k, _)| k == forbidden),
+            "request header {forbidden} must not be forwarded upstream"
+        );
+    }
+
+    gw_cancel.cancel();
+    up_cancel.cancel();
+}
+
+#[tokio::test]
+async fn server_origin_validation_blocks_cross_site_requests() {
+    let tmp = TempDir::new().unwrap();
+    let hash = PasswordVerifier::from_plaintext_with_iterations("secret123", 10_000)
+        .unwrap()
+        .encode();
+    let py = python_executable();
+    let cfg_json = format!(
+        r#"{{
+          "listen": "127.0.0.1:0",
+          "public_url": "https://mcp.example.com",
+          "state_path": "state.json",
+          "oauth": {{ "owner_password_hash": "{hash}" }},
+          "upstream": {{
+            "transport": "stdio",
+            "command": "{py}",
+            "args": ["-c", "import sys; sys.exit(0)"]
+          }}
+        }}"#
+    );
+    let cfg = Arc::new(GatewayConfig::from_json_str(&cfg_json, tmp.path()).unwrap());
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let shutdown = CancellationToken::new();
+    let shutdown_bg = shutdown.clone();
+    let server_task =
+        tokio::spawn(async move { server::serve_with_listener(listener, cfg, shutdown_bg).await });
+
+    let client = make_client();
+
+    for path in ["/mcp", "/oauth/register", "/oauth/token"] {
+        let evil_resp = client
+            .request(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri(format!("http://{addr}{path}"))
+                    .header(header::ORIGIN, "https://evil.example")
+                    .body(empty_body())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            evil_resp.status(),
+            StatusCode::FORBIDDEN,
+            "cross-site Origin on {path} must return 403"
+        );
+    }
+
+    // Matching Origin passes Origin check (reaches auth -> 401 on /mcp).
+    let same_origin_mcp = client
+        .request(
+            Request::builder()
+                .method(Method::POST)
+                .uri(format!("http://{addr}/mcp"))
+                .header(header::ORIGIN, "https://mcp.example.com")
+                .body(empty_body())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(same_origin_mcp.status(), StatusCode::UNAUTHORIZED);
+
+    // Non-browser client without Origin header also passes Origin check.
+    let no_origin_mcp = client
+        .request(
+            Request::builder()
+                .method(Method::POST)
+                .uri(format!("http://{addr}/mcp"))
+                .body(empty_body())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(no_origin_mcp.status(), StatusCode::UNAUTHORIZED);
+
+    shutdown.cancel();
+    server_task.await.unwrap().unwrap();
+}
+
+#[tokio::test]
+async fn stdio_terminate_grant_kills_only_matching_grant_sessions() {
+    let tmp = TempDir::new().unwrap();
+    let script_path = write_mock_mcp_python_script(tmp.path());
+    let stdio_up = build_stdio_upstream(&script_path, tmp.path(), 4);
+    let bridge = Arc::clone(&stdio_up);
+
+    let (gw_addr, gw_cancel) = spawn_http1_harness(move |req: Request<Incoming>| {
+        let up = Arc::clone(&bridge);
+        async move {
+            let grant = req
+                .headers()
+                .get("x-test-grant")
+                .and_then(|v| v.to_str().ok())
+                .unwrap_or("grant-a")
+                .to_owned();
+            up.handle_mcp(req, &make_token(&grant, 0)).await
+        }
+    })
+    .await;
+
+    let client = make_client();
+    let init_payload = r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"term-grant","version":"0.1"}}}"#;
+
+    let spawn_for = |grant: &'static str| {
+        let client = client.clone();
+        async move {
+            let resp = client
+                .request(
+                    Request::builder()
+                        .method(Method::POST)
+                        .uri(format!("http://{gw_addr}/mcp"))
+                        .header("x-test-grant", grant)
+                        .header(header::CONTENT_TYPE, "application/json")
+                        .body(bytes_body(init_payload))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), StatusCode::OK);
+            let sid = resp
+                .headers()
+                .get("mcp-session-id")
+                .unwrap()
+                .to_str()
+                .unwrap()
+                .to_owned();
+            let val: Value =
+                serde_json::from_slice(&resp.into_body().collect().await.unwrap().to_bytes())
+                    .unwrap();
+            let pid = val["result"]["_meta"]["pid"].as_u64().unwrap() as u32;
+            let grand = val["result"]["_meta"]["grandchild_pid"].as_u64().unwrap() as u32;
+            (sid, pid, grand)
+        }
+    };
+
+    let (sid_a, pid_a, grand_a) = spawn_for("grant-a").await;
+    let (_sid_b, pid_b, grand_b) = spawn_for("grant-b").await;
+
+    assert!(process_exists(pid_a));
+    assert!(process_exists(grand_a));
+    assert!(process_exists(pid_b));
+    assert!(process_exists(grand_b));
+
+    stdio_up.terminate_grant("grant-a").await;
+
+    assert!(wait_process_gone(pid_a).await);
+    assert!(wait_process_gone(grand_a).await);
+    assert!(
+        process_exists(pid_b),
+        "other grant session must remain alive"
+    );
+    assert!(process_exists(grand_b));
+
+    // Terminated session returns 404.
+    let stale_resp = client
+        .request(
+            Request::builder()
+                .method(Method::POST)
+                .uri(format!("http://{gw_addr}/mcp"))
+                .header("x-test-grant", "grant-a")
+                .header("mcp-session-id", &sid_a)
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(bytes_body(
+                    r#"{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"bump"}}"#,
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(stale_resp.status(), StatusCode::NOT_FOUND);
+
+    stdio_up.shutdown().await;
+    assert!(wait_process_gone(pid_b).await);
+    assert!(wait_process_gone(grand_b).await);
     gw_cancel.cancel();
 }
