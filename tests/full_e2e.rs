@@ -159,6 +159,7 @@ async fn register_and_authorize_grant(
         &[
             ("content-type", "application/x-www-form-urlencoded"),
             ("cookie", &cookie_pair),
+            ("origin", PUBLIC_URL),
         ],
         bytes_body(post_form),
     )
@@ -1253,6 +1254,7 @@ async fn e2e_custom_resource_path_host_rebinding_discovery_cors_and_http_revocat
 
     for (method, path) in [
         (Method::POST, "/bridge/mcp"),
+        (Method::POST, "/oauth/authorize"),
         (Method::POST, "/oauth/token"),
         (Method::GET, "/t/item"),
     ] {

@@ -1016,7 +1016,11 @@ async fn xss_escaping_security_headers_and_csrf_cookie_enforcement() {
         "default-src 'none'; style-src 'unsafe-inline'; form-action 'self'"
     );
     assert_eq!(headers.get(header::X_FRAME_OPTIONS).unwrap(), "DENY");
-    assert_eq!(headers.get(header::REFERRER_POLICY).unwrap(), "no-referrer");
+    assert_eq!(
+        headers.get(header::REFERRER_POLICY).unwrap(),
+        "strict-origin",
+        "the consent form must preserve the browser's same-origin POST Origin"
+    );
 
     let html = std::str::from_utf8(&body).unwrap();
     assert!(!html.contains("<script>"));
@@ -1061,6 +1065,11 @@ async fn xss_escaping_security_headers_and_csrf_cookie_enforcement() {
     assert_eq!(
         retry_headers.get(header::CONTENT_SECURITY_POLICY).unwrap(),
         expected_csp
+    );
+    assert_eq!(
+        retry_headers.get(header::REFERRER_POLICY).unwrap(),
+        "strict-origin",
+        "the password retry form must preserve the browser's same-origin POST Origin"
     );
 
     let (no_cookie_st, _, _) = send_req(

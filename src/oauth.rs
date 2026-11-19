@@ -1068,8 +1068,7 @@ impl OAuthEngine {
             &csrf_token,
             PENDING_AUTH_TTL_SECS,
         );
-        let html = render_authorize_page(&pending, None);
-        html_reply_with_cookie(StatusCode::OK, html, Some(&cookie))
+        authorize_form_reply(StatusCode::OK, &pending, None, Some(&cookie))
     }
 
     async fn handle_authorize_post(
@@ -1240,12 +1239,19 @@ impl OAuthEngine {
             if burned {
                 let clear_cookie =
                     build_ar_cookie(self.core.config.public_is_https, &pending.ar_id, "", 0);
-                let html =
-                    render_authorize_page(&pending, Some("Maximum password attempts exceeded"));
-                return html_reply_with_cookie(StatusCode::UNAUTHORIZED, html, Some(&clear_cookie));
+                return authorize_form_reply(
+                    StatusCode::UNAUTHORIZED,
+                    &pending,
+                    Some("Maximum password attempts exceeded"),
+                    Some(&clear_cookie),
+                );
             }
-            let html = render_authorize_page(&pending, Some("Incorrect password"));
-            return html_reply_with_cookie(StatusCode::UNAUTHORIZED, html, None);
+            return authorize_form_reply(
+                StatusCode::UNAUTHORIZED,
+                &pending,
+                Some("Incorrect password"),
+                None,
+            );
         }
 
         let Ok(raw_code) = random_token_b64(32) else {
@@ -3022,6 +3028,22 @@ button{{padding:0.78rem 1.25rem;font-size:0.95rem;font-weight:600;border-radius:
 </body>\
 </html>"
     )
+}
+
+fn authorize_form_reply(
+    status: StatusCode,
+    pending: &PendingAuthRequest,
+    error_notice: Option<&str>,
+    cookie: Option<&str>,
+) -> HttpReply {
+    let mut reply =
+        html_reply_with_cookie(status, render_authorize_page(pending, error_notice), cookie);
+    // Browsers send Origin: null on form POSTs from a no-referrer page.
+    reply.headers_mut().insert(
+        header::REFERRER_POLICY,
+        header::HeaderValue::from_static("strict-origin"),
+    );
+    reply
 }
 
 fn html_reply_with_cookie(status: StatusCode, html: String, cookie: Option<&str>) -> HttpReply {
