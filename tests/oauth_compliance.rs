@@ -363,6 +363,7 @@ async fn custom_resource_path_drives_oauth_discovery_and_token_binding() {
         },
     );
     let engine = OAuthEngine::open(cfg).unwrap();
+    assert_eq!(engine.resource_path(), "/bridge/oauth2");
     let challenge = engine.unauthorized_reply(AuthChallenge::MissingToken);
     assert_eq!(challenge.status(), StatusCode::UNAUTHORIZED);
     assert_eq!(
@@ -387,6 +388,23 @@ async fn custom_resource_path_drives_oauth_discovery_and_token_binding() {
                 parse_json(&body)["resource"],
                 "https://mcp.example.com/bridge/oauth2"
             );
+        }
+    }
+    for (path, expected) in [
+        ("/.well-known/oauth-authorization-server", StatusCode::OK),
+        (
+            "/.well-known/oauth-authorization-server/bridge/oauth2",
+            StatusCode::OK,
+        ),
+        (
+            "/.well-known/oauth-authorization-server/mcp",
+            StatusCode::NOT_FOUND,
+        ),
+    ] {
+        let (status, _, body) = send_req(&engine, Method::GET, path, &[], Bytes::new()).await;
+        assert_eq!(status, expected, "{path}");
+        if status == StatusCode::OK {
+            assert_eq!(parse_json(&body)["issuer"], "https://mcp.example.com");
         }
     }
     let redirect = "http://127.0.0.1:19000/cb";
@@ -1665,4 +1683,354 @@ async fn password_rate_limiting_and_least_loaded_pool_slot_selection() {
     )
     .await;
     assert_eq!(throttled_st, StatusCode::TOO_MANY_REQUESTS);
+}
+
+#[test]
+fn config_validates_bidirectional_overlap_scopes_bearer_tokens_and_redacts_debug() {
+    let pw_hash = PasswordVerifier::from_plaintext_with_iterations(OWNER_SECRET, 10_000)
+        .unwrap()
+        .encode();
+
+    // Bidirectional overlap: resource_path is a parent of passthrough_prefixes and vice versa.
+    for (resource_path, prefix) in [("/api", "/api/files/"), ("/api/files", "/api/")] {
+        let cfg_json = json!({
+            "listen": "127.0.0.1:0",
+            "public_url": "https://mcp.example.com",
+            "resource_path": resource_path,
+            "state_path": "state.json",
+            "oauth": { "owner_password_hash": pw_hash },
+            "upstream": {
+                "transport": "http",
+                "url": "http://127.0.0.1:9090/upstream",
+                "passthrough_prefixes": [prefix],
+            }
+        });
+        let err = GatewayConfig::from_json_str(&cfg_json.to_string(), Path::new("/tmp"))
+            .expect_err("overlapping resource_path and passthrough_prefix must fail");
+        assert!(err.contains("overlaps passthrough prefix"), "{err}");
+    }
+
+    // Scopes: deduplication preserves order; invalid RFC 6749 §3.3 chars are rejected.
+    let dedup_json = json!({
+        "listen": "127.0.0.1:0",
+        "public_url": "https://mcp.example.com",
+        "state_path": "state.json",
+        "oauth": {
+            "owner_password_hash": pw_hash,
+            "scopes": ["files", "mcp", "files", "read:all", "mcp"]
+        },
+        "upstream": {
+            "transport": "http",
+            "url": "http://127.0.0.1:9090/mcp",
+            "bearer_tokens": ["super-secret-upstream-token"]
+        }
+    });
+    let cfg = GatewayConfig::from_json_str(&dedup_json.to_string(), Path::new("/tmp")).unwrap();
+    assert_eq!(cfg.oauth.scopes, vec!["files", "mcp", "read:all"]);
+
+    // Debug formatting must not leak verifier material or bearer tokens.
+    let debug_http = format!("{cfg:?}");
+    assert!(!debug_http.contains("super-secret-upstream-token"));
+    let verifier_dbg = format!("{:?}", cfg.oauth.verifier);
+    assert!(verifier_dbg.contains("PasswordVerifier"));
+    assert!(verifier_dbg.contains("iterations"));
+    assert!(!verifier_dbg.contains("salt"));
+    assert!(!verifier_dbg.contains("expected"));
+
+    let stdio_json = json!({
+        "listen": "127.0.0.1:0",
+        "public_url": "https://mcp.example.com",
+        "state_path": "state.json",
+        "oauth": { "owner_password_hash": pw_hash },
+        "upstream": {
+            "transport": "stdio",
+            "command": "echo",
+            "env": { "API_KEY": "top-secret-stdio-env" }
+        }
+    });
+    let stdio_cfg =
+        GatewayConfig::from_json_str(&stdio_json.to_string(), Path::new("/tmp")).unwrap();
+    let debug_stdio = format!("{stdio_cfg:?}");
+    assert!(debug_stdio.contains("API_KEY"));
+    assert!(!debug_stdio.contains("top-secret-stdio-env"));
+
+    for bad_scope in ["has\"quote", "has\\slash", "has space", "nonascii-é", ""] {
+        let bad_json = json!({
+            "listen": "127.0.0.1:0",
+            "public_url": "https://mcp.example.com",
+            "state_path": "state.json",
+            "oauth": {
+                "owner_password_hash": pw_hash,
+                "scopes": [bad_scope]
+            },
+            "upstream": {
+                "transport": "stdio",
+                "command": "echo"
+            }
+        });
+        assert!(
+            GatewayConfig::from_json_str(&bad_json.to_string(), Path::new("/tmp")).is_err(),
+            "scope {bad_scope:?} should be rejected"
+        );
+    }
+
+    for bad_token in ["tok with space", "tok\twith-tab", "nonascii-é", ""] {
+        let bad_json = json!({
+            "listen": "127.0.0.1:0",
+            "public_url": "https://mcp.example.com",
+            "state_path": "state.json",
+            "oauth": { "owner_password_hash": pw_hash },
+            "upstream": {
+                "transport": "http",
+                "url": "http://127.0.0.1:9090/mcp",
+                "bearer_tokens": [bad_token]
+            }
+        });
+        assert!(
+            GatewayConfig::from_json_str(&bad_json.to_string(), Path::new("/tmp")).is_err(),
+            "bearer token {bad_token:?} should be rejected"
+        );
+    }
+}
+
+#[tokio::test]
+async fn cross_client_isolation_for_code_refresh_and_revoke() {
+    let tmp = TempDir::new().unwrap();
+    let engine = OAuthEngine::open(build_config(tmp.path(), &TestOpts::default())).unwrap();
+
+    let cb_a = "http://127.0.0.1:25001/cb";
+    let cb_b = "http://127.0.0.1:25002/cb";
+    let client_a = register_public_client(&engine, cb_a, Some("Client A")).await;
+    let client_b = register_public_client(&engine, cb_b, Some("Client B")).await;
+
+    // Client B cannot redeem Client A's authorization code.
+    let (verifier, challenge) = pkce_pair("cross-code");
+    let code_a = authorize_and_get_code(&engine, &client_a, cb_a, &challenge, "st-a").await;
+    let (st_code, _, body_code) = send_req(
+        &engine,
+        Method::POST,
+        "/oauth/token",
+        &[("content-type", "application/x-www-form-urlencoded")],
+        form_encode(&[
+            ("grant_type", "authorization_code"),
+            ("client_id", &client_b),
+            ("code", &code_a),
+            ("redirect_uri", cb_a),
+            ("code_verifier", &verifier),
+        ]),
+    )
+    .await;
+    assert_eq!(st_code, StatusCode::BAD_REQUEST);
+    assert_eq!(parse_json(&body_code)["error"], "invalid_grant");
+
+    // Client B cannot refresh or revoke Client A's grant.
+    let (access_a, refresh_a) = mint_public_grant(&engine, &client_a, cb_a, "cross-grant").await;
+    let (st_rt, _, body_rt) = send_req(
+        &engine,
+        Method::POST,
+        "/oauth/token",
+        &[("content-type", "application/x-www-form-urlencoded")],
+        form_encode(&[
+            ("grant_type", "refresh_token"),
+            ("client_id", &client_b),
+            ("refresh_token", &refresh_a),
+        ]),
+    )
+    .await;
+    assert_eq!(st_rt, StatusCode::BAD_REQUEST);
+    assert_eq!(parse_json(&body_rt)["error"], "invalid_grant");
+
+    let (st_rev, _, _) = send_req(
+        &engine,
+        Method::POST,
+        "/oauth/revoke",
+        &[("content-type", "application/x-www-form-urlencoded")],
+        form_encode(&[("client_id", &client_b), ("token", &access_a)]),
+    )
+    .await;
+    assert_eq!(st_rev, StatusCode::OK);
+
+    let mut hdr_a = HeaderMap::new();
+    hdr_a.insert(
+        header::AUTHORIZATION,
+        HeaderValue::from_str(&format!("Bearer {access_a}")).unwrap(),
+    );
+    assert!(
+        engine.verify_bearer(&hdr_a).is_ok(),
+        "Client B revoke must not revoke Client A grant"
+    );
+}
+
+#[tokio::test]
+async fn non_numeric_content_length_returns_400_and_oversized_authorize_post_returns_html() {
+    let tmp = TempDir::new().unwrap();
+    let engine = OAuthEngine::open(build_config(tmp.path(), &TestOpts::default())).unwrap();
+
+    // Send a raw HTTP/1.1 request with a non-numeric Content-Length directly to the server.
+    let (mut client_io, server_io) = tokio::io::duplex(16 * 1024);
+    let eng = Arc::clone(&engine);
+    let srv = tokio::spawn(async move {
+        let svc = hyper::service::service_fn(move |incoming| {
+            let eng = Arc::clone(&eng);
+            async move { Ok::<_, Infallible>(eng.handle(incoming).await) }
+        });
+        let _ = hyper::server::conn::http1::Builder::new()
+            .serve_connection(TokioIo::new(server_io), svc)
+            .await;
+    });
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    client_io
+        .write_all(
+            b"POST /oauth/token HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/x-www-form-urlencoded\r\nContent-Length: not-a-number\r\nConnection: close\r\n\r\n",
+        )
+        .await
+        .unwrap();
+    let mut resp_buf = Vec::new();
+    client_io.read_to_end(&mut resp_buf).await.unwrap();
+    let _ = srv.await;
+    let resp_text = String::from_utf8_lossy(&resp_buf);
+    assert!(
+        resp_text.starts_with("HTTP/1.1 400 "),
+        "expected 400 Bad Request, got: {resp_text}"
+    );
+
+    // Oversized POST /oauth/authorize must return 413 HTML with security headers.
+    let oversized = vec![b'x'; 65 * 1024];
+    let (status, headers, body) = send_req(
+        &engine,
+        Method::POST,
+        "/oauth/authorize",
+        &[("content-type", "application/x-www-form-urlencoded")],
+        oversized,
+    )
+    .await;
+    assert_eq!(status, StatusCode::PAYLOAD_TOO_LARGE);
+    assert_eq!(
+        headers.get(header::CONTENT_TYPE).unwrap(),
+        "text/html; charset=utf-8"
+    );
+    assert!(headers.contains_key(header::CONTENT_SECURITY_POLICY));
+    assert_eq!(headers.get(header::X_FRAME_OPTIONS).unwrap(), "DENY");
+    assert_eq!(headers.get(header::REFERRER_POLICY).unwrap(), "no-referrer");
+    assert_eq!(
+        headers.get(header::X_CONTENT_TYPE_OPTIONS).unwrap(),
+        "nosniff"
+    );
+    assert!(
+        std::str::from_utf8(&body)
+            .unwrap()
+            .contains("<!DOCTYPE html>")
+    );
+}
+
+#[tokio::test]
+async fn revoke_hook_fires_on_explicit_revoke_code_replay_and_refresh_replay() {
+    let tmp = TempDir::new().unwrap();
+    let revoked = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+    let hook_log = Arc::clone(&revoked);
+    let engine = OAuthEngine::open_with_revoke_hook(
+        build_config(
+            tmp.path(),
+            &TestOpts {
+                refresh_grace_secs: 0,
+                ..Default::default()
+            },
+        ),
+        Arc::new(move |grant_id: &str| {
+            hook_log.lock().unwrap().push(grant_id.to_owned());
+        }),
+    )
+    .unwrap();
+
+    let cb = "http://127.0.0.1:26001/cb";
+    let client = register_public_client(&engine, cb, Some("Hook Test")).await;
+
+    // 1. Explicit /oauth/revoke
+    let (at1, _) = mint_public_grant(&engine, &client, cb, "hook-1").await;
+    let mut h1 = HeaderMap::new();
+    h1.insert(
+        header::AUTHORIZATION,
+        HeaderValue::from_str(&format!("Bearer {at1}")).unwrap(),
+    );
+    let gid1 = engine.verify_bearer(&h1).unwrap().grant_id;
+    let (st, _, _) = send_req(
+        &engine,
+        Method::POST,
+        "/oauth/revoke",
+        &[("content-type", "application/x-www-form-urlencoded")],
+        form_encode(&[("client_id", &client), ("token", &at1)]),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
+    assert_eq!(*revoked.lock().unwrap(), vec![gid1.clone()]);
+
+    // 2. Authorization code replay
+    let (verifier, challenge) = pkce_pair("hook-2");
+    let code = authorize_and_get_code(&engine, &client, cb, &challenge, "h2").await;
+    let tok_body = form_encode(&[
+        ("grant_type", "authorization_code"),
+        ("client_id", &client),
+        ("code", &code),
+        ("redirect_uri", cb),
+        ("code_verifier", &verifier),
+    ]);
+    let (st2, _, b2) = send_req(
+        &engine,
+        Method::POST,
+        "/oauth/token",
+        &[("content-type", "application/x-www-form-urlencoded")],
+        tok_body.clone(),
+    )
+    .await;
+    assert_eq!(st2, StatusCode::OK);
+    let at2 = parse_json(&b2)["access_token"].as_str().unwrap().to_owned();
+    let mut h2 = HeaderMap::new();
+    h2.insert(
+        header::AUTHORIZATION,
+        HeaderValue::from_str(&format!("Bearer {at2}")).unwrap(),
+    );
+    let gid2 = engine.verify_bearer(&h2).unwrap().grant_id;
+    let (st2_replay, _, _) = send_req(
+        &engine,
+        Method::POST,
+        "/oauth/token",
+        &[("content-type", "application/x-www-form-urlencoded")],
+        tok_body,
+    )
+    .await;
+    assert_eq!(st2_replay, StatusCode::BAD_REQUEST);
+    assert_eq!(*revoked.lock().unwrap(), vec![gid1.clone(), gid2.clone()]);
+
+    // 3. Refresh token post-grace replay (refresh_grace_secs = 0)
+    let (at3, r0) = mint_public_grant(&engine, &client, cb, "hook-3").await;
+    let mut h3 = HeaderMap::new();
+    h3.insert(
+        header::AUTHORIZATION,
+        HeaderValue::from_str(&format!("Bearer {at3}")).unwrap(),
+    );
+    let gid3 = engine.verify_bearer(&h3).unwrap().grant_id;
+    let rt_form = form_encode(&[
+        ("grant_type", "refresh_token"),
+        ("client_id", &client),
+        ("refresh_token", &r0),
+    ]);
+    let (st3, _, _) = send_req(
+        &engine,
+        Method::POST,
+        "/oauth/token",
+        &[("content-type", "application/x-www-form-urlencoded")],
+        rt_form.clone(),
+    )
+    .await;
+    assert_eq!(st3, StatusCode::OK);
+    let (st3_replay, _, _) = send_req(
+        &engine,
+        Method::POST,
+        "/oauth/token",
+        &[("content-type", "application/x-www-form-urlencoded")],
+        rt_form,
+    )
+    .await;
+    assert_eq!(st3_replay, StatusCode::BAD_REQUEST);
+    assert_eq!(*revoked.lock().unwrap(), vec![gid1, gid2, gid3]);
 }

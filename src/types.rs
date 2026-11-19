@@ -4,7 +4,6 @@ use http_body_util::{BodyExt, Full, combinators::BoxBody};
 use std::convert::Infallible;
 use std::io;
 
-pub type BoxError = Box<dyn std::error::Error + Send + Sync>;
 pub type ReplyBody = BoxBody<Bytes, io::Error>;
 pub type HttpReply = Response<ReplyBody>;
 

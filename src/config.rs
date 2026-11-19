@@ -16,7 +16,7 @@ pub struct GatewayConfig {
     pub upstream: UpstreamSettings,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct OAuthSettings {
     pub verifier: PasswordVerifier,
     pub scopes: Vec<String>,
@@ -25,6 +25,20 @@ pub struct OAuthSettings {
     pub refresh_token_ttl_secs: u64,
     pub refresh_grace_secs: u64,
     pub max_registered_clients: usize,
+}
+
+impl std::fmt::Debug for OAuthSettings {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("OAuthSettings")
+            .field("verifier", &"<redacted>")
+            .field("scopes", &self.scopes)
+            .field("allowed_redirect_hosts", &self.allowed_redirect_hosts)
+            .field("access_token_ttl_secs", &self.access_token_ttl_secs)
+            .field("refresh_token_ttl_secs", &self.refresh_token_ttl_secs)
+            .field("refresh_grace_secs", &self.refresh_grace_secs)
+            .field("max_registered_clients", &self.max_registered_clients)
+            .finish()
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -42,7 +56,7 @@ impl UpstreamSettings {
     }
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct HttpUpstreamSettings {
     pub url: Url,
     pub origin_base: Url,
@@ -52,7 +66,23 @@ pub struct HttpUpstreamSettings {
     pub request_timeout_secs: u64,
 }
 
-#[derive(Clone, Debug)]
+impl std::fmt::Debug for HttpUpstreamSettings {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("HttpUpstreamSettings")
+            .field("url", &self.url)
+            .field("origin_base", &self.origin_base)
+            .field("public_is_https", &self.public_is_https)
+            .field(
+                "bearer_tokens",
+                &format_args!("<{} redacted>", self.bearer_tokens.len()),
+            )
+            .field("passthrough_prefixes", &self.passthrough_prefixes)
+            .field("request_timeout_secs", &self.request_timeout_secs)
+            .finish()
+    }
+}
+
+#[derive(Clone)]
 pub struct StdioUpstreamSettings {
     pub command: String,
     pub args: Vec<String>,
@@ -60,6 +90,24 @@ pub struct StdioUpstreamSettings {
     pub cwd: Option<PathBuf>,
     pub max_sessions: usize,
     pub session_idle_secs: u64,
+}
+
+impl std::fmt::Debug for StdioUpstreamSettings {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let redacted_env: BTreeMap<&str, &str> = self
+            .env
+            .keys()
+            .map(|k| (k.as_str(), "<redacted>"))
+            .collect();
+        f.debug_struct("StdioUpstreamSettings")
+            .field("command", &self.command)
+            .field("args", &self.args)
+            .field("env", &redacted_env)
+            .field("cwd", &self.cwd)
+            .field("max_sessions", &self.max_sessions)
+            .field("session_idle_secs", &self.session_idle_secs)
+            .finish()
+    }
 }
 
 #[derive(Deserialize)]
@@ -340,16 +388,14 @@ impl GatewayConfig {
         let mut scopes = Vec::with_capacity(raw.oauth.scopes.len());
         for (idx, scope) in raw.oauth.scopes.iter().enumerate() {
             let expanded = expand_env_reference(scope, &format!("oauth.scopes[{idx}]"))?;
-            if expanded.trim().is_empty()
-                || expanded
-                    .chars()
-                    .any(|c| c.is_whitespace() || c.is_control())
-            {
-                return Err(
-                    "oauth.scopes must contain non-empty whitespace-free scope tokens".to_owned(),
-                );
+            if !is_valid_scope_token(&expanded) {
+                return Err(format!(
+                    "oauth.scopes[{idx}] must be a valid RFC 6749 scope token"
+                ));
             }
-            scopes.push(expanded);
+            if !scopes.contains(&expanded) {
+                scopes.push(expanded);
+            }
         }
 
         if !(60..=86_400).contains(&raw.oauth.access_token_ttl_secs) {
@@ -419,9 +465,15 @@ impl GatewayConfig {
                 for (idx, tok) in bearer_tokens.iter().enumerate() {
                     let expanded =
                         expand_env_reference(tok, &format!("upstream.bearer_tokens[{idx}]"))?;
-                    if expanded.trim().is_empty() || expanded.chars().any(char::is_control) {
+                    if expanded.is_empty()
+                        || !expanded.is_ascii()
+                        || expanded
+                            .bytes()
+                            .any(|b| b.is_ascii_whitespace() || b.is_ascii_control())
+                        || http::HeaderValue::from_str(&format!("Bearer {expanded}")).is_err()
+                    {
                         return Err(format!(
-                            "upstream.bearer_tokens[{idx}] must be non-empty and free of control characters"
+                            "upstream.bearer_tokens[{idx}] must be a valid ASCII Bearer token without whitespace or control characters"
                         ));
                     }
                     tokens.push(expanded);
@@ -434,7 +486,8 @@ impl GatewayConfig {
                         &format!("upstream.passthrough_prefixes[{idx}]"),
                     )?;
                     validate_passthrough_prefix(&expanded, parsed.path())?;
-                    if resource_dir.starts_with(&expanded.to_ascii_lowercase()) {
+                    let lower = expanded.to_ascii_lowercase();
+                    if resource_dir.starts_with(&lower) || lower.starts_with(&resource_dir) {
                         return Err(format!(
                             "resource_path overlaps passthrough prefix {expanded:?}"
                         ));
@@ -523,6 +576,13 @@ impl GatewayConfig {
     pub fn mcp_resource_url(&self) -> String {
         format!("{}{}", self.public_url, self.resource_path)
     }
+}
+
+fn is_valid_scope_token(scope: &str) -> bool {
+    !scope.is_empty()
+        && scope
+            .bytes()
+            .all(|b| b == 0x21 || (0x23..=0x5B).contains(&b) || (0x5D..=0x7E).contains(&b))
 }
 
 fn validate_passthrough_prefix(prefix: &str, upstream_path: &str) -> Result<(), String> {

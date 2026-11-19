@@ -75,11 +75,25 @@ async fn main() -> ExitCode {
         },
         Commands::HashPassword => {
             use std::io::Read;
-            let mut buf = String::new();
-            if let Err(err) = std::io::stdin().read_to_string(&mut buf) {
+            const MAX_PASSWORD_STDIN_BYTES: u64 = 4096;
+            let mut raw = Vec::new();
+            if let Err(err) = std::io::stdin()
+                .take(MAX_PASSWORD_STDIN_BYTES + 1)
+                .read_to_end(&mut raw)
+            {
                 eprintln!("oauth2-mcp-gateway: cannot read stdin: {err}");
                 return ExitCode::from(1);
             }
+            if raw.len() as u64 > MAX_PASSWORD_STDIN_BYTES {
+                eprintln!(
+                    "oauth2-mcp-gateway: password input exceeds {MAX_PASSWORD_STDIN_BYTES} bytes limit"
+                );
+                return ExitCode::from(1);
+            }
+            let Ok(buf) = String::from_utf8(raw) else {
+                eprintln!("oauth2-mcp-gateway: password input must be valid UTF-8");
+                return ExitCode::from(1);
+            };
             let secret = buf.trim_end_matches(['\r', '\n']);
             match PasswordVerifier::from_plaintext(secret) {
                 Ok(v) => {

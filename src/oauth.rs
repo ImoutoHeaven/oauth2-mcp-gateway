@@ -9,17 +9,19 @@ use crate::store::{
 use crate::types::{
     AuthChallenge, HttpReply, VerifiedToken, bytes_body, empty_body, json_reply, text_reply,
 };
+use crate::upstream_http::{ContentLengthCheck, check_content_length_limit};
 use base64::Engine;
 use base64::engine::general_purpose::{STANDARD, STANDARD_NO_PAD};
 use bytes::Bytes;
 use http::{HeaderMap, Method, Request, Response, StatusCode, header};
+use http_body::Body;
 use http_body_util::{BodyExt, LengthLimitError, Limited};
 use hyper::body::Incoming;
 use serde::Deserialize;
 use serde_json::json;
 use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use url::Url;
 
 const MAX_POST_BODY_BYTES: usize = 64 * 1024;
@@ -32,20 +34,26 @@ const AUTH_CODE_TTL_SECS: u64 = 300;
 const MAX_AUTH_CODES: usize = 256;
 const CONSUMED_CODE_TTL_SECS: u64 = 300;
 const MAX_CONSUMED_CODES: usize = 1024;
-const PW_FAIL_WINDOW_SECS: u64 = 15 * 60;
+const PW_FAIL_WINDOW: Duration = Duration::from_secs(15 * 60);
 const PW_MAX_FAILURES: usize = 10;
 const MAX_ACCESS_TOKENS_PER_GRANT: usize = 64;
+const MAX_ACTIVE_REFRESH_PER_GRANT: usize = 8;
 const MAX_ROTATED_REFRESH_PER_GRANT: usize = 256;
+const MAX_GRACE_CACHE: usize = 1024;
+const MAX_ACTIVE_GRANTS: usize = 4096;
 
 const AUTH_PAGE_CSP: &str = "default-src 'none'; style-src 'unsafe-inline'; form-action 'self'";
 
 type EarlyReply = Box<HttpReply>;
+type RevokeHook = Arc<dyn Fn(&str) + Send + Sync>;
 
 pub struct OAuthEngine {
     config: Arc<GatewayConfig>,
     store: StateStore,
     inner: Mutex<EngineState>,
+    persist_lock: tokio::sync::Mutex<()>,
     pw_verify_gate: tokio::sync::Mutex<()>,
+    on_revoke: Option<RevokeHook>,
 }
 
 struct EngineState {
@@ -54,7 +62,7 @@ struct EngineState {
     auth_codes: VecDeque<AuthCodeEntry>,
     consumed_codes: VecDeque<ConsumedCodeEntry>,
     grace_cache: HashMap<String, GraceCacheEntry>,
-    pw_failures: VecDeque<u64>,
+    pw_failures: VecDeque<Instant>,
     rr_cursor: usize,
 }
 
@@ -114,8 +122,9 @@ impl EngineState {
         self.consumed_codes.retain(|entry| entry.expires_at > now);
         self.grace_cache
             .retain(|_, entry| entry.grace_until >= now && entry.a1_expires_at > now);
+        let mono_now = Instant::now();
         while let Some(&ts) = self.pw_failures.front() {
-            if ts.saturating_add(PW_FAIL_WINDOW_SECS) <= now {
+            if mono_now.saturating_duration_since(ts) >= PW_FAIL_WINDOW {
                 self.pw_failures.pop_front();
             } else {
                 break;
@@ -123,11 +132,18 @@ impl EngineState {
         }
     }
 
-    fn revoke_grant_in_memory(&mut self, grant_id: &str) -> bool {
-        let before = self.persisted.grants.len();
-        self.persisted.grants.retain(|g| g.grant_id != grant_id);
-        self.grace_cache.retain(|_, e| e.grant_id != grant_id);
-        self.persisted.grants.len() != before
+    fn insert_grace_cache(&mut self, rt_hash: String, entry: GraceCacheEntry) {
+        if self.grace_cache.len() >= MAX_GRACE_CACHE
+            && !self.grace_cache.contains_key(&rt_hash)
+            && let Some(evict_key) = self
+                .grace_cache
+                .iter()
+                .min_by_key(|(_, e)| e.grace_until)
+                .map(|(k, _)| k.clone())
+        {
+            self.grace_cache.remove(&evict_key);
+        }
+        self.grace_cache.insert(rt_hash, entry);
     }
 
     fn select_pool_slot(&mut self, pool_size: usize) -> usize {
@@ -155,6 +171,20 @@ impl EngineState {
 
 impl OAuthEngine {
     pub fn open(config: Arc<GatewayConfig>) -> Result<Arc<Self>, String> {
+        Self::open_internal(config, None)
+    }
+
+    pub fn open_with_revoke_hook(
+        config: Arc<GatewayConfig>,
+        on_revoke: Arc<dyn Fn(&str) + Send + Sync>,
+    ) -> Result<Arc<Self>, String> {
+        Self::open_internal(config, Some(on_revoke))
+    }
+
+    fn open_internal(
+        config: Arc<GatewayConfig>,
+        on_revoke: Option<RevokeHook>,
+    ) -> Result<Arc<Self>, String> {
         let now = unix_now();
         let (store, persisted) = StateStore::open(config.state_path.clone(), now)?;
         let state = EngineState {
@@ -170,8 +200,36 @@ impl OAuthEngine {
             config,
             store,
             inner: Mutex::new(state),
+            persist_lock: tokio::sync::Mutex::new(()),
             pw_verify_gate: tokio::sync::Mutex::new(()),
+            on_revoke,
         }))
+    }
+
+    pub fn resource_path(&self) -> &str {
+        &self.config.resource_path
+    }
+
+    fn notify_revoke(&self, grant_id: &str) {
+        if let Some(hook) = &self.on_revoke {
+            hook(grant_id);
+        }
+    }
+
+    async fn persist_snapshot(&self, snapshot: PersistedState) -> Result<PersistedState, ()> {
+        let store = self.store.clone();
+        let to_save = snapshot.clone();
+        match tokio::task::spawn_blocking(move || store.save(&to_save)).await {
+            Ok(Ok(())) => Ok(snapshot),
+            Ok(Err(err)) => {
+                eprintln!("oauth2-mcp-gateway: failed to persist OAuth state: {err}");
+                Err(())
+            }
+            Err(err) => {
+                eprintln!("oauth2-mcp-gateway: state persistence task failed: {err}");
+                Err(())
+            }
+        }
     }
 
     pub fn handles_path(path: &str) -> bool {
@@ -195,8 +253,10 @@ impl OAuthEngine {
                 self.handle_prm()
             }
             p if p.starts_with("/.well-known/oauth-protected-resource/") => not_found_reply(),
-            "/.well-known/oauth-authorization-server"
-            | "/.well-known/oauth-authorization-server/mcp" => {
+            p if p == "/.well-known/oauth-authorization-server"
+                || p.strip_prefix("/.well-known/oauth-authorization-server")
+                    == Some(self.config.resource_path.as_str()) =>
+            {
                 if req.method() != Method::GET {
                     return method_not_allowed("GET");
                 }
@@ -362,7 +422,7 @@ impl OAuthEngine {
         }
         let body = match read_limited_body(req).await {
             Ok(bytes) => bytes,
-            Err(reply) => return reply,
+            Err(err) => return body_error_json(err),
         };
         let raw_req: DcrRequest = match serde_json::from_slice(&body) {
             Ok(parsed) => parsed,
@@ -521,7 +581,8 @@ impl OAuthEngine {
             issued_at: now,
         };
 
-        {
+        let _persist_guard = self.persist_lock.lock().await;
+        let (snapshot, evicted_ids) = {
             let mut guard = self
                 .inner
                 .lock()
@@ -560,14 +621,23 @@ impl OAuthEngine {
             candidate_clients.push(record);
             let mut snapshot = guard.persisted.clone();
             snapshot.clients = candidate_clients;
-            if self.store.save(&snapshot).is_err() {
-                return oauth_error(
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    "server_error",
-                    "failed to persist registered client",
-                );
-            }
-            guard.persisted = snapshot;
+            (snapshot, evicted_ids)
+        };
+
+        let Ok(persisted) = self.persist_snapshot(snapshot).await else {
+            return oauth_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "server_error",
+                "failed to persist registered client",
+            );
+        };
+
+        {
+            let mut guard = self
+                .inner
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            guard.persisted = persisted;
             if !evicted_ids.is_empty() {
                 guard
                     .pending_auths
@@ -754,7 +824,7 @@ impl OAuthEngine {
         let req_headers = req.headers().clone();
         let body = match read_limited_body(req).await {
             Ok(bytes) => bytes,
-            Err(reply) => return reply,
+            Err(err) => return body_error_html(err),
         };
         let Ok(form) = parse_unique_form(&body) else {
             return html_status_reply(StatusCode::BAD_REQUEST, "Invalid form submission");
@@ -833,7 +903,7 @@ impl OAuthEngine {
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
             guard.prune_ephemeral(finish_now);
-            guard.pw_failures.push_back(finish_now);
+            guard.pw_failures.push_back(Instant::now());
             let html = render_authorize_page(&pending, Some("Incorrect password"));
             return html_reply_with_cookie(StatusCode::UNAUTHORIZED, html, None);
         }
@@ -936,7 +1006,7 @@ impl OAuthEngine {
         let req_headers = req.headers().clone();
         let body = match read_limited_body(req).await {
             Ok(bytes) => bytes,
-            Err(reply) => return reply,
+            Err(err) => return body_error_json(err),
         };
         let Ok(form) = parse_unique_form(&body) else {
             return oauth_error(
@@ -952,8 +1022,8 @@ impl OAuthEngine {
         };
 
         match form.get("grant_type").map(String::as_str) {
-            Some("authorization_code") => self.handle_token_auth_code(&client, &form),
-            Some("refresh_token") => self.handle_token_refresh(&client, &form),
+            Some("authorization_code") => self.handle_token_auth_code(&client, &form).await,
+            Some("refresh_token") => self.handle_token_refresh(&client, &form).await,
             Some(_) => oauth_error(
                 StatusCode::BAD_REQUEST,
                 "unsupported_grant_type",
@@ -967,7 +1037,7 @@ impl OAuthEngine {
         }
     }
 
-    fn handle_token_auth_code(
+    async fn handle_token_auth_code(
         &self,
         client: &RegisteredClient,
         form: &BTreeMap<String, String>,
@@ -988,179 +1058,248 @@ impl OAuthEngine {
         };
 
         let code_hash = sha256_b64(raw_code);
+        let _persist_guard = self.persist_lock.lock().await;
         let now = unix_now();
 
-        let mut guard = self
-            .inner
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        guard.persisted.prune_expired(now);
-        guard.prune_ephemeral(now);
+        enum AuthCodePlan {
+            Replay {
+                grant_id: String,
+                snapshot: Option<PersistedState>,
+            },
+            Issue {
+                snapshot: PersistedState,
+                grant_id: String,
+                access_token: String,
+                refresh_token: Option<String>,
+                access_ttl: u64,
+                scopes: Vec<String>,
+            },
+            Reply(EarlyReply),
+        }
 
-        if let Some(replayed_grant_id) = guard
-            .consumed_codes
-            .iter()
-            .find(|c| constant_time_eq_str(&c.code_sha256, &code_hash))
-            .map(|c| c.grant_id.clone())
-        {
-            let mut snapshot = guard.persisted.clone();
-            let before = snapshot.grants.len();
-            snapshot.grants.retain(|g| g.grant_id != replayed_grant_id);
-            if snapshot.grants.len() != before {
-                if self.store.save(&snapshot).is_err() {
+        let plan = {
+            let mut guard = self
+                .inner
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            guard.persisted.prune_expired(now);
+            guard.prune_ephemeral(now);
+
+            if let Some(replayed_grant_id) = guard
+                .consumed_codes
+                .iter()
+                .find(|c| constant_time_eq_str(&c.code_sha256, &code_hash))
+                .map(|c| c.grant_id.clone())
+            {
+                let mut snapshot = guard.persisted.clone();
+                let before = snapshot.grants.len();
+                snapshot.grants.retain(|g| g.grant_id != replayed_grant_id);
+                let changed = snapshot.grants.len() != before;
+                if !changed {
+                    guard
+                        .grace_cache
+                        .retain(|_, e| e.grant_id != replayed_grant_id);
+                }
+                AuthCodePlan::Replay {
+                    grant_id: replayed_grant_id,
+                    snapshot: changed.then_some(snapshot),
+                }
+            } else {
+                let mut make_plan = || -> AuthCodePlan {
+                    let Some(code_verifier) = form.get("code_verifier").filter(|v| !v.is_empty())
+                    else {
+                        return AuthCodePlan::Reply(Box::new(oauth_error(
+                            StatusCode::BAD_REQUEST,
+                            "invalid_request",
+                            "code_verifier is required",
+                        )));
+                    };
+
+                    let requested_resource = match form.get("resource") {
+                        None => None,
+                        Some(raw_res) => match self.normalize_resource(Some(raw_res)) {
+                            Ok(norm) => Some(norm),
+                            Err(()) => {
+                                return AuthCodePlan::Reply(Box::new(oauth_error(
+                                    StatusCode::BAD_REQUEST,
+                                    "invalid_target",
+                                    "invalid resource target",
+                                )));
+                            }
+                        },
+                    };
+
+                    let Some(code_pos) = guard
+                        .auth_codes
+                        .iter()
+                        .position(|entry| constant_time_eq_str(&entry.code_sha256, &code_hash))
+                    else {
+                        return AuthCodePlan::Reply(Box::new(oauth_error(
+                            StatusCode::BAD_REQUEST,
+                            "invalid_grant",
+                            "unknown or expired authorization code",
+                        )));
+                    };
+                    let code_entry = guard.auth_codes.remove(code_pos).expect("position exists");
+
+                    if code_entry.client_id != client.client_id {
+                        return AuthCodePlan::Reply(Box::new(oauth_error(
+                            StatusCode::BAD_REQUEST,
+                            "invalid_grant",
+                            "authorization code was not issued to this client",
+                        )));
+                    }
+                    if form.get("redirect_uri").map(String::as_str)
+                        != Some(code_entry.redirect_uri.as_str())
+                    {
+                        return AuthCodePlan::Reply(Box::new(oauth_error(
+                            StatusCode::BAD_REQUEST,
+                            "invalid_grant",
+                            "redirect_uri mismatch",
+                        )));
+                    }
+                    if let Some(res) = requested_resource
+                        && res != code_entry.resource
+                    {
+                        return AuthCodePlan::Reply(Box::new(oauth_error(
+                            StatusCode::BAD_REQUEST,
+                            "invalid_target",
+                            "resource mismatch",
+                        )));
+                    }
+                    if !verify_pkce_s256(code_verifier, &code_entry.code_challenge) {
+                        return AuthCodePlan::Reply(Box::new(oauth_error(
+                            StatusCode::BAD_REQUEST,
+                            "invalid_grant",
+                            "PKCE verification failed",
+                        )));
+                    }
+                    if guard.persisted.grants.len() >= MAX_ACTIVE_GRANTS {
+                        return AuthCodePlan::Reply(Box::new(oauth_error(
+                            StatusCode::TOO_MANY_REQUESTS,
+                            "temporarily_unavailable",
+                            "maximum active grants reached",
+                        )));
+                    }
+
+                    let (Ok(grant_suffix), Ok(access_token), Ok(refresh_token)) = (
+                        random_token_b64(18),
+                        random_token_b64(32),
+                        random_token_b64(32),
+                    ) else {
+                        return AuthCodePlan::Reply(Box::new(oauth_error(
+                            StatusCode::INTERNAL_SERVER_ERROR,
+                            "server_error",
+                            "random generation failed",
+                        )));
+                    };
+
+                    let grant_id = format!("grt_{grant_suffix}");
+                    let pool_slot = guard.select_pool_slot(self.config.upstream.pool_size());
+                    let access_ttl = self.config.oauth.access_token_ttl_secs;
+                    let refresh_ttl = self.config.oauth.refresh_token_ttl_secs;
+                    let issue_refresh = client.grant_types.iter().any(|g| g == "refresh_token");
+
+                    let mut refresh_tokens = Vec::new();
+                    if issue_refresh {
+                        refresh_tokens.push(RefreshTokenRecord {
+                            token_sha256: sha256_b64(&refresh_token),
+                            expires_at: now.saturating_add(refresh_ttl),
+                            grace_until: None,
+                        });
+                    }
+
+                    let grant = GrantRecord {
+                        grant_id: grant_id.clone(),
+                        client_id: client.client_id.clone(),
+                        pool_slot,
+                        scopes: code_entry.scopes.clone(),
+                        resource: code_entry.resource,
+                        access_tokens: vec![AccessTokenRecord {
+                            token_sha256: sha256_b64(&access_token),
+                            expires_at: now.saturating_add(access_ttl),
+                        }],
+                        refresh_tokens,
+                    };
+
+                    let mut snapshot = guard.persisted.clone();
+                    snapshot.grants.push(grant);
+                    AuthCodePlan::Issue {
+                        snapshot,
+                        grant_id,
+                        access_token,
+                        refresh_token: issue_refresh.then_some(refresh_token),
+                        access_ttl,
+                        scopes: code_entry.scopes,
+                    }
+                };
+                make_plan()
+            }
+        };
+
+        match plan {
+            AuthCodePlan::Reply(reply) => *reply,
+            AuthCodePlan::Replay { grant_id, snapshot } => {
+                if let Some(snap) = snapshot {
+                    let Ok(persisted) = self.persist_snapshot(snap).await else {
+                        return oauth_error(
+                            StatusCode::INTERNAL_SERVER_ERROR,
+                            "server_error",
+                            "failed to persist grant revocation",
+                        );
+                    };
+                    {
+                        let mut guard = self
+                            .inner
+                            .lock()
+                            .unwrap_or_else(|poisoned| poisoned.into_inner());
+                        guard.persisted = persisted;
+                        guard.grace_cache.retain(|_, e| e.grant_id != grant_id);
+                    }
+                    self.notify_revoke(&grant_id);
+                }
+                oauth_error(
+                    StatusCode::BAD_REQUEST,
+                    "invalid_grant",
+                    "authorization code has already been used",
+                )
+            }
+            AuthCodePlan::Issue {
+                snapshot,
+                grant_id,
+                access_token,
+                refresh_token,
+                access_ttl,
+                scopes,
+            } => {
+                let Ok(persisted) = self.persist_snapshot(snapshot).await else {
                     return oauth_error(
                         StatusCode::INTERNAL_SERVER_ERROR,
                         "server_error",
-                        "failed to persist grant revocation",
+                        "failed to persist token grant",
                     );
+                };
+                {
+                    let mut guard = self
+                        .inner
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner());
+                    guard.persisted = persisted;
+                    while guard.consumed_codes.len() >= MAX_CONSUMED_CODES {
+                        guard.consumed_codes.pop_front();
+                    }
+                    guard.consumed_codes.push_back(ConsumedCodeEntry {
+                        code_sha256: code_hash,
+                        grant_id,
+                        expires_at: now.saturating_add(CONSUMED_CODE_TTL_SECS),
+                    });
                 }
-                guard.persisted = snapshot;
+                token_success_reply(&access_token, access_ttl, refresh_token.as_deref(), &scopes)
             }
-            guard
-                .grace_cache
-                .retain(|_, e| e.grant_id != replayed_grant_id);
-            return oauth_error(
-                StatusCode::BAD_REQUEST,
-                "invalid_grant",
-                "authorization code has already been used",
-            );
         }
-
-        let Some(code_verifier) = form.get("code_verifier").filter(|v| !v.is_empty()) else {
-            return oauth_error(
-                StatusCode::BAD_REQUEST,
-                "invalid_request",
-                "code_verifier is required",
-            );
-        };
-
-        let requested_resource = match form.get("resource") {
-            None => None,
-            Some(raw_res) => match self.normalize_resource(Some(raw_res)) {
-                Ok(norm) => Some(norm),
-                Err(()) => {
-                    return oauth_error(
-                        StatusCode::BAD_REQUEST,
-                        "invalid_target",
-                        "invalid resource target",
-                    );
-                }
-            },
-        };
-
-        let Some(code_pos) = guard
-            .auth_codes
-            .iter()
-            .position(|entry| constant_time_eq_str(&entry.code_sha256, &code_hash))
-        else {
-            return oauth_error(
-                StatusCode::BAD_REQUEST,
-                "invalid_grant",
-                "unknown or expired authorization code",
-            );
-        };
-        let code_entry = guard.auth_codes.remove(code_pos).expect("position exists");
-
-        if code_entry.client_id != client.client_id {
-            return oauth_error(
-                StatusCode::BAD_REQUEST,
-                "invalid_grant",
-                "authorization code was not issued to this client",
-            );
-        }
-        if form.get("redirect_uri").map(String::as_str) != Some(code_entry.redirect_uri.as_str()) {
-            return oauth_error(
-                StatusCode::BAD_REQUEST,
-                "invalid_grant",
-                "redirect_uri mismatch",
-            );
-        }
-        if let Some(res) = requested_resource
-            && res != code_entry.resource
-        {
-            return oauth_error(
-                StatusCode::BAD_REQUEST,
-                "invalid_target",
-                "resource mismatch",
-            );
-        }
-        if !verify_pkce_s256(code_verifier, &code_entry.code_challenge) {
-            return oauth_error(
-                StatusCode::BAD_REQUEST,
-                "invalid_grant",
-                "PKCE verification failed",
-            );
-        }
-
-        let (Ok(grant_suffix), Ok(access_token), Ok(refresh_token)) = (
-            random_token_b64(18),
-            random_token_b64(32),
-            random_token_b64(32),
-        ) else {
-            return oauth_error(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "server_error",
-                "random generation failed",
-            );
-        };
-
-        let grant_id = format!("grt_{grant_suffix}");
-        let pool_slot = guard.select_pool_slot(self.config.upstream.pool_size());
-        let access_ttl = self.config.oauth.access_token_ttl_secs;
-        let refresh_ttl = self.config.oauth.refresh_token_ttl_secs;
-        let issue_refresh = client.grant_types.iter().any(|g| g == "refresh_token");
-
-        let mut refresh_tokens = Vec::new();
-        if issue_refresh {
-            refresh_tokens.push(RefreshTokenRecord {
-                token_sha256: sha256_b64(&refresh_token),
-                expires_at: now.saturating_add(refresh_ttl),
-                grace_until: None,
-            });
-        }
-
-        let grant = GrantRecord {
-            grant_id: grant_id.clone(),
-            client_id: client.client_id.clone(),
-            pool_slot,
-            scopes: code_entry.scopes.clone(),
-            resource: code_entry.resource,
-            access_tokens: vec![AccessTokenRecord {
-                token_sha256: sha256_b64(&access_token),
-                expires_at: now.saturating_add(access_ttl),
-            }],
-            refresh_tokens,
-        };
-
-        let mut snapshot = guard.persisted.clone();
-        snapshot.grants.push(grant);
-        if self.store.save(&snapshot).is_err() {
-            return oauth_error(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "server_error",
-                "failed to persist token grant",
-            );
-        }
-        guard.persisted = snapshot;
-
-        while guard.consumed_codes.len() >= MAX_CONSUMED_CODES {
-            guard.consumed_codes.pop_front();
-        }
-        guard.consumed_codes.push_back(ConsumedCodeEntry {
-            code_sha256: code_hash,
-            grant_id,
-            expires_at: now.saturating_add(CONSUMED_CODE_TTL_SECS),
-        });
-
-        token_success_reply(
-            &access_token,
-            access_ttl,
-            issue_refresh.then_some(refresh_token.as_str()),
-            &code_entry.scopes,
-        )
     }
 
-    fn handle_token_refresh(
+    async fn handle_token_refresh(
         &self,
         client: &RegisteredClient,
         form: &BTreeMap<String, String>,
@@ -1181,224 +1320,311 @@ impl OAuthEngine {
         };
 
         let rt_hash = sha256_b64(raw_rt);
+        let _persist_guard = self.persist_lock.lock().await;
         let now = unix_now();
 
-        let mut guard = self
-            .inner
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        guard.persisted.prune_expired(now);
-        guard.prune_ephemeral(now);
+        enum RefreshPlan {
+            Reply(EarlyReply),
+            RevokeReplay {
+                grant_id: String,
+                snapshot: PersistedState,
+            },
+            PersistGraceFallback {
+                snapshot: PersistedState,
+                cache_entry: GraceCacheEntry,
+                access_token: String,
+                refresh_token: String,
+                access_ttl: u64,
+                scopes: Vec<String>,
+            },
+            PersistRotation {
+                snapshot: PersistedState,
+                cache_entry: Option<GraceCacheEntry>,
+                access_token: String,
+                refresh_token: String,
+                access_ttl: u64,
+                scopes: Vec<String>,
+            },
+        }
 
-        let mut matched: Option<(usize, usize)> = None;
-        for (g_idx, grant) in guard.persisted.grants.iter().enumerate() {
-            for (r_idx, rt) in grant.refresh_tokens.iter().enumerate() {
-                if rt.expires_at > now && constant_time_eq_str(&rt.token_sha256, &rt_hash) {
-                    matched = Some((g_idx, r_idx));
-                    break;
+        let plan = {
+            let mut guard = self
+                .inner
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            guard.persisted.prune_expired(now);
+            guard.prune_ephemeral(now);
+
+            let make_plan = || -> RefreshPlan {
+                let mut matched: Option<(usize, usize)> = None;
+                for (g_idx, grant) in guard.persisted.grants.iter().enumerate() {
+                    for (r_idx, rt) in grant.refresh_tokens.iter().enumerate() {
+                        if rt.expires_at > now && constant_time_eq_str(&rt.token_sha256, &rt_hash) {
+                            matched = Some((g_idx, r_idx));
+                            break;
+                        }
+                    }
+                    if matched.is_some() {
+                        break;
+                    }
                 }
-            }
-            if matched.is_some() {
-                break;
-            }
-        }
 
-        let Some((grant_idx, rt_idx)) = matched else {
-            return oauth_error(
-                StatusCode::BAD_REQUEST,
-                "invalid_grant",
-                "unknown or expired refresh token",
-            );
-        };
+                let Some((grant_idx, rt_idx)) = matched else {
+                    return RefreshPlan::Reply(Box::new(oauth_error(
+                        StatusCode::BAD_REQUEST,
+                        "invalid_grant",
+                        "unknown or expired refresh token",
+                    )));
+                };
 
-        if guard.persisted.grants[grant_idx].client_id != client.client_id {
-            return oauth_error(
-                StatusCode::BAD_REQUEST,
-                "invalid_grant",
-                "refresh token was not issued to this client",
-            );
-        }
+                if guard.persisted.grants[grant_idx].client_id != client.client_id {
+                    return RefreshPlan::Reply(Box::new(oauth_error(
+                        StatusCode::BAD_REQUEST,
+                        "invalid_grant",
+                        "refresh token was not issued to this client",
+                    )));
+                }
 
-        if guard.persisted.grants[grant_idx].resource != self.config.mcp_resource_url() {
-            return oauth_error(
-                StatusCode::BAD_REQUEST,
-                "invalid_grant",
-                "refresh token targets a previous resource URL",
-            );
-        }
+                if guard.persisted.grants[grant_idx].resource != self.config.mcp_resource_url() {
+                    return RefreshPlan::Reply(Box::new(oauth_error(
+                        StatusCode::BAD_REQUEST,
+                        "invalid_grant",
+                        "refresh token targets a previous resource URL",
+                    )));
+                }
 
-        let existing_grace = guard.persisted.grants[grant_idx].refresh_tokens[rt_idx].grace_until;
-        let r0_expires_at = guard.persisted.grants[grant_idx].refresh_tokens[rt_idx].expires_at;
-        let grant_id = guard.persisted.grants[grant_idx].grant_id.clone();
+                let existing_grace =
+                    guard.persisted.grants[grant_idx].refresh_tokens[rt_idx].grace_until;
+                let r0_expires_at =
+                    guard.persisted.grants[grant_idx].refresh_tokens[rt_idx].expires_at;
+                let grant_id = guard.persisted.grants[grant_idx].grant_id.clone();
 
-        if let Some(gu) = existing_grace {
-            let within_grace = self.config.oauth.refresh_grace_secs > 0 && now <= gu;
-            if !within_grace {
-                let mut snapshot = guard.persisted.clone();
-                snapshot.grants.retain(|g| g.grant_id != grant_id);
-                if self.store.save(&snapshot).is_err() {
-                    return oauth_error(
+                if let Some(gu) = existing_grace {
+                    let within_grace = self.config.oauth.refresh_grace_secs > 0 && now <= gu;
+                    if !within_grace {
+                        let mut snapshot = guard.persisted.clone();
+                        snapshot.grants.retain(|g| g.grant_id != grant_id);
+                        return RefreshPlan::RevokeReplay { grant_id, snapshot };
+                    }
+
+                    let grant = &guard.persisted.grants[grant_idx];
+                    let effective_scopes =
+                        match self.validate_refresh_scope_and_resource(grant, form) {
+                            Ok(scopes) => scopes,
+                            Err(reply) => return RefreshPlan::Reply(reply),
+                        };
+                    if effective_scopes.len() != grant.scopes.len() {
+                        return RefreshPlan::Reply(Box::new(oauth_error(
+                            StatusCode::BAD_REQUEST,
+                            "invalid_scope",
+                            "refresh retry cannot narrow the current scope",
+                        )));
+                    }
+
+                    if let Some(cached) = guard.grace_cache.get(&rt_hash).cloned()
+                        && cached.a1_expires_at > now
+                        && cached.scopes.len() == grant.scopes.len()
+                        && cached
+                            .scopes
+                            .iter()
+                            .all(|scope| grant.scopes.contains(scope))
+                    {
+                        let rem_ttl = cached.a1_expires_at.saturating_sub(now).max(1);
+                        return RefreshPlan::Reply(Box::new(token_success_reply(
+                            &cached.access_token,
+                            rem_ttl,
+                            Some(&cached.refresh_token),
+                            &cached.scopes,
+                        )));
+                    }
+
+                    let (Ok(a_re), Ok(r_re)) = (random_token_b64(32), random_token_b64(32)) else {
+                        return RefreshPlan::Reply(Box::new(oauth_error(
+                            StatusCode::INTERNAL_SERVER_ERROR,
+                            "server_error",
+                            "random generation failed",
+                        )));
+                    };
+                    let access_ttl = self.config.oauth.access_token_ttl_secs;
+                    let refresh_ttl = self.config.oauth.refresh_token_ttl_secs;
+                    let a_re_expires = now.saturating_add(access_ttl);
+                    let ceiling = guard.persisted.grants[grant_idx]
+                        .refresh_tokens
+                        .iter()
+                        .filter(|rt| rt.grace_until.is_none())
+                        .map(|rt| rt.expires_at)
+                        .max();
+                    let r_re_expires = ceiling
+                        .unwrap_or_else(|| now.saturating_add(refresh_ttl))
+                        .min(now.saturating_add(refresh_ttl));
+
+                    let mut snapshot = guard.persisted.clone();
+                    let target_grant = &mut snapshot.grants[grant_idx];
+                    target_grant.access_tokens.push(AccessTokenRecord {
+                        token_sha256: sha256_b64(&a_re),
+                        expires_at: a_re_expires,
+                    });
+                    target_grant.refresh_tokens.push(RefreshTokenRecord {
+                        token_sha256: sha256_b64(&r_re),
+                        expires_at: r_re_expires,
+                        grace_until: None,
+                    });
+                    trim_rotated_refresh_history(target_grant);
+                    let scopes = target_grant.scopes.clone();
+
+                    return RefreshPlan::PersistGraceFallback {
+                        snapshot,
+                        cache_entry: GraceCacheEntry {
+                            grant_id,
+                            access_token: a_re.clone(),
+                            refresh_token: r_re.clone(),
+                            a1_expires_at: a_re_expires,
+                            scopes: scopes.clone(),
+                            grace_until: gu,
+                        },
+                        access_token: a_re,
+                        refresh_token: r_re,
+                        access_ttl,
+                        scopes,
+                    };
+                }
+
+                let effective_scopes = match self
+                    .validate_refresh_scope_and_resource(&guard.persisted.grants[grant_idx], form)
+                {
+                    Ok(s) => s,
+                    Err(reply) => return RefreshPlan::Reply(reply),
+                };
+
+                let (Ok(a1), Ok(r1)) = (random_token_b64(32), random_token_b64(32)) else {
+                    return RefreshPlan::Reply(Box::new(oauth_error(
                         StatusCode::INTERNAL_SERVER_ERROR,
                         "server_error",
-                        "failed to persist grant revocation",
-                    );
-                }
-                guard.persisted = snapshot;
-                guard.grace_cache.retain(|_, e| e.grant_id != grant_id);
-                return oauth_error(
-                    StatusCode::BAD_REQUEST,
-                    "invalid_grant",
-                    "refresh token reuse detected",
-                );
-            }
+                        "random generation failed",
+                    )));
+                };
 
-            let grant = &guard.persisted.grants[grant_idx];
-            let effective_scopes = match self.validate_refresh_scope_and_resource(grant, form) {
-                Ok(scopes) => scopes,
-                Err(reply) => return *reply,
-            };
-            if effective_scopes.len() != grant.scopes.len() {
-                return oauth_error(
-                    StatusCode::BAD_REQUEST,
-                    "invalid_scope",
-                    "refresh retry cannot narrow the current scope",
-                );
-            }
+                let grace_secs = self.config.oauth.refresh_grace_secs;
+                let grace_until = r0_expires_at.min(now.saturating_add(grace_secs));
+                let access_ttl = self.config.oauth.access_token_ttl_secs;
+                let refresh_ttl = self.config.oauth.refresh_token_ttl_secs;
+                let a1_expires_at = now.saturating_add(access_ttl);
+                let r1_expires_at = now.saturating_add(refresh_ttl);
 
-            if let Some(cached) = guard.grace_cache.get(&rt_hash).cloned()
-                && cached.a1_expires_at > now
-                && cached.scopes.len() == grant.scopes.len()
-                && cached
-                    .scopes
-                    .iter()
-                    .all(|scope| grant.scopes.contains(scope))
-            {
-                let rem_ttl = cached.a1_expires_at.saturating_sub(now).max(1);
-                return token_success_reply(
-                    &cached.access_token,
-                    rem_ttl,
-                    Some(&cached.refresh_token),
-                    &cached.scopes,
-                );
-            }
+                let mut snapshot = guard.persisted.clone();
+                let target_grant = &mut snapshot.grants[grant_idx];
+                target_grant.scopes = effective_scopes.clone();
+                target_grant.refresh_tokens[rt_idx].grace_until = Some(grace_until);
+                target_grant.access_tokens.push(AccessTokenRecord {
+                    token_sha256: sha256_b64(&a1),
+                    expires_at: a1_expires_at,
+                });
+                target_grant.refresh_tokens.push(RefreshTokenRecord {
+                    token_sha256: sha256_b64(&r1),
+                    expires_at: r1_expires_at,
+                    grace_until: None,
+                });
+                trim_rotated_refresh_history(target_grant);
 
-            let (Ok(a_re), Ok(r_re)) = (random_token_b64(32), random_token_b64(32)) else {
-                return oauth_error(
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    "server_error",
-                    "random generation failed",
-                );
-            };
-            let access_ttl = self.config.oauth.access_token_ttl_secs;
-            let refresh_ttl = self.config.oauth.refresh_token_ttl_secs;
-            let a_re_expires = now.saturating_add(access_ttl);
-            let ceiling = guard.persisted.grants[grant_idx]
-                .refresh_tokens
-                .iter()
-                .filter(|rt| rt.grace_until.is_none())
-                .map(|rt| rt.expires_at)
-                .max();
-            let r_re_expires = ceiling
-                .unwrap_or_else(|| now.saturating_add(refresh_ttl))
-                .min(now.saturating_add(refresh_ttl));
-
-            let mut snapshot = guard.persisted.clone();
-            let target_grant = &mut snapshot.grants[grant_idx];
-            target_grant.access_tokens.push(AccessTokenRecord {
-                token_sha256: sha256_b64(&a_re),
-                expires_at: a_re_expires,
-            });
-            target_grant.refresh_tokens.push(RefreshTokenRecord {
-                token_sha256: sha256_b64(&r_re),
-                expires_at: r_re_expires,
-                grace_until: None,
-            });
-            trim_rotated_refresh_history(target_grant);
-            let scopes = target_grant.scopes.clone();
-
-            if self.store.save(&snapshot).is_err() {
-                return oauth_error(
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    "server_error",
-                    "failed to persist refreshed token",
-                );
-            }
-            guard.persisted = snapshot;
-            guard.grace_cache.insert(
-                rt_hash,
-                GraceCacheEntry {
-                    grant_id,
-                    access_token: a_re.clone(),
-                    refresh_token: r_re.clone(),
-                    a1_expires_at: a_re_expires,
-                    scopes: scopes.clone(),
-                    grace_until: gu,
-                },
-            );
-            return token_success_reply(&a_re, access_ttl, Some(&r_re), &scopes);
-        }
-
-        let effective_scopes = match self
-            .validate_refresh_scope_and_resource(&guard.persisted.grants[grant_idx], form)
-        {
-            Ok(s) => s,
-            Err(reply) => return *reply,
-        };
-
-        let (Ok(a1), Ok(r1)) = (random_token_b64(32), random_token_b64(32)) else {
-            return oauth_error(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "server_error",
-                "random generation failed",
-            );
-        };
-
-        let grace_secs = self.config.oauth.refresh_grace_secs;
-        let grace_until = r0_expires_at.min(now.saturating_add(grace_secs));
-        let access_ttl = self.config.oauth.access_token_ttl_secs;
-        let refresh_ttl = self.config.oauth.refresh_token_ttl_secs;
-        let a1_expires_at = now.saturating_add(access_ttl);
-        let r1_expires_at = now.saturating_add(refresh_ttl);
-
-        let mut snapshot = guard.persisted.clone();
-        let target_grant = &mut snapshot.grants[grant_idx];
-        target_grant.scopes = effective_scopes.clone();
-        target_grant.refresh_tokens[rt_idx].grace_until = Some(grace_until);
-        target_grant.access_tokens.push(AccessTokenRecord {
-            token_sha256: sha256_b64(&a1),
-            expires_at: a1_expires_at,
-        });
-        target_grant.refresh_tokens.push(RefreshTokenRecord {
-            token_sha256: sha256_b64(&r1),
-            expires_at: r1_expires_at,
-            grace_until: None,
-        });
-        trim_rotated_refresh_history(target_grant);
-
-        if self.store.save(&snapshot).is_err() {
-            return oauth_error(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "server_error",
-                "failed to persist rotated token",
-            );
-        }
-        guard.persisted = snapshot;
-
-        if grace_secs > 0 {
-            guard.grace_cache.insert(
-                rt_hash,
-                GraceCacheEntry {
+                let cache_entry = (grace_secs > 0).then(|| GraceCacheEntry {
                     grant_id,
                     access_token: a1.clone(),
                     refresh_token: r1.clone(),
                     a1_expires_at,
                     scopes: effective_scopes.clone(),
                     grace_until,
-                },
-            );
-        }
+                });
 
-        token_success_reply(&a1, access_ttl, Some(&r1), &effective_scopes)
+                RefreshPlan::PersistRotation {
+                    snapshot,
+                    cache_entry,
+                    access_token: a1,
+                    refresh_token: r1,
+                    access_ttl,
+                    scopes: effective_scopes,
+                }
+            };
+            make_plan()
+        };
+
+        match plan {
+            RefreshPlan::Reply(reply) => *reply,
+            RefreshPlan::RevokeReplay { grant_id, snapshot } => {
+                let Ok(persisted) = self.persist_snapshot(snapshot).await else {
+                    return oauth_error(
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        "server_error",
+                        "failed to persist grant revocation",
+                    );
+                };
+                {
+                    let mut guard = self
+                        .inner
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner());
+                    guard.persisted = persisted;
+                    guard.grace_cache.retain(|_, e| e.grant_id != grant_id);
+                }
+                self.notify_revoke(&grant_id);
+                oauth_error(
+                    StatusCode::BAD_REQUEST,
+                    "invalid_grant",
+                    "refresh token reuse detected",
+                )
+            }
+            RefreshPlan::PersistGraceFallback {
+                snapshot,
+                cache_entry,
+                access_token,
+                refresh_token,
+                access_ttl,
+                scopes,
+            } => {
+                let Ok(persisted) = self.persist_snapshot(snapshot).await else {
+                    return oauth_error(
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        "server_error",
+                        "failed to persist refreshed token",
+                    );
+                };
+                {
+                    let mut guard = self
+                        .inner
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner());
+                    guard.persisted = persisted;
+                    guard.insert_grace_cache(rt_hash, cache_entry);
+                }
+                token_success_reply(&access_token, access_ttl, Some(&refresh_token), &scopes)
+            }
+            RefreshPlan::PersistRotation {
+                snapshot,
+                cache_entry,
+                access_token,
+                refresh_token,
+                access_ttl,
+                scopes,
+            } => {
+                let Ok(persisted) = self.persist_snapshot(snapshot).await else {
+                    return oauth_error(
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        "server_error",
+                        "failed to persist rotated token",
+                    );
+                };
+                {
+                    let mut guard = self
+                        .inner
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner());
+                    guard.persisted = persisted;
+                    if let Some(entry) = cache_entry {
+                        guard.insert_grace_cache(rt_hash, entry);
+                    }
+                }
+                token_success_reply(&access_token, access_ttl, Some(&refresh_token), &scopes)
+            }
+        }
     }
 
     async fn handle_revoke(&self, req: Request<Incoming>) -> HttpReply {
@@ -1412,7 +1638,7 @@ impl OAuthEngine {
         let req_headers = req.headers().clone();
         let body = match read_limited_body(req).await {
             Ok(bytes) => bytes,
-            Err(reply) => return reply,
+            Err(err) => return body_error_json(err),
         };
         let Ok(form) = parse_unique_form(&body) else {
             return oauth_error(
@@ -1447,60 +1673,74 @@ impl OAuthEngine {
         }
 
         let token_hash = sha256_b64(raw_token);
+        let _persist_guard = self.persist_lock.lock().await;
         let now = unix_now();
 
-        let mut guard = self
-            .inner
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        guard.persisted.prune_expired(now);
-        guard.prune_ephemeral(now);
+        let planned = {
+            let mut guard = self
+                .inner
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            guard.persisted.prune_expired(now);
+            guard.prune_ephemeral(now);
 
-        let found_grant = guard
-            .persisted
-            .grants
-            .iter()
-            .find(|grant| {
-                grant
-                    .access_tokens
-                    .iter()
-                    .any(|at| constant_time_eq_str(&at.token_sha256, &token_hash))
-                    || grant
-                        .refresh_tokens
+            let found_grant = guard
+                .persisted
+                .grants
+                .iter()
+                .find(|grant| {
+                    grant
+                        .access_tokens
                         .iter()
-                        .any(|rt| constant_time_eq_str(&rt.token_sha256, &token_hash))
-            })
-            .map(|g| (g.grant_id.clone(), g.client_id.clone()));
+                        .any(|at| constant_time_eq_str(&at.token_sha256, &token_hash))
+                        || grant
+                            .refresh_tokens
+                            .iter()
+                            .any(|rt| constant_time_eq_str(&rt.token_sha256, &token_hash))
+                })
+                .map(|g| (g.grant_id.clone(), g.client_id.clone()));
 
-        let Some((grant_id, owner_client_id)) = found_grant else {
-            return empty_ok_reply();
+            let Some((grant_id, owner_client_id)) = found_grant else {
+                return empty_ok_reply();
+            };
+
+            if let Some(client) = authed_client {
+                if client.client_id != owner_client_id {
+                    return empty_ok_reply();
+                }
+            } else if let Some(owner_client) = guard
+                .persisted
+                .clients
+                .iter()
+                .find(|c| c.client_id == owner_client_id)
+                && owner_client.token_endpoint_auth_method != "none"
+            {
+                let basic = owner_client.token_endpoint_auth_method == "client_secret_basic";
+                return invalid_client_reply(basic, "client authentication required");
+            }
+
+            let mut snapshot = guard.persisted.clone();
+            snapshot.grants.retain(|g| g.grant_id != grant_id);
+            (grant_id, snapshot)
         };
 
-        if let Some(client) = authed_client {
-            if client.client_id != owner_client_id {
-                return empty_ok_reply();
-            }
-        } else if let Some(owner_client) = guard
-            .persisted
-            .clients
-            .iter()
-            .find(|c| c.client_id == owner_client_id)
-            && owner_client.token_endpoint_auth_method != "none"
-        {
-            let basic = owner_client.token_endpoint_auth_method == "client_secret_basic";
-            return invalid_client_reply(basic, "client authentication required");
-        }
-
-        let mut snapshot = guard.persisted.clone();
-        snapshot.grants.retain(|g| g.grant_id != grant_id);
-        if self.store.save(&snapshot).is_err() {
+        let (grant_id, snapshot) = planned;
+        let Ok(persisted) = self.persist_snapshot(snapshot).await else {
             return oauth_error(
                 StatusCode::INTERNAL_SERVER_ERROR,
                 "server_error",
                 "failed to persist grant revocation",
             );
+        };
+        {
+            let mut guard = self
+                .inner
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            guard.persisted = persisted;
+            guard.grace_cache.retain(|_, e| e.grant_id != grant_id);
         }
-        let _ = guard.revoke_grant_in_memory(&grant_id);
+        self.notify_revoke(&grant_id);
         empty_ok_reply()
     }
 
@@ -1771,6 +2011,22 @@ fn trim_rotated_refresh_history(grant: &mut GrantRecord) {
         let drop_at = grant.access_tokens.len() - MAX_ACCESS_TOKENS_PER_GRANT;
         grant.access_tokens.drain(0..drop_at);
     }
+    let active_count = grant
+        .refresh_tokens
+        .iter()
+        .filter(|rt| rt.grace_until.is_none())
+        .count();
+    if active_count > MAX_ACTIVE_REFRESH_PER_GRANT {
+        let mut excess_active = active_count - MAX_ACTIVE_REFRESH_PER_GRANT;
+        grant.refresh_tokens.retain(|rt| {
+            if excess_active > 0 && rt.grace_until.is_none() {
+                excess_active -= 1;
+                false
+            } else {
+                true
+            }
+        });
+    }
     let rotated_count = grant
         .refresh_tokens
         .iter()
@@ -1923,45 +2179,50 @@ fn decode_hex_nibble(b: u8) -> Result<u8, ()> {
     }
 }
 
-async fn read_limited_body(req: Request<Incoming>) -> Result<Bytes, HttpReply> {
-    if let Some(cl_val) = req.headers().get(header::CONTENT_LENGTH) {
-        let Ok(cl_str) = cl_val.to_str() else {
-            return Err(oauth_error(
-                StatusCode::BAD_REQUEST,
-                "invalid_request",
-                "invalid Content-Length header",
-            ));
-        };
-        let Ok(cl_len) = cl_str.trim_ascii().parse::<usize>() else {
-            return Err(oauth_error(
-                StatusCode::PAYLOAD_TOO_LARGE,
-                "invalid_request",
-                "request body exceeds 64 KiB limit",
-            ));
-        };
-        if cl_len > MAX_POST_BODY_BYTES {
-            return Err(oauth_error(
-                StatusCode::PAYLOAD_TOO_LARGE,
-                "invalid_request",
-                "request body exceeds 64 KiB limit",
-            ));
-        }
+enum BodyReadError {
+    InvalidContentLength,
+    TooLarge,
+    ReadFailed,
+    Timeout,
+}
+
+async fn read_limited_body(req: Request<Incoming>) -> Result<Bytes, BodyReadError> {
+    match check_content_length_limit(req.headers(), MAX_POST_BODY_BYTES as u64) {
+        ContentLengthCheck::Ok => {}
+        ContentLengthCheck::Invalid => return Err(BodyReadError::InvalidContentLength),
+        ContentLengthCheck::TooLarge => return Err(BodyReadError::TooLarge),
+    }
+    if req.body().size_hint().lower() > MAX_POST_BODY_BYTES as u64 {
+        return Err(BodyReadError::TooLarge);
     }
 
     let limited = Limited::new(req.into_body(), MAX_POST_BODY_BYTES);
     match tokio::time::timeout(OAUTH_BODY_TIMEOUT, limited.collect()).await {
         Ok(Ok(collected)) => Ok(collected.to_bytes()),
-        Ok(Err(err)) if err.is::<LengthLimitError>() => Err(oauth_error(
+        Ok(Err(err)) if err.is::<LengthLimitError>() => Err(BodyReadError::TooLarge),
+        Ok(Err(_)) => Err(BodyReadError::ReadFailed),
+        Err(_) => Err(BodyReadError::Timeout),
+    }
+}
+
+fn body_error_json(err: BodyReadError) -> HttpReply {
+    match err {
+        BodyReadError::InvalidContentLength => oauth_error(
+            StatusCode::BAD_REQUEST,
+            "invalid_request",
+            "invalid Content-Length header",
+        ),
+        BodyReadError::TooLarge => oauth_error(
             StatusCode::PAYLOAD_TOO_LARGE,
             "invalid_request",
             "request body exceeds 64 KiB limit",
-        )),
-        Ok(Err(_)) => Err(oauth_error(
+        ),
+        BodyReadError::ReadFailed => oauth_error(
             StatusCode::BAD_REQUEST,
             "invalid_request",
             "failed to read request body",
-        )),
-        Err(_) => {
+        ),
+        BodyReadError::Timeout => {
             let mut reply = oauth_error(
                 StatusCode::REQUEST_TIMEOUT,
                 "invalid_request",
@@ -1971,7 +2232,33 @@ async fn read_limited_body(req: Request<Incoming>) -> Result<Bytes, HttpReply> {
                 header::CONNECTION,
                 header::HeaderValue::from_static("close"),
             );
-            Err(reply)
+            reply
+        }
+    }
+}
+
+fn body_error_html(err: BodyReadError) -> HttpReply {
+    match err {
+        BodyReadError::InvalidContentLength => {
+            html_status_reply(StatusCode::BAD_REQUEST, "Invalid Content-Length header")
+        }
+        BodyReadError::TooLarge => html_status_reply(
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "Request body exceeds 64 KiB limit",
+        ),
+        BodyReadError::ReadFailed => {
+            html_status_reply(StatusCode::BAD_REQUEST, "Failed to read request body")
+        }
+        BodyReadError::Timeout => {
+            let mut reply = html_status_reply(
+                StatusCode::REQUEST_TIMEOUT,
+                "OAuth request body read timed out",
+            );
+            reply.headers_mut().insert(
+                header::CONNECTION,
+                header::HeaderValue::from_static("close"),
+            );
+            reply
         }
     }
 }

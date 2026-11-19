@@ -9,11 +9,19 @@ const MAX_PBKDF2_ITERATIONS: u32 = 5_000_000;
 const SALT_LEN: usize = 16;
 const KEY_LEN: usize = 32;
 
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct PasswordVerifier {
     iterations: u32,
     salt: [u8; SALT_LEN],
     expected: [u8; KEY_LEN],
+}
+
+impl std::fmt::Debug for PasswordVerifier {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PasswordVerifier")
+            .field("iterations", &self.iterations)
+            .finish_non_exhaustive()
+    }
 }
 
 impl PasswordVerifier {
