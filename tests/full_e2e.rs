@@ -1041,18 +1041,18 @@ async fn e2e_stdio_grant_isolation_revocation_process_reap_and_cli_smoke() {
     )
     .await;
     assert_eq!(after_rev_st, StatusCode::UNAUTHORIZED);
-
-    // 5. Trigger shutdown.cancel() and verify entire child process group is reaped
-    gw_shutdown.cancel();
-    gw_handle.await.unwrap().unwrap();
     assert!(
         wait_process_gone(pid_1).await,
-        "stdio session leader must be reaped"
+        "revoking Grant 1 must immediately terminate its stdio session leader"
     );
     assert!(
         wait_process_gone(grandchild_1).await,
-        "stdio background grandchild in process group must be reaped"
+        "revoking Grant 1 must immediately reap its background grandchild"
     );
+
+    // 5. Trigger shutdown.cancel() and verify clean gateway exit
+    gw_shutdown.cancel();
+    gw_handle.await.unwrap().unwrap();
 
     // 6. CLI subcommand smoke tests (hash-password, check --config, and examples/*.json validation)
     let bin = env!("CARGO_BIN_EXE_oauth2-mcp-gateway");

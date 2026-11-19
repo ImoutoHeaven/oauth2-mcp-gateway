@@ -82,7 +82,6 @@ pub async fn serve_with_listener(
     config: Arc<GatewayConfig>,
     shutdown: CancellationToken,
 ) -> Result<(), String> {
-    let oauth = OAuthEngine::open(Arc::clone(&config))?;
     let upstream = match &config.upstream {
         UpstreamSettings::Http(settings) => {
             UpstreamRuntime::Http(Arc::new(HttpUpstream::new(settings.clone())?))
@@ -90,6 +89,23 @@ pub async fn serve_with_listener(
         UpstreamSettings::Stdio(settings) => {
             UpstreamRuntime::Stdio(Arc::new(StdioUpstream::new(settings.clone())?))
         }
+    };
+    let oauth = match &upstream {
+        UpstreamRuntime::Stdio(stdio) => {
+            let stdio_ref = Arc::clone(stdio);
+            let handle = tokio::runtime::Handle::current();
+            OAuthEngine::open_with_revoke_hook(
+                Arc::clone(&config),
+                Arc::new(move |grant_id| {
+                    let stdio_inner = Arc::clone(&stdio_ref);
+                    let gid = grant_id.to_owned();
+                    handle.spawn(async move {
+                        stdio_inner.terminate_grant(&gid).await;
+                    });
+                }),
+            )?
+        }
+        UpstreamRuntime::Http(_) => OAuthEngine::open(Arc::clone(&config))?,
     };
 
     let public_url: Arc<str> = Arc::from(config.public_url.as_str());
