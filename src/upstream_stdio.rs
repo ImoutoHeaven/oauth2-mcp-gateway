@@ -29,6 +29,7 @@ use tokio_util::sync::CancellationToken;
 const BODY_READ_TIMEOUT: Duration = Duration::from_secs(30);
 const INIT_TIMEOUT: Duration = Duration::from_secs(30);
 const STDIN_GRACE_WAIT: Duration = Duration::from_millis(200);
+#[cfg(unix)]
 const SIGTERM_WAIT: Duration = Duration::from_secs(2);
 const STDIN_CHANNEL_CAPACITY: usize = 64;
 const NOTIF_CHANNEL_CAPACITY: usize = 256;
