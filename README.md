@@ -14,7 +14,7 @@ Out of scope by design:
 
 - No TLS or ACME certificate termination. Terminate HTTPS at your reverse proxy or tunnel.
 - No multi-domain or multi-path routing across multiple MCP backends. Run one sidecar per upstream MCP service.
-- No web dashboard, external OIDC login provider, or SQL database. State lives in one `0600` JSON file updated via `fsync` and atomic rename.
+- No web dashboard, external OIDC login provider, or SQL database. State lives in one JSON file (mode `0600` on Unix) updated via `fsync` and atomic rename.
 - No MCP tool filtering, tool renaming, or JSON Schema rewriting. JSON-RPC payloads pass through untouched.
 
 ## Quick start
@@ -49,7 +49,7 @@ export UPSTREAM_BEARER_TOKEN_2='upstream-token-b'
 ./target/release/oauth2-mcp-gateway serve --config gateway.json
 ```
 
-`OAUTH2_MCP_GATEWAY_CONFIG` sets the default `--config` path when the flag is omitted. `SIGINT` and `SIGTERM` drain active HTTP connections and terminate managed `stdio` process groups before exit.
+`OAUTH2_MCP_GATEWAY_CONFIG` sets the default `--config` path when the flag is omitted. `SIGINT` and `SIGTERM` drain active HTTP connections and terminate managed `stdio` child process trees before exit.
 
 ## Configuration
 
@@ -62,7 +62,7 @@ Unknown JSON fields fail startup. Any string field set to `"${VAR}"` (except ent
 | `listen` | yes | Local `IP:PORT` socket address to bind, such as `"127.0.0.1:8080"`. |
 | `public_url` | yes | External origin without path, query, fragment, or userinfo, such as `"https://mcp.example.com"`. Plain `http://` is allowed only on `localhost`, `127.0.0.1`, and `[::1]`. |
 | `resource_path` | no | Public MCP path. Defaults to `/mcp`. Use an absolute path with nonempty segments made of ASCII letters, digits, or `-._~`. Dot and dot-dot segments, reserved gateway namespaces and configured passthrough prefix overlaps are rejected. |
-| `state_path` | yes | File path for persisted OAuth clients and hashed token grants. Created with mode `0600`. |
+| `state_path` | yes | File path for persisted OAuth clients and hashed token grants. Created with mode `0600` on Unix. |
 | `oauth` | yes | OAuth 2.1 owner credential and token lifetime settings. |
 | `upstream` | yes | Upstream MCP bridge configuration (`"transport": "http"` or `"transport": "stdio"`). |
 
@@ -99,7 +99,7 @@ Provide either `owner_password_hash` or `owner_password`. Setting both fails sta
 | `env` | `{}` | Environment overrides passed to the child process (values support `"${VAR}"`). |
 | `cwd` | none | Optional working directory for the child process. |
 | `max_sessions` | `32` | Maximum concurrent `stdio` sessions (`1..=256`). Returns `503` when full. |
-| `session_idle_secs` | `1800` | Idle timeout in seconds (`30..=86400`) before an inactive session process group is terminated. |
+| `session_idle_secs` | `1800` | Idle timeout in seconds (`30..=86400`) before an inactive session process tree is terminated. |
 
 ## Nginx reverse proxy example
 
@@ -132,24 +132,25 @@ server {
 }
 ```
 
-To publish the gateway at `https://mcp.example.com/oauth2`, set `"resource_path": "/oauth2"` and proxy that exact path to the gateway at `/mcp`. Forward `/.well-known/oauth-protected-resource/oauth2`, `/.well-known/oauth-authorization-server` and `/oauth/` requests to the gateway with their paths intact. OAuth clients should connect to the public path. When the public resource URL changes, clients must authorize again.
+To publish the gateway at `https://mcp.example.com/oauth2`, set `"resource_path": "/oauth2"` and proxy that exact path to the gateway at `/mcp`. Forward `/.well-known/oauth-protected-resource/oauth2`, `/.well-known/oauth-authorization-server`, `/.well-known/oauth-authorization-server/oauth2`, and `/oauth/` requests to the gateway with their paths intact. OAuth clients should connect to the public path. When the public resource URL changes, clients must authorize again.
 
 ## Protocol behavior
 
 ### OAuth 2.1 endpoints
 
 - `GET /.well-known/oauth-protected-resource` and `GET /.well-known/oauth-protected-resource<resource_path>` (RFC 9728): advertise `resource: "<public_url><resource_path>"` and `authorization_servers: ["<public_url>"]`. Unauthenticated `/mcp` requests return `401` with `WWW-Authenticate: Bearer resource_metadata="<public_url>/.well-known/oauth-protected-resource<resource_path>"`.
-- `GET /.well-known/oauth-authorization-server` (RFC 8414): advertises endpoints, `code_challenge_methods_supported: ["S256"]`, and `authorization_response_iss_parameter_supported: true`.
+- `GET /.well-known/oauth-authorization-server` and `GET /.well-known/oauth-authorization-server<resource_path>` (RFC 8414): follow the configured `resource_path` and advertise endpoints, `code_challenge_methods_supported: ["S256"]`, and `authorization_response_iss_parameter_supported: true`.
 - `POST /oauth/register` (RFC 7591): registers public (`none`) or confidential (`client_secret_post`, `client_secret_basic`) clients. Client secrets and issued tokens are stored only as SHA-256 digests.
 - `GET /oauth/authorize` and `POST /oauth/authorize`: enforces PKCE `S256` for all clients, binds the login form with an `HttpOnly; SameSite=Lax` `mcp_ar_<id>` CSRF cookie and strict `Content-Security-Policy`, throttles failed password attempts (10 failures per 15 minutes), and returns `code`, `iss` (RFC 9207), and `state` to the verified callback. Browser form submissions get a page that navigates to the callback without forwarding the password. Other clients receive `303 See Other`.
-- `POST /oauth/token`: exchanges single-use authorization codes and rotates refresh tokens. During `refresh_grace_secs` after a refresh token `R0` rotates to `(A1, R1)`, concurrent refresh requests presenting `R0` can reuse `(A1, R1)` while the cached scope matches the current grant. If the grant has changed or the cache was lost, the gateway can issue a sibling pair under the current scope. Presenting `R0` after `refresh_grace_secs` expires triggers RFC 9700 reuse detection and revokes the entire grant.
-- `POST /oauth/revoke` (RFC 7009): revokes the grant owning the submitted access or refresh token.
+- `POST /oauth/token`: exchanges single-use authorization codes and rotates refresh tokens. During `refresh_grace_secs` after a refresh token `R0` rotates to `(A1, R1)`, concurrent refresh requests presenting `R0` can reuse `(A1, R1)` while the cached scope matches the current grant. If the grant has changed or the cache was lost, the gateway can issue a sibling pair under the current scope. Presenting `R0` after `refresh_grace_secs` expires triggers RFC 9700 reuse detection, revokes the entire grant, and terminates any bound `stdio` sessions.
+- `POST /oauth/revoke` (RFC 7009): revokes the grant owning the submitted access or refresh token and immediately terminates any active `stdio` sessions bound to that grant.
 - `GET /healthz`: unauthenticated liveness check returning `{"ok":true}`.
 
 ### MCP Streamable HTTP bridging
 
-- HTTP upstream mode enforces a `16 MiB` limit on `/mcp` JSON-RPC request bodies, strips hop-by-hop headers and client OAuth tokens, sets `X-Accel-Buffering: no`, and strips leading `text/event-stream` blocks that carry no `data:` line (such as bare `retry:` or comment keepalives) before forwarding the event stream. Requests matching `passthrough_prefixes` reject path traversal (`..`, backslashes, NUL bytes, and percent-encoded dot segments) and stream `GET`, `HEAD`, and `PUT` without body size limits.
-- Stdio upstream mode spawns a dedicated child process in its own Unix process group (`setsid`) on `initialize`, returns a `Mcp-Session-Id` bound to the caller's OAuth `grant_id`, and rejects cross-grant `POST` or `DELETE` attempts on that session ID with `404`. In-flight `POST /mcp` calls stream matching `notifications/progress` events and the final JSON-RPC response as `text/event-stream` without empty priming frames, and send `notifications/cancelled` to the child if the HTTP client disconnects early. Inline sessionless requests carrying `MCP-Protocol-Version: 2026-07-28` or `_meta["io.modelcontextprotocol/protocolVersion"] = "2026-07-28"` run on an ephemeral initialized subprocess that is reaped immediately after the response completes.
+- Origin checks: when a request includes an `Origin` header, the gateway validates it against `public_url` and rejects mismatched browser origins. Non-browser clients that omit `Origin` are allowed.
+- HTTP upstream mode enforces a `16 MiB` limit on `/mcp` JSON-RPC request bodies, strips hop-by-hop headers, client OAuth tokens, and `Cookie`/`Set-Cookie` headers across the upstream boundary, sets `X-Accel-Buffering: no`, and strips leading `text/event-stream` blocks that carry no `data:` line (such as bare `retry:` or comment keepalives) before forwarding the event stream. Requests matching `passthrough_prefixes` reject path traversal (`..`, backslashes, NUL bytes, and percent-encoded dot segments), strip `Cookie`/`Set-Cookie`, and stream `GET`, `HEAD`, and `PUT` without body size limits.
+- Stdio upstream mode spawns a dedicated child process on `initialize` (in its own `setsid` process group on Unix, or inside a Job Object on Windows so the full child tree terminates on close), returns a `Mcp-Session-Id` bound to the caller's OAuth `grant_id`, and rejects cross-grant `POST` or `DELETE` attempts on that session ID with `404`. Revoking a grant immediately terminates all active `stdio` sessions bound to it. In-flight `POST /mcp` calls stream matching `notifications/progress` events and the final JSON-RPC response as `text/event-stream` without empty priming frames, and send `notifications/cancelled` to the child if the HTTP client disconnects early. Sessionless requests carrying `MCP-Protocol-Version: 2026-07-28` or `_meta["io.modelcontextprotocol/protocolVersion"] = "2026-07-28"` run on an ephemeral initialized subprocess, stream SSE events live as they arrive, and reap the child once the response completes.
 
 ## License
 
