@@ -1,12 +1,16 @@
+mod common;
+
 use bytes::Bytes;
+use common::{
+    TestClient, channel_body, make_client, process_exists, python_executable, wait_process_gone,
+};
 use http::{HeaderMap, Method, Request, Response, StatusCode, header};
 use http_body::Frame;
 use http_body_util::BodyExt;
 use hyper::body::Incoming;
 use hyper::server::conn::http1;
 use hyper::service::service_fn;
-use hyper_util::client::legacy::{Client, connect::HttpConnector};
-use hyper_util::rt::{TokioExecutor, TokioIo};
+use hyper_util::rt::TokioIo;
 use oauth2_mcp_gateway::config::GatewayConfig;
 use oauth2_mcp_gateway::crypto::{PasswordVerifier, sha256_b64};
 use oauth2_mcp_gateway::server;
@@ -14,50 +18,20 @@ use oauth2_mcp_gateway::types::{HttpReply, ReplyBody, bytes_body, empty_body};
 use serde_json::{Value, json};
 use std::collections::BTreeMap;
 use std::convert::Infallible;
-use std::io::{self, Write};
+use std::io::Write;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
-use std::pin::Pin;
 use std::process::{Command, Stdio};
 use std::sync::{Arc, Mutex};
-use std::task::{Context, Poll};
 use std::time::Duration;
 use tempfile::TempDir;
 use tokio::net::TcpListener;
-use tokio::sync::{Barrier, mpsc};
+use tokio::sync::Barrier;
 use tokio_util::sync::CancellationToken;
 use url::Url;
 
 const OWNER_PASSWORD: &str = "e2e-owner-correct-horse-staple-42";
 const PUBLIC_URL: &str = "https://mcp.example.com";
-
-type TestClient = Client<HttpConnector, ReplyBody>;
-type FrameSender = mpsc::Sender<Result<Frame<Bytes>, io::Error>>;
-
-struct ReceiverBody {
-    rx: mpsc::Receiver<Result<Frame<Bytes>, io::Error>>,
-}
-
-impl http_body::Body for ReceiverBody {
-    type Data = Bytes;
-    type Error = io::Error;
-
-    fn poll_frame(
-        mut self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-    ) -> Poll<Option<Result<Frame<Self::Data>, Self::Error>>> {
-        self.rx.poll_recv(cx)
-    }
-}
-
-fn channel_body(buffer: usize) -> (FrameSender, ReplyBody) {
-    let (tx, rx) = mpsc::channel(buffer);
-    (tx, ReceiverBody { rx }.boxed())
-}
-
-fn make_client() -> TestClient {
-    Client::builder(TokioExecutor::new()).build_http()
-}
 
 fn form_encode(pairs: &[(&str, &str)]) -> String {
     let mut ser = form_urlencoded::Serializer::new(String::new());
@@ -299,24 +273,19 @@ fn fast_owner_hash() -> String {
         .encode()
 }
 
-fn process_exists(pid: i32) -> bool {
-    let status_path = format!("/proc/{pid}/status");
-    if let Ok(content) = std::fs::read_to_string(&status_path)
-        && content.lines().any(|l| l.starts_with("State:\tZ"))
-    {
-        return false;
-    }
-    unsafe { libc::kill(pid, 0) == 0 }
-}
-
 fn write_stdio_e2e_script(dir: &Path) -> PathBuf {
     let script_path = dir.join("e2e_stdio_mcp.py");
-    let script = r#"import json, os, signal, subprocess, sys, time
+    let script = r#"import json, os, subprocess, sys, time
 
 pid = os.getpid()
-pgid = os.getpgrp()
+pgid = pid if sys.platform == "win32" else os.getpgrp()
+bg_code = (
+    "import time; time.sleep(120)"
+    if sys.platform == "win32"
+    else "import signal, time; signal.signal(signal.SIGHUP, signal.SIG_IGN); time.sleep(120)"
+)
 bg = subprocess.Popen(
-    [sys.executable, "-c", "import signal, time; signal.signal(signal.SIGHUP, signal.SIG_IGN); time.sleep(120)"],
+    [sys.executable, "-c", bg_code],
     stdin=subprocess.DEVNULL,
     stdout=subprocess.DEVNULL,
     stderr=subprocess.DEVNULL,
@@ -885,7 +854,7 @@ async fn e2e_stdio_grant_isolation_revocation_process_reap_and_cli_smoke() {
         },
         "upstream": {
             "transport": "stdio",
-            "command": "python3",
+            "command": python_executable(),
             "args": ["-u", script_path.to_string_lossy()],
             "max_sessions": 8,
             "session_idle_secs": 120,
@@ -947,11 +916,11 @@ async fn e2e_stdio_grant_isolation_revocation_process_reap_and_cli_smoke() {
         .unwrap()
         .to_owned();
     let init_val = parse_json(&init_body);
-    let pid_1 = init_val["result"]["_meta"]["pid"].as_i64().unwrap() as i32;
-    let pgid_1 = init_val["result"]["_meta"]["pgid"].as_i64().unwrap() as i32;
+    let pid_1 = init_val["result"]["_meta"]["pid"].as_u64().unwrap() as u32;
+    let pgid_1 = init_val["result"]["_meta"]["pgid"].as_u64().unwrap() as u32;
     let grandchild_1 = init_val["result"]["_meta"]["grandchild_pid"]
-        .as_i64()
-        .unwrap() as i32;
+        .as_u64()
+        .unwrap() as u32;
     assert_eq!(pid_1, pgid_1);
     assert!(process_exists(pid_1));
     assert!(process_exists(grandchild_1));
@@ -1077,11 +1046,11 @@ async fn e2e_stdio_grant_isolation_revocation_process_reap_and_cli_smoke() {
     gw_shutdown.cancel();
     gw_handle.await.unwrap().unwrap();
     assert!(
-        !process_exists(pid_1),
+        wait_process_gone(pid_1).await,
         "stdio session leader must be reaped"
     );
     assert!(
-        !process_exists(grandchild_1),
+        wait_process_gone(grandchild_1).await,
         "stdio background grandchild in process group must be reaped"
     );
 
