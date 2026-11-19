@@ -672,12 +672,22 @@ async fn http_mcp_rejects_oversized_payload_with_413() {
 
     let client = make_client();
     let (tx, chunked_body) = channel_body(4);
+    let (done_tx, done_rx) = tokio::sync::oneshot::channel::<()>();
     tokio::spawn(async move {
         let block = Bytes::from(vec![b'a'; 1024 * 1024]);
-        for _ in 0..17 {
+        for _ in 0..16 {
             if tx.send(Ok(Frame::data(block.clone()))).await.is_err() {
-                break;
+                return;
             }
+        }
+        // Push 1 byte past MAX_MCP_BODY_BYTES and hold tx open so Windows Winsock
+        // does not race a trailing chunk terminator against the server's 413 close.
+        if tx
+            .send(Ok(Frame::data(Bytes::from_static(b"x"))))
+            .await
+            .is_ok()
+        {
+            let _ = done_rx.await;
         }
     });
     let chunked_req = Request::builder()
@@ -687,6 +697,7 @@ async fn http_mcp_rejects_oversized_payload_with_413() {
         .body(chunked_body)
         .unwrap();
     let chunked_resp = client.request(chunked_req).await.unwrap();
+    let _ = done_tx.send(());
     assert_eq!(chunked_resp.status(), StatusCode::PAYLOAD_TOO_LARGE);
     assert_eq!(upstream_hits.load(Ordering::SeqCst), 0);
 
