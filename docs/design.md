@@ -28,7 +28,7 @@ Top-level fields:
 - `listen`: local socket address to bind, such as `"127.0.0.1:8080"`.
 - `public_url`: canonical external origin without path, query, fragment, or userinfo, such as `"https://mcp.example.com"`. Plain `http://` is accepted only when the host is `localhost`, `127.0.0.1`, or `[::1]`.
 - `resource_path`: optional public MCP path, default `/mcp`. The proxy maps this path to the gateway’s `/mcp` route and forwards the public discovery paths unchanged.
-- `state_path`: regular file path for persisted OAuth clients and hashed token grants (created with mode `0600`, updated via sibling temporary file `fsync` and atomic `rename`).
+- `state_path`: regular file path for persisted OAuth clients and hashed token grants (created with mode `0600` on Unix, updated via sibling temporary file `fsync` and atomic `rename`).
 - `oauth`: owner credential and token lifetimes.
 - `upstream`: tagged union (`"transport": "http"` or `"transport": "stdio"`).
 
@@ -63,8 +63,8 @@ The gateway exposes six OAuth routes:
 1. `GET /.well-known/oauth-protected-resource` and `GET /.well-known/oauth-protected-resource/{*path}` (RFC 9728):
    - Root metadata reports `resource: "<public_url><resource_path>"` and `authorization_servers: ["<public_url>"]`.
    - Path-scoped metadata `/.well-known/oauth-protected-resource<resource_path>` reports `resource: "<public_url><resource_path>"` so clients that resolve path-relative metadata (including Claude.ai Web) match exact resource identifiers.
-2. `GET /.well-known/oauth-authorization-server` and `GET /.well-known/oauth-authorization-server/{*path}` (RFC 8414):
-   - Publishes `issuer: "<public_url>"`, `authorization_endpoint`, `token_endpoint`, `registration_endpoint`, `revocation_endpoint`, `response_types_supported: ["code"]`, `grant_types_supported: ["authorization_code", "refresh_token"]`, `token_endpoint_auth_methods_supported: ["none", "client_secret_post", "client_secret_basic"]`, `code_challenge_methods_supported: ["S256"]`, and `authorization_response_iss_parameter_supported: true`.
+2. `GET /.well-known/oauth-authorization-server` and `GET /.well-known/oauth-authorization-server<resource_path>` (RFC 8414):
+   - Follows the configured `resource_path` (returning `404` for other subpaths) and publishes `issuer: "<public_url>"`, `authorization_endpoint`, `token_endpoint`, `registration_endpoint`, `revocation_endpoint`, `response_types_supported: ["code"]`, `grant_types_supported: ["authorization_code", "refresh_token"]`, `token_endpoint_auth_methods_supported: ["none", "client_secret_post", "client_secret_basic"]`, `code_challenge_methods_supported: ["S256"]`, and `authorization_response_iss_parameter_supported: true`.
 3. `POST /oauth/register` (RFC 7591):
    - Validates every `redirect_uri`. Rejects relative URLs, fragments, userinfo, OAuth response query keys, non-loopback `http://`, and hosts outside `allowed_redirect_hosts` when configured.
    - Applies RFC 7591 defaults when omitted (`grant_types: ["authorization_code", "refresh_token"]`, `response_types: ["code"]`, `token_endpoint_auth_method: "none"`). Issues a random `client_secret` (storing only its SHA-256 hash) when `token_endpoint_auth_method` is `client_secret_post` or `client_secret_basic`.
@@ -81,24 +81,26 @@ The gateway exposes six OAuth routes:
    - `refresh_token`: supports concurrent multi-agent refresh bursts without weakening theft detection:
      - First exchange of refresh token `R0` at time `t0` atomically marks `R0` rotated with `grace_until = min(R0.expires_at, t0 + refresh_grace_secs)`, mints `(A1, R1)` under the same `grant_id` and `pool_slot`, and caches the serialized token response in memory keyed by `hash(R0)` until `grace_until`.
      - Retries within the grace window validate the client, resource, and current scope. They return the cached pair when its scope matches the current grant, regardless of scope order. Otherwise they mint a sibling pair without extending the grace window or the grant’s refresh ceiling.
-     - Any presentation of `R0` after `grace_until` triggers RFC 9700 reuse detection and revokes the entire `grant_id` (invalidating `A1`, `R1`, and all tokens in that grant).
+     - Any presentation of `R0` after `grace_until` triggers RFC 9700 reuse detection, revokes the entire `grant_id` (invalidating `A1`, `R1`, and all tokens in that grant), and immediately terminates any active `stdio` sessions bound to that grant.
 6. `POST /oauth/revoke` (RFC 7009):
-   - Authenticates confidential clients and revokes the matching grant if found, returning `200 OK`.
+   - Authenticates confidential clients, revokes the matching grant if found, immediately terminates any active `stdio` sessions bound to that grant, and returns `200 OK`.
 
 OAuth POST requests have a 64 KiB body limit and a 10-second body read deadline. Changing the public resource URL requires clients to authorize again. A retry of an already rotated refresh token within its grace period cannot narrow the current scope.
 
 ## 4. Upstream transport semantics
 
+When an `Origin` header is present on `/mcp` (both HTTP and `stdio` upstreams) or `/oauth/*` requests, the gateway validates it against `public_url` and rejects disallowed browser origins with `403 Forbidden`; non-browser clients omitting `Origin` are permitted.
+
 ### 4.1 HTTP upstream (`src/upstream_http.rs`)
 
 - Unauthenticated `/mcp` requests receive `401 Unauthorized` with `WWW-Authenticate: Bearer resource_metadata="<public_url>/.well-known/oauth-protected-resource<resource_path>"` and `Connection: close` before reading the request body.
-- Authenticated `/mcp` requests enforce a `16 MiB` JSON-RPC request body limit, remove hop-by-hop headers and incoming `Authorization`, inject `Authorization: Bearer <bearer_tokens[grant.pool_slot]>` (when `bearer_tokens` is non-empty), set `X-Forwarded-Proto` from `public_url`, and stream the upstream response with `X-Accel-Buffering: no`.
+- Authenticated `/mcp` requests enforce a `16 MiB` JSON-RPC request body limit, strip hop-by-hop headers, incoming `Authorization`, and `Cookie` on the forwarded request, strip `Set-Cookie` on the upstream response, inject `Authorization: Bearer <bearer_tokens[grant.pool_slot]>` (when `bearer_tokens` is non-empty), set `X-Forwarded-Proto` from `public_url`, and stream the upstream response with `X-Accel-Buffering: no`.
 - When upstream responds with `Content-Type: text/event-stream`, the stream filter drops leading SSE blocks that contain no `data:` field (such as bare `retry:` or priming comment blocks) before the first JSON-RPC event, preventing Gemini Web connectors from failing on empty initial SSE events. All subsequent frames stream through unchanged.
-- Requests matching `passthrough_prefixes` verify path safety (rejecting `..`, `\`, NUL, and percent-encoded dot segments regardless of case), strip any incoming `Authorization`, and stream `GET`, `HEAD`, and `PUT` bodies directly in both directions with no body size cap and no memory buffering.
+- Requests matching `passthrough_prefixes` verify path safety (rejecting `..`, `\`, NUL, and percent-encoded dot segments regardless of case), strip any incoming `Authorization` and `Cookie` headers as well as upstream `Set-Cookie` headers, and stream `GET`, `HEAD`, and `PUT` bodies directly in both directions with no body size cap and no memory buffering.
 
 ### 4.2 Stdio upstream (`src/upstream_stdio.rs`)
 
-- Each `initialize` request without `Mcp-Session-Id` spawns an isolated child process in its own Unix process group (`setsid`), forwards `initialize`, returns the upstream response verbatim with a newly generated `Mcp-Session-Id` header, and retains the live child under that session ID.
+- Each `initialize` request without `Mcp-Session-Id` spawns an isolated child process (in its own `setsid` process group on Unix, or assigned to a Job Object on Windows to terminate the child process tree on close), forwards `initialize`, returns the upstream response verbatim with a newly generated `Mcp-Session-Id` header, and retains the live child under that session ID.
 - Subsequent `POST /mcp` requests carrying `Mcp-Session-Id` route JSON-RPC requests and notifications to that session's child stdin as single-line JSON. While a request is in flight, server-initiated notifications targeting that request (such as `notifications/progress`) and matching JSON-RPC responses stream out as `text/event-stream` `data: <json>\n\n` events (with no empty priming frame). If the HTTP client disconnects before the response arrives, the gateway writes `notifications/cancelled` for that request ID to the child.
-- Inline sessionless requests carrying `_meta["io.modelcontextprotocol/protocolVersion"]` (MCP `2026-07-28`) without `Mcp-Session-Id` run against an ephemeral initialized child process and close it after the response completes.
-- `DELETE /mcp` with `Mcp-Session-Id`, idle session expiry (`session_idle_secs`), or gateway shutdown closes child stdin, sends `SIGTERM` to the child's process group after `200 ms`, escalates to `SIGKILL` after `2 s`, and reaps the child.
+- Sessionless requests carrying `MCP-Protocol-Version: 2026-07-28` or `_meta["io.modelcontextprotocol/protocolVersion"] = "2026-07-28"` without `Mcp-Session-Id` run on an ephemeral initialized child process, stream matching notifications and the final JSON-RPC response live as `text/event-stream`, and terminate the child as soon as the response completes.
+- `DELETE /mcp` with `Mcp-Session-Id`, grant revocation (via `POST /oauth/revoke` or refresh-token reuse detection), idle session expiry (`session_idle_secs`), or gateway shutdown terminates the session immediately: on Unix it closes child stdin, sends `SIGTERM` to the child's process group after `200 ms`, escalates to `SIGKILL` after `2 s`, and reaps the child; on Windows it closes the Job Object to terminate the child process tree.
