@@ -1,20 +1,22 @@
 use base64::Engine;
-use base64::engine::general_purpose::STANDARD;
+use base64::engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD};
 use bytes::Bytes;
 use http::{HeaderMap, HeaderValue, Method, Request, StatusCode, header};
 use http_body::Frame;
 use http_body_util::{BodyExt, Full, combinators::BoxBody};
 use hyper_util::rt::TokioIo;
 use oauth2_mcp_gateway::config::GatewayConfig;
-use oauth2_mcp_gateway::crypto::{PasswordVerifier, sha256_b64};
+use oauth2_mcp_gateway::crypto::{PasswordVerifier, hmac_sha256, sha256_b64};
 use oauth2_mcp_gateway::oauth::OAuthEngine;
 use oauth2_mcp_gateway::store::{
-    AccessTokenRecord, GrantRecord, PersistedState, RefreshTokenRecord, STATE_VERSION, unix_now,
+    AccessTokenRecord, GraceRefreshRecord, GrantRecord, PersistedState, RefreshTokenRecord,
+    STATE_VERSION, unix_now,
 };
 use oauth2_mcp_gateway::types::AuthChallenge;
 use serde_json::{Value, json};
 use std::collections::BTreeMap;
 use std::convert::Infallible;
+use std::net::IpAddr;
 use std::path::Path;
 use std::pin::Pin;
 use std::sync::Arc;
@@ -33,6 +35,7 @@ struct TestOpts<'a> {
     scopes: &'a [&'a str],
     bearer_tokens: &'a [&'a str],
     refresh_grace_secs: u64,
+    refresh_reuse_policy: &'a str,
     max_registered_clients: usize,
 }
 
@@ -44,7 +47,8 @@ impl Default for TestOpts<'_> {
             allowed_hosts: &[],
             scopes: &["mcp", "files"],
             bearer_tokens: &["up-slot-0"],
-            refresh_grace_secs: 120,
+            refresh_grace_secs: 3600,
+            refresh_reuse_policy: "converge",
             max_registered_clients: 16,
         }
     }
@@ -65,6 +69,7 @@ fn build_config(dir: &Path, opts: &TestOpts<'_>) -> Arc<GatewayConfig> {
             "access_token_ttl_secs": 3600,
             "refresh_token_ttl_secs": 86400,
             "refresh_grace_secs": opts.refresh_grace_secs,
+            "refresh_reuse_policy": opts.refresh_reuse_policy,
             "max_registered_clients": opts.max_registered_clients,
         },
         "upstream": {
@@ -81,15 +86,19 @@ fn build_config(dir: &Path, opts: &TestOpts<'_>) -> Arc<GatewayConfig> {
     )
 }
 
-async fn dispatch_box_body(
+async fn dispatch_box_body_with_ip(
     engine: &Arc<OAuthEngine>,
+    peer_ip: Option<IpAddr>,
     req: Request<BoxBody<Bytes, Infallible>>,
 ) -> (StatusCode, HeaderMap, Bytes) {
     let (client_io, server_io) = tokio::io::duplex(256 * 1024);
     let eng = Arc::clone(engine);
     let srv_task = tokio::spawn(async move {
-        let svc = hyper::service::service_fn(move |incoming| {
+        let svc = hyper::service::service_fn(move |mut incoming| {
             let eng = Arc::clone(&eng);
+            if let Some(ip) = peer_ip {
+                incoming.extensions_mut().insert(ip);
+            }
             async move { Ok::<_, Infallible>(eng.handle(incoming).await) }
         });
         let _ = hyper::server::conn::http1::Builder::new()
@@ -120,8 +129,16 @@ async fn dispatch_box_body(
     (status, headers, body)
 }
 
-async fn send_req(
+async fn dispatch_box_body(
     engine: &Arc<OAuthEngine>,
+    req: Request<BoxBody<Bytes, Infallible>>,
+) -> (StatusCode, HeaderMap, Bytes) {
+    dispatch_box_body_with_ip(engine, None, req).await
+}
+
+async fn send_req_from_ip(
+    engine: &Arc<OAuthEngine>,
+    peer_ip: Option<IpAddr>,
     method: Method,
     uri: &str,
     extra_headers: &[(&str, &str)],
@@ -133,7 +150,17 @@ async fn send_req(
     }
     let boxed = Full::new(body.into()).boxed();
     let req = builder.body(boxed).expect("build request");
-    dispatch_box_body(engine, req).await
+    dispatch_box_body_with_ip(engine, peer_ip, req).await
+}
+
+async fn send_req(
+    engine: &Arc<OAuthEngine>,
+    method: Method,
+    uri: &str,
+    extra_headers: &[(&str, &str)],
+    body: impl Into<Bytes>,
+) -> (StatusCode, HeaderMap, Bytes) {
+    send_req_from_ip(engine, None, method, uri, extra_headers, body).await
 }
 
 fn parse_json(bytes: &Bytes) -> Value {
@@ -508,6 +535,7 @@ async fn metadata_rfc9728_and_rfc8414_subpaths_and_body_limits() {
             as_meta["revocation_endpoint"],
             "https://mcp.example.com/oauth/revoke"
         );
+        assert_eq!(as_meta["response_modes_supported"], json!(["query"]));
         assert_eq!(as_meta["code_challenge_methods_supported"], json!(["S256"]));
         assert_eq!(
             as_meta["authorization_response_iss_parameter_supported"],
@@ -526,7 +554,7 @@ async fn metadata_rfc9728_and_rfc8414_subpaths_and_body_limits() {
     assert_eq!(as_404, StatusCode::NOT_FOUND);
 
     let oversized = vec![b'x'; 65 * 1024];
-    let (lim_status, _, _) = send_req(
+    let (lim_status, lim_headers, _) = send_req(
         &engine,
         Method::POST,
         "/oauth/register",
@@ -535,6 +563,7 @@ async fn metadata_rfc9728_and_rfc8414_subpaths_and_body_limits() {
     )
     .await;
     assert_eq!(lim_status, StatusCode::PAYLOAD_TOO_LARGE);
+    assert_eq!(lim_headers[header::CONNECTION], "close");
 
     let chunked_body = StreamAdapter(ChunkStream::new(vec![
         Bytes::from(vec![b'a'; 40 * 1024]),
@@ -547,8 +576,9 @@ async fn metadata_rfc9728_and_rfc8414_subpaths_and_body_limits() {
         .header("content-type", "application/x-www-form-urlencoded")
         .body(chunked_body)
         .unwrap();
-    let (chunk_status, _, _) = dispatch_box_body(&engine, chunked_req).await;
+    let (chunk_status, chunk_headers, _) = dispatch_box_body(&engine, chunked_req).await;
     assert_eq!(chunk_status, StatusCode::PAYLOAD_TOO_LARGE);
+    assert_eq!(chunk_headers[header::CONNECTION], "close");
 }
 
 #[tokio::test]
@@ -564,6 +594,38 @@ async fn dcr_redirect_whitelist_and_idle_client_eviction() {
     );
     let engine = OAuthEngine::open(cfg).unwrap();
 
+    let (missing_uris_st, _, missing_uris_b) = send_req(
+        &engine,
+        Method::POST,
+        "/oauth/register",
+        &[("content-type", "application/json")],
+        json!({ "client_name": "Missing URIs" }).to_string(),
+    )
+    .await;
+    assert_eq!(missing_uris_st, StatusCode::BAD_REQUEST);
+    assert_eq!(
+        parse_json(&missing_uris_b)["error"],
+        "invalid_client_metadata"
+    );
+
+    for bad_meta in [
+        json!({ "redirect_uris": ["http://127.0.0.1:8000/cb"], "client_name": "Bidi\u{202E}Spoof" }),
+        json!({ "redirect_uris": ["http://127.0.0.1:8000/cb"], "client_name": "ZeroWidth\u{200B}Name" }),
+        json!({ "redirect_uris": ["http://127.0.0.1:8000/cb"], "client_name": "\u{FEFF}BomName" }),
+        json!({ "redirect_uris": ["http://127.0.0.1:8000/cb"], "scope": "admin" }),
+    ] {
+        let (st, _, b) = send_req(
+            &engine,
+            Method::POST,
+            "/oauth/register",
+            &[("content-type", "application/json")],
+            bad_meta.to_string(),
+        )
+        .await;
+        assert_eq!(st, StatusCode::BAD_REQUEST, "payload {bad_meta}");
+        assert_eq!(parse_json(&b)["error"], "invalid_client_metadata");
+    }
+
     for bad_payload in [
         json!({ "redirect_uris": [] }),
         json!({ "redirect_uris": ["/relative/cb"] }),
@@ -572,6 +634,10 @@ async fn dcr_redirect_whitelist_and_idle_client_eviction() {
         json!({ "redirect_uris": ["https://user:pw@claude.ai/cb"] }),
         json!({ "redirect_uris": ["https://unlisted.example.org/cb"] }),
         json!({ "redirect_uris": ["https://claude.ai/cb?%73tate=old"] }),
+        json!({ "redirect_uris": ["https://claude.ai/a/../cb"] }),
+        json!({ "redirect_uris": ["https://claude.ai/./cb"] }),
+        json!({ "redirect_uris": ["https://claude.ai/a\\b"] }),
+        json!({ "redirect_uris": ["http://0x7f000001:8000/cb"] }),
         json!({ "redirect_uris": (0..17).map(|i| format!("http://127.0.0.1:8000/cb/{i}")).collect::<Vec<_>>() }),
     ] {
         let (st, _, b) = send_req(
@@ -952,21 +1018,24 @@ async fn xss_escaping_security_headers_and_csrf_cookie_enforcement() {
     assert_eq!(headers.get(header::X_FRAME_OPTIONS).unwrap(), "DENY");
     assert_eq!(headers.get(header::REFERRER_POLICY).unwrap(), "no-referrer");
 
-    let raw_set_cookie = headers.get(header::SET_COOKIE).unwrap().to_str().unwrap();
-    assert!(raw_set_cookie.contains("HttpOnly"));
-    assert!(raw_set_cookie.contains("SameSite=Lax"));
-    assert!(raw_set_cookie.contains("Path=/oauth/authorize"));
-    assert!(raw_set_cookie.contains("Max-Age=300"));
-    assert!(raw_set_cookie.contains("Secure"));
-
     let html = std::str::from_utf8(&body).unwrap();
     assert!(!html.contains("<script>"));
     assert!(html.contains("&lt;script&gt;alert(1)&lt;/script&gt;&quot;&#x27;&amp;client"));
     assert!(html.contains("http://127.0.0.1:19000/cb;part,more?x=1&amp;y=2"));
+    assert!(html.contains("https://mcp.example.com/mcp"));
+    assert!(html.contains("127.0.0.1"));
 
     let ar_id = extract_hidden_input(html, "ar_id");
     let csrf_token = extract_hidden_input(html, "csrf_token");
     let cookie_pair = extract_cookie_pair(&headers);
+
+    let raw_set_cookie = headers.get(header::SET_COOKIE).unwrap().to_str().unwrap();
+    assert!(raw_set_cookie.starts_with(&format!("__Host-mcp_ar_{ar_id}=")));
+    assert!(raw_set_cookie.contains("HttpOnly"));
+    assert!(raw_set_cookie.contains("SameSite=Lax"));
+    assert!(raw_set_cookie.contains("Path=/;"));
+    assert!(raw_set_cookie.contains("Max-Age=300"));
+    assert!(raw_set_cookie.contains("Secure"));
 
     let valid_form = form_encode(&[
         ("ar_id", &ar_id),
@@ -1010,7 +1079,7 @@ async fn xss_escaping_security_headers_and_csrf_cookie_enforcement() {
         "/oauth/authorize",
         &[
             ("content-type", "application/x-www-form-urlencoded"),
-            ("cookie", &format!("mcp_ar_{ar_id}=forged")),
+            ("cookie", &format!("__Host-mcp_ar_{ar_id}=forged")),
         ],
         valid_form.clone(),
     )
@@ -1035,14 +1104,15 @@ async fn xss_escaping_security_headers_and_csrf_cookie_enforcement() {
     .await;
     assert_eq!(bad_form_st, StatusCode::FORBIDDEN);
 
+    let tossed_cookies = format!("__Host-mcp_ar_{ar_id}=forged; {cookie_pair}");
     let (ok_st, completed_headers, completed_body) = send_req(
         &engine,
         Method::POST,
         "/oauth/authorize",
         &[
             ("content-type", "application/x-www-form-urlencoded"),
-            ("cookie", &cookie_pair),
-            ("sec-fetch-mode", "navigate"),
+            ("cookie", &tossed_cookies),
+            ("sec-fetch-mode", "NaViGaTe"),
         ],
         valid_form.clone(),
     )
@@ -1155,6 +1225,7 @@ async fn ten_concurrent_refreshes_converge_and_post_grace_replay_revokes_all() {
         tmp.path(),
         &TestOpts {
             refresh_grace_secs: 2,
+            refresh_reuse_policy: "revoke",
             ..TestOpts::default()
         },
     );
@@ -1231,7 +1302,7 @@ async fn ten_concurrent_refreshes_converge_and_post_grace_replay_revokes_all() {
     assert_eq!(narrow_status, StatusCode::BAD_REQUEST);
     assert_eq!(parse_json(&narrow_body)["error"], "invalid_scope");
 
-    let (reordered_status, _, _) = send_req(
+    let (reordered_status, _, reordered_body) = send_req(
         &engine,
         Method::POST,
         "/oauth/token",
@@ -1245,6 +1316,9 @@ async fn ten_concurrent_refreshes_converge_and_post_grace_replay_revokes_all() {
     )
     .await;
     assert_eq!(reordered_status, StatusCode::OK);
+    let r2_json = parse_json(&reordered_body);
+    let a2 = r2_json["access_token"].as_str().unwrap();
+    let r2 = r2_json["refresh_token"].as_str().unwrap();
 
     let (retry_status, _, retry_body) = send_req(
         &engine,
@@ -1260,8 +1334,8 @@ async fn ten_concurrent_refreshes_converge_and_post_grace_replay_revokes_all() {
     .await;
     assert_eq!(retry_status, StatusCode::OK);
     let retried = parse_json(&retry_body);
-    assert_eq!(retried["access_token"], *a1);
-    assert_eq!(retried["refresh_token"], *r1);
+    assert_eq!(retried["access_token"], a2);
+    assert_eq!(retried["refresh_token"], r2);
 
     tokio::time::sleep(Duration::from_millis(3150)).await;
 
@@ -1307,6 +1381,7 @@ async fn disk_persistence_security_restart_recovery_and_rotated_retention() {
         tmp.path(),
         &TestOpts {
             refresh_grace_secs: 60,
+            refresh_reuse_policy: "revoke",
             ..TestOpts::default()
         },
     );
@@ -1389,12 +1464,11 @@ async fn disk_persistence_security_restart_recovery_and_rotated_retention() {
 
     let disk_before: PersistedState = serde_json::from_str(&raw_disk).unwrap();
     let r0_grace_before = disk_before.grants[0]
-        .refresh_tokens
+        .grace_refreshes
         .iter()
         .find(|rt| rt.token_sha256 == sha256_b64(&r0))
         .unwrap()
-        .grace_until
-        .unwrap();
+        .grace_until;
 
     let reopened = OAuthEngine::open(Arc::clone(&cfg)).unwrap();
     let mut a1_hdr = HeaderMap::new();
@@ -1452,12 +1526,11 @@ async fn disk_persistence_security_restart_recovery_and_rotated_retention() {
     let disk_after: PersistedState =
         serde_json::from_str(&std::fs::read_to_string(&state_path).unwrap()).unwrap();
     let r0_grace_after = disk_after.grants[0]
-        .refresh_tokens
+        .grace_refreshes
         .iter()
         .find(|rt| rt.token_sha256 == sha256_b64(&r0))
         .unwrap()
-        .grace_until
-        .unwrap();
+        .grace_until;
     assert_eq!(
         r0_grace_after, r0_grace_before,
         "mid-grace restart fallback must not extend R0 grace_until"
@@ -1465,9 +1538,19 @@ async fn disk_persistence_security_restart_recovery_and_rotated_retention() {
 
     let now = unix_now();
     let expired_at_raw = "expired-access-token-value";
-    let past_grace_rt_raw = "rotated-past-grace-but-unexpired-rt";
     let active_at_raw = "active-access-token-value";
-    let active_rt_raw = "active-refresh-token-value";
+    let family_key = [0x5au8; 32];
+    let family_key_b64 = URL_SAFE_NO_PAD.encode(family_key);
+    let make_crafted_rt = |generation: u64, nonce: &str| -> String {
+        let tag = URL_SAFE_NO_PAD.encode(hmac_sha256(
+            &family_key,
+            format!("grt_crafted.{generation}.{nonce}").as_bytes(),
+        ));
+        format!("rt1.grt_crafted.{generation}.{nonce}.{tag}")
+    };
+    let past_grace_rt_raw = make_crafted_rt(0, "nonce-zero-crafted");
+    let active_rt_raw = make_crafted_rt(1, "nonce-one-crafted");
+
     let crafted = PersistedState {
         version: STATE_VERSION,
         clients: disk_after.clients.clone(),
@@ -1477,28 +1560,33 @@ async fn disk_persistence_security_restart_recovery_and_rotated_retention() {
             pool_slot: 0,
             scopes: vec!["mcp".to_owned()],
             resource: "https://mcp.example.com/mcp".to_owned(),
+            issued_at: now.saturating_sub(60),
+            max_expires_at: now + 86400,
+            family_key_b64,
+            current_gen: 1,
+            current_refresh: Some(RefreshTokenRecord {
+                r#gen: 1,
+                token_sha256: sha256_b64(&active_rt_raw),
+                expires_at: now + 7200,
+            }),
+            grace_refreshes: vec![GraceRefreshRecord {
+                r#gen: 0,
+                token_sha256: sha256_b64(&past_grace_rt_raw),
+                grace_until: now.saturating_sub(5),
+            }],
             access_tokens: vec![
                 AccessTokenRecord {
                     token_sha256: sha256_b64(expired_at_raw),
                     expires_at: now.saturating_sub(10),
+                    scopes: vec!["mcp".to_owned()],
                 },
                 AccessTokenRecord {
                     token_sha256: sha256_b64(active_at_raw),
                     expires_at: now + 3600,
+                    scopes: vec!["mcp".to_owned()],
                 },
             ],
-            refresh_tokens: vec![
-                RefreshTokenRecord {
-                    token_sha256: sha256_b64(past_grace_rt_raw),
-                    expires_at: now + 7200,
-                    grace_until: Some(now.saturating_sub(5)),
-                },
-                RefreshTokenRecord {
-                    token_sha256: sha256_b64(active_rt_raw),
-                    expires_at: now + 7200,
-                    grace_until: None,
-                },
-            ],
+            consumed_code_sha256: None,
         }],
     };
     std::fs::write(&state_path, serde_json::to_vec_pretty(&crafted).unwrap()).unwrap();
@@ -1507,11 +1595,11 @@ async fn disk_persistence_security_restart_recovery_and_rotated_retention() {
     let cleaned: PersistedState =
         serde_json::from_str(&std::fs::read_to_string(&state_path).unwrap()).unwrap();
     assert_eq!(cleaned.grants[0].access_tokens.len(), 1);
-    assert_eq!(
-        cleaned.grants[0].refresh_tokens.len(),
-        2,
-        "rotated refresh token with unexpired expires_at must survive startup cleanup"
+    assert!(
+        cleaned.grants[0].grace_refreshes.is_empty(),
+        "expired grace refresh entries are pruned while HMAC generation lineage stays O(1)"
     );
+    assert!(engine3.is_grant_active("grt_crafted"));
 
     let mut live_hdr = HeaderMap::new();
     live_hdr.insert(
@@ -1529,11 +1617,12 @@ async fn disk_persistence_security_restart_recovery_and_rotated_retention() {
             ("grant_type", "refresh_token"),
             ("client_id", &client_id),
             ("client_secret", &client_secret),
-            ("refresh_token", past_grace_rt_raw),
+            ("refresh_token", &past_grace_rt_raw),
         ]),
     )
     .await;
     assert_eq!(reuse_st, StatusCode::BAD_REQUEST);
+    assert!(!engine3.is_grant_active("grt_crafted"));
     assert_eq!(
         engine3.verify_bearer(&live_hdr),
         Err(AuthChallenge::InvalidToken)
@@ -1634,21 +1723,45 @@ async fn password_rate_limiting_and_least_loaded_pool_slot_selection() {
         ("code_challenge", &challenge),
         ("code_challenge_method", "S256"),
     ]);
-    let (g_st, g_hdr, g_body) = send_req(
-        &engine,
-        Method::GET,
-        &format!("/oauth/authorize?{q}"),
-        &[],
-        Bytes::new(),
-    )
-    .await;
-    assert_eq!(g_st, StatusCode::OK);
-    let cookie = extract_cookie_pair(&g_hdr);
-    let html = std::str::from_utf8(&g_body).unwrap();
-    let ar_id = extract_hidden_input(html, "ar_id");
-    let csrf = extract_hidden_input(html, "csrf_token");
+    let open_ar = || async {
+        let (g_st, g_hdr, g_body) = send_req(
+            &engine,
+            Method::GET,
+            &format!("/oauth/authorize?{q}"),
+            &[],
+            Bytes::new(),
+        )
+        .await;
+        assert_eq!(g_st, StatusCode::OK);
+        let cookie = extract_cookie_pair(&g_hdr);
+        let html = std::str::from_utf8(&g_body).unwrap();
+        let ar_id = extract_hidden_input(html, "ar_id");
+        let csrf = extract_hidden_input(html, "csrf_token");
+        (cookie, ar_id, csrf)
+    };
 
+    let (mut cookie, mut ar_id, mut csrf) = open_ar().await;
     for attempt in 0..10 {
+        if attempt > 0 && attempt % 3 == 0 {
+            // Confirm burned ar_id rejects further tries with 400 before opening a new one.
+            let (burned_st, _, _) = send_req(
+                &engine,
+                Method::POST,
+                "/oauth/authorize",
+                &[
+                    ("content-type", "application/x-www-form-urlencoded"),
+                    ("cookie", &cookie),
+                ],
+                form_encode(&[
+                    ("ar_id", &ar_id),
+                    ("csrf_token", &csrf),
+                    ("password", OWNER_SECRET),
+                ]),
+            )
+            .await;
+            assert_eq!(burned_st, StatusCode::BAD_REQUEST);
+            (cookie, ar_id, csrf) = open_ar().await;
+        }
         let (st, _, _) = send_req(
             &engine,
             Method::POST,
@@ -1933,6 +2046,7 @@ async fn revoke_hook_fires_on_explicit_revoke_code_replay_and_refresh_replay() {
             tmp.path(),
             &TestOpts {
                 refresh_grace_secs: 0,
+                refresh_reuse_policy: "revoke",
                 ..Default::default()
             },
         ),
@@ -2033,4 +2147,1166 @@ async fn revoke_hook_fires_on_explicit_revoke_code_replay_and_refresh_replay() {
     .await;
     assert_eq!(st3_replay, StatusCode::BAD_REQUEST);
     assert_eq!(*revoked.lock().unwrap(), vec![gid1, gid2, gid3]);
+}
+
+#[tokio::test]
+async fn multi_hop_refresh_replay_returns_current_tip_and_survives_grace_expiry() {
+    let tmp = TempDir::new().unwrap();
+    let cfg = build_config(
+        tmp.path(),
+        &TestOpts {
+            refresh_grace_secs: 2,
+            refresh_reuse_policy: "revoke",
+            ..Default::default()
+        },
+    );
+    let engine = OAuthEngine::open(cfg).unwrap();
+    let cb = "http://127.0.0.1:27001/cb";
+    let client_id = register_public_client(&engine, cb, Some("Multi-Hop Subagents")).await;
+    let (_, r0) = mint_public_grant(&engine, &client_id, cb, "mhop-0").await;
+
+    let refresh = |rt: String| {
+        let eng = Arc::clone(&engine);
+        let cid = client_id.clone();
+        async move {
+            send_req(
+                &eng,
+                Method::POST,
+                "/oauth/token",
+                &[("content-type", "application/x-www-form-urlencoded")],
+                form_encode(&[
+                    ("grant_type", "refresh_token"),
+                    ("client_id", &cid),
+                    ("refresh_token", &rt),
+                ]),
+            )
+            .await
+        }
+    };
+
+    let (st1, _, b1) = refresh(r0.clone()).await;
+    assert_eq!(st1, StatusCode::OK);
+    let j1 = parse_json(&b1);
+    let r1 = j1["refresh_token"].as_str().unwrap().to_owned();
+
+    let (st2, _, b2) = refresh(r1.clone()).await;
+    assert_eq!(st2, StatusCode::OK);
+    let j2 = parse_json(&b2);
+    let a2 = j2["access_token"].as_str().unwrap().to_owned();
+    let r2 = j2["refresh_token"].as_str().unwrap().to_owned();
+    assert_ne!(r2, r1);
+
+    let (st_r0_grace, _, b_r0_grace) = refresh(r0.clone()).await;
+    assert_eq!(st_r0_grace, StatusCode::OK);
+    let j_grace = parse_json(&b_r0_grace);
+    assert_eq!(j_grace["access_token"], a2);
+    assert_eq!(j_grace["refresh_token"], r2);
+
+    tokio::time::sleep(Duration::from_millis(3150)).await;
+
+    let (st3, _, b3) = refresh(r2.clone()).await;
+    assert_eq!(st3, StatusCode::OK);
+    let j3 = parse_json(&b3);
+    let a3 = j3["access_token"].as_str().unwrap().to_owned();
+    let r3 = j3["refresh_token"].as_str().unwrap().to_owned();
+
+    let mut a3_hdr = HeaderMap::new();
+    a3_hdr.insert(
+        header::AUTHORIZATION,
+        HeaderValue::from_str(&format!("Bearer {a3}")).unwrap(),
+    );
+    let gid = engine.verify_bearer(&a3_hdr).unwrap().grant_id;
+    assert!(engine.is_grant_active(&gid));
+
+    let (st_breach, _, _) = refresh(r1).await;
+    assert_eq!(st_breach, StatusCode::BAD_REQUEST);
+    assert!(!engine.is_grant_active(&gid));
+    assert_eq!(
+        engine.verify_bearer(&a3_hdr),
+        Err(AuthChallenge::InvalidToken)
+    );
+    let (st_r3, _, _) = refresh(r3).await;
+    assert_eq!(st_r3, StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
+async fn rapid_over_256_rotations_and_expired_r0_replay_revoke_grant_via_hmac_lineage() {
+    let tmp = TempDir::new().unwrap();
+    let revoked = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+    let hook_log = Arc::clone(&revoked);
+    let cfg = build_config(
+        tmp.path(),
+        &TestOpts {
+            refresh_grace_secs: 60,
+            refresh_reuse_policy: "revoke",
+            ..Default::default()
+        },
+    );
+    let engine = OAuthEngine::open_with_revoke_hook(
+        Arc::clone(&cfg),
+        Arc::new(move |gid: &str| hook_log.lock().unwrap().push(gid.to_owned())),
+    )
+    .unwrap();
+
+    let cb = "http://127.0.0.1:27002/cb";
+    let client_id = register_public_client(&engine, cb, Some("Rapid Rotator")).await;
+    let (_, r0) = mint_public_grant(&engine, &client_id, cb, "rapid-260").await;
+
+    let mut cur_rt = r0.clone();
+    let mut cur_at = String::new();
+    for _ in 0..260 {
+        let (st, _, b) = send_req(
+            &engine,
+            Method::POST,
+            "/oauth/token",
+            &[("content-type", "application/x-www-form-urlencoded")],
+            form_encode(&[
+                ("grant_type", "refresh_token"),
+                ("client_id", &client_id),
+                ("refresh_token", &cur_rt),
+            ]),
+        )
+        .await;
+        assert_eq!(st, StatusCode::OK);
+        let j = parse_json(&b);
+        cur_at = j["access_token"].as_str().unwrap().to_owned();
+        cur_rt = j["refresh_token"].as_str().unwrap().to_owned();
+    }
+
+    let persisted: PersistedState =
+        serde_json::from_str(&std::fs::read_to_string(&cfg.state_path).unwrap()).unwrap();
+    assert!(persisted.grants[0].grace_refreshes.len() <= 16);
+
+    let mut hdr = HeaderMap::new();
+    hdr.insert(
+        header::AUTHORIZATION,
+        HeaderValue::from_str(&format!("Bearer {cur_at}")).unwrap(),
+    );
+    let gid = engine.verify_bearer(&hdr).unwrap().grant_id;
+
+    let (replay_st, _, replay_b) = send_req(
+        &engine,
+        Method::POST,
+        "/oauth/token",
+        &[("content-type", "application/x-www-form-urlencoded")],
+        form_encode(&[
+            ("grant_type", "refresh_token"),
+            ("client_id", &client_id),
+            ("refresh_token", &r0),
+        ]),
+    )
+    .await;
+    assert_eq!(replay_st, StatusCode::BAD_REQUEST);
+    assert_eq!(parse_json(&replay_b)["error"], "invalid_grant");
+    assert!(!engine.is_grant_active(&gid));
+    assert_eq!(engine.verify_bearer(&hdr), Err(AuthChallenge::InvalidToken));
+    assert_eq!(*revoked.lock().unwrap(), vec![gid]);
+    drop(engine);
+
+    // Expired rotated R0 replayed while R1 is still alive must also revoke the grant.
+    let now = unix_now();
+    let family_key = [0x33u8; 32];
+    let family_key_b64 = URL_SAFE_NO_PAD.encode(family_key);
+    let sign_rt = |generation: u64, nonce: &str| {
+        let tag = URL_SAFE_NO_PAD.encode(hmac_sha256(
+            &family_key,
+            format!("grt_exp_r0.{generation}.{nonce}").as_bytes(),
+        ));
+        format!("rt1.grt_exp_r0.{generation}.{nonce}.{tag}")
+    };
+    let expired_r0 = sign_rt(0, "r0-expired-nonce");
+    let live_r1 = sign_rt(1, "r1-live-nonce");
+    let live_a1 = "live-a1-token";
+    let state = PersistedState {
+        version: STATE_VERSION,
+        clients: persisted.clients,
+        grants: vec![GrantRecord {
+            grant_id: "grt_exp_r0".to_owned(),
+            client_id: client_id.clone(),
+            pool_slot: 0,
+            scopes: vec!["mcp".to_owned()],
+            resource: "https://mcp.example.com/mcp".to_owned(),
+            issued_at: now.saturating_sub(400),
+            max_expires_at: now + 7200,
+            family_key_b64,
+            current_gen: 1,
+            current_refresh: Some(RefreshTokenRecord {
+                r#gen: 1,
+                token_sha256: sha256_b64(&live_r1),
+                expires_at: now + 3600,
+            }),
+            grace_refreshes: Vec::new(),
+            access_tokens: vec![AccessTokenRecord {
+                token_sha256: sha256_b64(live_a1),
+                expires_at: now + 3600,
+                scopes: vec!["mcp".to_owned()],
+            }],
+            consumed_code_sha256: None,
+        }],
+    };
+    std::fs::write(&cfg.state_path, serde_json::to_vec_pretty(&state).unwrap()).unwrap();
+
+    let engine2 = OAuthEngine::open(cfg).unwrap();
+    assert!(engine2.is_grant_active("grt_exp_r0"));
+    let (exp_st, _, _) = send_req(
+        &engine2,
+        Method::POST,
+        "/oauth/token",
+        &[("content-type", "application/x-www-form-urlencoded")],
+        form_encode(&[
+            ("grant_type", "refresh_token"),
+            ("client_id", &client_id),
+            ("refresh_token", &expired_r0),
+        ]),
+    )
+    .await;
+    assert_eq!(exp_st, StatusCode::BAD_REQUEST);
+    assert!(!engine2.is_grant_active("grt_exp_r0"));
+}
+
+#[tokio::test]
+async fn max_grant_lifetime_ceiling_clamps_tokens_and_expires_grant() {
+    let tmp = TempDir::new().unwrap();
+    let cfg = build_config(tmp.path(), &TestOpts::default());
+    let engine = OAuthEngine::open(Arc::clone(&cfg)).unwrap();
+    let cb = "http://127.0.0.1:27003/cb";
+    let client_id = register_public_client(&engine, cb, Some("Ceiling Client")).await;
+    let (_, r0) = mint_public_grant(&engine, &client_id, cb, "ceiling-0").await;
+    drop(engine);
+
+    let now = unix_now();
+    let mut persisted: PersistedState =
+        serde_json::from_str(&std::fs::read_to_string(&cfg.state_path).unwrap()).unwrap();
+    let ceiling = now + 2;
+    persisted.grants[0].max_expires_at = ceiling;
+    let gid = persisted.grants[0].grant_id.clone();
+    std::fs::write(
+        &cfg.state_path,
+        serde_json::to_vec_pretty(&persisted).unwrap(),
+    )
+    .unwrap();
+
+    let engine = OAuthEngine::open(Arc::clone(&cfg)).unwrap();
+    let (st, _, b) = send_req(
+        &engine,
+        Method::POST,
+        "/oauth/token",
+        &[("content-type", "application/x-www-form-urlencoded")],
+        form_encode(&[
+            ("grant_type", "refresh_token"),
+            ("client_id", &client_id),
+            ("refresh_token", &r0),
+        ]),
+    )
+    .await;
+    assert_eq!(st, StatusCode::OK);
+    let j = parse_json(&b);
+    assert!(j["expires_in"].as_u64().unwrap() <= 2);
+    let a1 = j["access_token"].as_str().unwrap().to_owned();
+    let r1 = j["refresh_token"].as_str().unwrap().to_owned();
+
+    let after_rot: PersistedState =
+        serde_json::from_str(&std::fs::read_to_string(&cfg.state_path).unwrap()).unwrap();
+    assert_eq!(
+        after_rot.grants[0]
+            .current_refresh
+            .as_ref()
+            .unwrap()
+            .expires_at,
+        ceiling
+    );
+
+    tokio::time::sleep(Duration::from_millis(3150)).await;
+
+    assert!(!engine.is_grant_active(&gid));
+    let mut hdr = HeaderMap::new();
+    hdr.insert(
+        header::AUTHORIZATION,
+        HeaderValue::from_str(&format!("Bearer {a1}")).unwrap(),
+    );
+    assert_eq!(engine.verify_bearer(&hdr), Err(AuthChallenge::InvalidToken));
+
+    let (exp_st, _, exp_b) = send_req(
+        &engine,
+        Method::POST,
+        "/oauth/token",
+        &[("content-type", "application/x-www-form-urlencoded")],
+        form_encode(&[
+            ("grant_type", "refresh_token"),
+            ("client_id", &client_id),
+            ("refresh_token", &r1),
+        ]),
+    )
+    .await;
+    assert_eq!(exp_st, StatusCode::BAD_REQUEST);
+    assert_eq!(parse_json(&exp_b)["error"], "invalid_grant");
+}
+
+#[tokio::test]
+async fn revoke_requires_client_auth_without_token_oracle_and_restart_code_replay_revokes() {
+    let tmp = TempDir::new().unwrap();
+    let cfg = build_config(tmp.path(), &TestOpts::default());
+    let engine = OAuthEngine::open(Arc::clone(&cfg)).unwrap();
+
+    let cb = "http://127.0.0.1:27004/cb";
+    let (reg_st, _, reg_b) = send_req(
+        &engine,
+        Method::POST,
+        "/oauth/register",
+        &[("content-type", "application/json")],
+        json!({
+            "redirect_uris": [cb],
+            "token_endpoint_auth_method": "client_secret_basic",
+        })
+        .to_string(),
+    )
+    .await;
+    assert_eq!(reg_st, StatusCode::CREATED);
+    let rj = parse_json(&reg_b);
+    let conf_id = rj["client_id"].as_str().unwrap().to_owned();
+    let conf_sec = rj["client_secret"].as_str().unwrap().to_owned();
+    let basic = STANDARD.encode(format!("{conf_id}:{conf_sec}"));
+
+    let (verifier, challenge) = pkce_pair("oracle-check");
+    let code = authorize_and_get_code(&engine, &conf_id, cb, &challenge, "st-o").await;
+    let tok_form = form_encode(&[
+        ("grant_type", "authorization_code"),
+        ("code", &code),
+        ("redirect_uri", cb),
+        ("code_verifier", &verifier),
+    ]);
+    let (tok_st, _, tok_b) = send_req(
+        &engine,
+        Method::POST,
+        "/oauth/token",
+        &[
+            ("content-type", "application/x-www-form-urlencoded"),
+            ("authorization", &format!("Basic {basic}")),
+        ],
+        tok_form.clone(),
+    )
+    .await;
+    assert_eq!(tok_st, StatusCode::OK);
+    let conf_at = parse_json(&tok_b)["access_token"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+
+    // Unauthenticated revoke must return identical 401 invalid_client for active and unknown tokens.
+    let (st_unknown, _, b_unknown) = send_req(
+        &engine,
+        Method::POST,
+        "/oauth/revoke",
+        &[("content-type", "application/x-www-form-urlencoded")],
+        form_encode(&[("token", "completely-unknown-token")]),
+    )
+    .await;
+    let (st_active, _, b_active) = send_req(
+        &engine,
+        Method::POST,
+        "/oauth/revoke",
+        &[("content-type", "application/x-www-form-urlencoded")],
+        form_encode(&[("token", &conf_at)]),
+    )
+    .await;
+    assert_eq!(st_unknown, StatusCode::UNAUTHORIZED);
+    assert_eq!(st_active, StatusCode::UNAUTHORIZED);
+    assert_eq!(parse_json(&b_unknown), parse_json(&b_active));
+    assert_eq!(parse_json(&b_active)["error"], "invalid_client");
+
+    let mut conf_hdr = HeaderMap::new();
+    conf_hdr.insert(
+        header::AUTHORIZATION,
+        HeaderValue::from_str(&format!("Bearer {conf_at}")).unwrap(),
+    );
+    assert!(engine.verify_bearer(&conf_hdr).is_ok());
+
+    // Public client also requires client_id at /oauth/revoke.
+    let pub_id = register_public_client(&engine, cb, None).await;
+    let (pub_at, _) = mint_public_grant(&engine, &pub_id, cb, "pub-rev").await;
+    let (pub_no_id, _, _) = send_req(
+        &engine,
+        Method::POST,
+        "/oauth/revoke",
+        &[("content-type", "application/x-www-form-urlencoded")],
+        form_encode(&[("token", &pub_at)]),
+    )
+    .await;
+    assert_eq!(pub_no_id, StatusCode::UNAUTHORIZED);
+
+    // Restart engine and confirm auth-code replay still revokes conf_at via persisted consumed_code_sha256.
+    drop(engine);
+    let reopened = OAuthEngine::open(cfg).unwrap();
+    assert!(reopened.verify_bearer(&conf_hdr).is_ok());
+    let (replay_st, _, _) = send_req(
+        &reopened,
+        Method::POST,
+        "/oauth/token",
+        &[
+            ("content-type", "application/x-www-form-urlencoded"),
+            ("authorization", &format!("Basic {basic}")),
+        ],
+        tok_form,
+    )
+    .await;
+    assert_eq!(replay_st, StatusCode::BAD_REQUEST);
+    assert_eq!(
+        reopened.verify_bearer(&conf_hdr),
+        Err(AuthChallenge::InvalidToken)
+    );
+}
+
+#[tokio::test]
+async fn per_ip_lockout_isolation_ar_burn_pending_cap_and_mid_login_dcr_protection() {
+    let tmp = TempDir::new().unwrap();
+    let cfg = build_config(
+        tmp.path(),
+        &TestOpts {
+            max_registered_clients: 16,
+            ..Default::default()
+        },
+    );
+    let engine = OAuthEngine::open(cfg).unwrap();
+    let cb = "http://127.0.0.1:27005/cb";
+    let mid_login_client = register_public_client(&engine, cb, Some("Mid Login")).await;
+
+    let attacker_ip: IpAddr = "203.0.113.9".parse().unwrap();
+    let owner_ip: IpAddr = "198.51.100.7".parse().unwrap();
+    let flood_ip: IpAddr = "203.0.113.55".parse().unwrap();
+
+    let (owner_verifier, owner_challenge) = pkce_pair("owner-login");
+    let owner_q = form_encode(&[
+        ("response_type", "code"),
+        ("client_id", &mid_login_client),
+        ("redirect_uri", cb),
+        ("code_challenge", &owner_challenge),
+        ("code_challenge_method", "S256"),
+        ("state", "owner-st"),
+    ]);
+    let (og_st, og_hdr, og_body) = send_req_from_ip(
+        &engine,
+        Some(owner_ip),
+        Method::GET,
+        &format!("/oauth/authorize?{owner_q}"),
+        &[],
+        Bytes::new(),
+    )
+    .await;
+    assert_eq!(og_st, StatusCode::OK);
+    let owner_cookie = extract_cookie_pair(&og_hdr);
+    let owner_html = std::str::from_utf8(&og_body).unwrap();
+    let owner_ar = extract_hidden_input(owner_html, "ar_id");
+    let owner_csrf = extract_hidden_input(owner_html, "csrf_token");
+
+    // Fill remaining 15 client slots with active grants; DCR must NOT evict mid_login_client.
+    for i in 1..16 {
+        let uri = format!("http://127.0.0.1:28000/cb/{i}");
+        let cid = register_public_client(&engine, &uri, None).await;
+        let _ = mint_public_grant(&engine, &cid, &uri, &format!("active-{i}")).await;
+    }
+    let (dcr_full_st, _, _) = send_req(
+        &engine,
+        Method::POST,
+        "/oauth/register",
+        &[("content-type", "application/json")],
+        json!({ "redirect_uris": ["http://127.0.0.1:28999/cb"] }).to_string(),
+    )
+    .await;
+    assert_eq!(dcr_full_st, StatusCode::TOO_MANY_REQUESTS);
+
+    // Per-IP pending_auths cap (32) blocks flood_ip without blocking other IPs.
+    for i in 0..32 {
+        let (_, ch) = pkce_pair(&format!("flood-{i}"));
+        let fq = form_encode(&[
+            ("response_type", "code"),
+            ("client_id", &mid_login_client),
+            ("redirect_uri", cb),
+            ("code_challenge", &ch),
+            ("code_challenge_method", "S256"),
+        ]);
+        let (fst, _, _) = send_req_from_ip(
+            &engine,
+            Some(flood_ip),
+            Method::GET,
+            &format!("/oauth/authorize?{fq}"),
+            &[],
+            Bytes::new(),
+        )
+        .await;
+        assert_eq!(fst, StatusCode::OK);
+    }
+    let (_, ch33) = pkce_pair("flood-33");
+    let fq33 = form_encode(&[
+        ("response_type", "code"),
+        ("client_id", &mid_login_client),
+        ("redirect_uri", cb),
+        ("code_challenge", &ch33),
+        ("code_challenge_method", "S256"),
+    ]);
+    let (fst33, _, _) = send_req_from_ip(
+        &engine,
+        Some(flood_ip),
+        Method::GET,
+        &format!("/oauth/authorize?{fq33}"),
+        &[],
+        Bytes::new(),
+    )
+    .await;
+    assert_eq!(fst33, StatusCode::TOO_MANY_REQUESTS);
+
+    // Attacker IP burns ar_id after 3 failures and hits per-IP 429 at 10 failures.
+    let open_attacker_ar = || async {
+        let (_, ch) = pkce_pair("atk");
+        let aq = form_encode(&[
+            ("response_type", "code"),
+            ("client_id", &mid_login_client),
+            ("redirect_uri", cb),
+            ("code_challenge", &ch),
+            ("code_challenge_method", "S256"),
+        ]);
+        let (st, hdr, b) = send_req_from_ip(
+            &engine,
+            Some(attacker_ip),
+            Method::GET,
+            &format!("/oauth/authorize?{aq}"),
+            &[],
+            Bytes::new(),
+        )
+        .await;
+        assert_eq!(st, StatusCode::OK);
+        let html = std::str::from_utf8(&b).unwrap();
+        (
+            extract_cookie_pair(&hdr),
+            extract_hidden_input(html, "ar_id"),
+            extract_hidden_input(html, "csrf_token"),
+        )
+    };
+
+    let (mut atk_cookie, mut atk_ar, mut atk_csrf) = open_attacker_ar().await;
+    for i in 0..10 {
+        if i > 0 && i % 3 == 0 {
+            let (burned, _, _) = send_req_from_ip(
+                &engine,
+                Some(attacker_ip),
+                Method::POST,
+                "/oauth/authorize",
+                &[
+                    ("content-type", "application/x-www-form-urlencoded"),
+                    ("cookie", &atk_cookie),
+                ],
+                form_encode(&[
+                    ("ar_id", &atk_ar),
+                    ("csrf_token", &atk_csrf),
+                    ("password", OWNER_SECRET),
+                ]),
+            )
+            .await;
+            assert_eq!(burned, StatusCode::BAD_REQUEST);
+            (atk_cookie, atk_ar, atk_csrf) = open_attacker_ar().await;
+        }
+        let (st, _, _) = send_req_from_ip(
+            &engine,
+            Some(attacker_ip),
+            Method::POST,
+            "/oauth/authorize",
+            &[
+                ("content-type", "application/x-www-form-urlencoded"),
+                ("cookie", &atk_cookie),
+            ],
+            form_encode(&[
+                ("ar_id", &atk_ar),
+                ("csrf_token", &atk_csrf),
+                ("password", "bad-guess"),
+            ]),
+        )
+        .await;
+        assert_eq!(st, StatusCode::UNAUTHORIZED);
+    }
+    let (atk_locked, _, _) = send_req_from_ip(
+        &engine,
+        Some(attacker_ip),
+        Method::POST,
+        "/oauth/authorize",
+        &[
+            ("content-type", "application/x-www-form-urlencoded"),
+            ("cookie", &atk_cookie),
+        ],
+        form_encode(&[
+            ("ar_id", &atk_ar),
+            ("csrf_token", &atk_csrf),
+            ("password", OWNER_SECRET),
+        ]),
+    )
+    .await;
+    assert_eq!(atk_locked, StatusCode::TOO_MANY_REQUESTS);
+
+    // Owner IP is NOT locked out and mid_login_client completes login + token exchange.
+    let (owner_post_st, owner_post_hdr, _) = send_req_from_ip(
+        &engine,
+        Some(owner_ip),
+        Method::POST,
+        "/oauth/authorize",
+        &[
+            ("content-type", "application/x-www-form-urlencoded"),
+            ("cookie", &owner_cookie),
+        ],
+        form_encode(&[
+            ("ar_id", &owner_ar),
+            ("csrf_token", &owner_csrf),
+            ("password", OWNER_SECRET),
+        ]),
+    )
+    .await;
+    assert_eq!(owner_post_st, StatusCode::SEE_OTHER);
+    let loc = Url::parse(owner_post_hdr[header::LOCATION].to_str().unwrap()).unwrap();
+    let qmap: BTreeMap<String, String> = loc.query_pairs().into_owned().collect();
+    let owner_code = qmap.get("code").unwrap();
+
+    let (tok_st, _, _) = send_req(
+        &engine,
+        Method::POST,
+        "/oauth/token",
+        &[("content-type", "application/x-www-form-urlencoded")],
+        form_encode(&[
+            ("grant_type", "authorization_code"),
+            ("client_id", &mid_login_client),
+            ("code", owner_code),
+            ("redirect_uri", cb),
+            ("code_verifier", &owner_verifier),
+        ]),
+    )
+    .await;
+    assert_eq!(tok_st, StatusCode::OK);
+}
+
+#[tokio::test]
+async fn insufficient_scope_403_and_per_access_token_scope_preservation() {
+    let tmp = TempDir::new().unwrap();
+    let cfg = build_config(
+        tmp.path(),
+        &TestOpts {
+            scopes: &["mcp", "files"],
+            ..Default::default()
+        },
+    );
+    let engine = OAuthEngine::open(cfg).unwrap();
+    let cb = "http://127.0.0.1:27006/cb";
+    let client_id = register_public_client(&engine, cb, Some("Scoped Client")).await;
+    let (a0, r0) = mint_public_grant(&engine, &client_id, cb, "scope-0").await;
+
+    let (st1, _, b1) = send_req(
+        &engine,
+        Method::POST,
+        "/oauth/token",
+        &[("content-type", "application/x-www-form-urlencoded")],
+        form_encode(&[
+            ("grant_type", "refresh_token"),
+            ("client_id", &client_id),
+            ("refresh_token", &r0),
+            ("scope", "mcp"),
+        ]),
+    )
+    .await;
+    assert_eq!(st1, StatusCode::OK);
+    let j1 = parse_json(&b1);
+    assert_eq!(j1["scope"], "mcp");
+    let a1 = j1["access_token"].as_str().unwrap().to_owned();
+    let r1 = j1["refresh_token"].as_str().unwrap().to_owned();
+
+    let mut h0 = HeaderMap::new();
+    h0.insert(
+        header::AUTHORIZATION,
+        HeaderValue::from_str(&format!("Bearer {a0}")).unwrap(),
+    );
+    let mut h1 = HeaderMap::new();
+    h1.insert(
+        header::AUTHORIZATION,
+        HeaderValue::from_str(&format!("Bearer {a1}")).unwrap(),
+    );
+    assert_eq!(
+        engine.verify_bearer(&h0).unwrap().scopes,
+        vec!["mcp", "files"]
+    );
+    assert_eq!(engine.verify_bearer(&h1).unwrap().scopes, vec!["mcp"]);
+
+    // Unscoped refresh restores grant scopes on A2 while A1 remains narrowed to ["mcp"].
+    let (st2, _, b2) = send_req(
+        &engine,
+        Method::POST,
+        "/oauth/token",
+        &[("content-type", "application/x-www-form-urlencoded")],
+        form_encode(&[
+            ("grant_type", "refresh_token"),
+            ("client_id", &client_id),
+            ("refresh_token", &r1),
+        ]),
+    )
+    .await;
+    assert_eq!(st2, StatusCode::OK);
+    let a2 = parse_json(&b2)["access_token"].as_str().unwrap().to_owned();
+    let mut h2 = HeaderMap::new();
+    h2.insert(
+        header::AUTHORIZATION,
+        HeaderValue::from_str(&format!("Bearer {a2}")).unwrap(),
+    );
+    assert_eq!(
+        engine.verify_bearer(&h2).unwrap().scopes,
+        vec!["mcp", "files"]
+    );
+    assert_eq!(engine.verify_bearer(&h1).unwrap().scopes, vec!["mcp"]);
+    drop(engine);
+
+    // Reopen requiring ["files"] only: A0 passes, A1 fails with 403 InsufficientScope.
+    let files_only_cfg = build_config(
+        tmp.path(),
+        &TestOpts {
+            scopes: &["files"],
+            ..Default::default()
+        },
+    );
+    let reopened = OAuthEngine::open(files_only_cfg).unwrap();
+    assert!(reopened.verify_bearer(&h0).is_ok());
+    assert_eq!(
+        reopened.verify_bearer(&h1),
+        Err(AuthChallenge::InsufficientScope)
+    );
+    let reply = reopened.unauthorized_reply(AuthChallenge::InsufficientScope);
+    assert_eq!(reply.status(), StatusCode::FORBIDDEN);
+    assert_eq!(
+        reply.headers()[header::WWW_AUTHENTICATE],
+        "Bearer resource_metadata=\"https://mcp.example.com/.well-known/oauth-protected-resource/mcp\", error=\"insufficient_scope\", scope=\"files\""
+    );
+}
+
+#[tokio::test]
+async fn case_insensitive_rfc8707_resource_loopback_cookie_dcr_scope_and_deny_button() {
+    let tmp = TempDir::new().unwrap();
+    let cfg = build_config(tmp.path(), &TestOpts::default());
+    let engine = OAuthEngine::open(cfg).unwrap();
+    let cb = "http://127.0.0.1:27007/cb";
+
+    let (reg_st, _, reg_b) = send_req(
+        &engine,
+        Method::POST,
+        "/oauth/register",
+        &[("content-type", "application/json")],
+        json!({
+            "redirect_uris": [cb],
+            "scope": "mcp",
+        })
+        .to_string(),
+    )
+    .await;
+    assert_eq!(reg_st, StatusCode::CREATED);
+    let rj = parse_json(&reg_b);
+    assert_eq!(rj["scope"], "mcp");
+    let client_id = rj["client_id"].as_str().unwrap().to_owned();
+
+    let (verifier, challenge) = pkce_pair("res-case");
+    let over_scope_q = form_encode(&[
+        ("response_type", "code"),
+        ("client_id", &client_id),
+        ("redirect_uri", cb),
+        ("code_challenge", &challenge),
+        ("code_challenge_method", "S256"),
+        ("scope", "mcp files"),
+    ]);
+    let (os_st, os_hdr, _) = send_req(
+        &engine,
+        Method::GET,
+        &format!("/oauth/authorize?{over_scope_q}"),
+        &[],
+        Bytes::new(),
+    )
+    .await;
+    assert_eq!(os_st, StatusCode::SEE_OTHER);
+    assert!(
+        os_hdr[header::LOCATION]
+            .to_str()
+            .unwrap()
+            .contains("error=invalid_scope")
+    );
+
+    let long_state = "s".repeat(1025);
+    let long_q = form_encode(&[
+        ("response_type", "code"),
+        ("client_id", &client_id),
+        ("redirect_uri", cb),
+        ("code_challenge", &challenge),
+        ("code_challenge_method", "S256"),
+        ("state", &long_state),
+    ]);
+    let (ls_st, _, _) = send_req(
+        &engine,
+        Method::GET,
+        &format!("/oauth/authorize?{long_q}"),
+        &[],
+        Bytes::new(),
+    )
+    .await;
+    assert_eq!(ls_st, StatusCode::BAD_REQUEST);
+
+    // Case-insensitive RFC 8707 resource origin on authorize, token exchange, and refresh.
+    let auth_q = form_encode(&[
+        ("response_type", "code"),
+        ("client_id", &client_id),
+        ("redirect_uri", cb),
+        ("code_challenge", &challenge),
+        ("code_challenge_method", "S256"),
+        ("resource", "HTTPS://MCP.EXAMPLE.COM:443/mcp"),
+        ("state", "ok-res"),
+    ]);
+    let (g_st, g_hdr, g_b) = send_req(
+        &engine,
+        Method::GET,
+        &format!("/oauth/authorize?{auth_q}"),
+        &[],
+        Bytes::new(),
+    )
+    .await;
+    assert_eq!(g_st, StatusCode::OK);
+    let cookie = extract_cookie_pair(&g_hdr);
+    let html = std::str::from_utf8(&g_b).unwrap();
+    let ar_id = extract_hidden_input(html, "ar_id");
+    let csrf = extract_hidden_input(html, "csrf_token");
+
+    let (p_st, p_hdr, _) = send_req(
+        &engine,
+        Method::POST,
+        "/oauth/authorize",
+        &[
+            ("content-type", "application/x-www-form-urlencoded"),
+            ("cookie", &cookie),
+        ],
+        form_encode(&[
+            ("ar_id", &ar_id),
+            ("csrf_token", &csrf),
+            ("password", OWNER_SECRET),
+            ("decision", "approve"),
+        ]),
+    )
+    .await;
+    assert_eq!(p_st, StatusCode::SEE_OTHER);
+    let loc = Url::parse(p_hdr[header::LOCATION].to_str().unwrap()).unwrap();
+    let qmap: BTreeMap<String, String> = loc.query_pairs().into_owned().collect();
+    let code = qmap.get("code").unwrap();
+
+    let (t_st, _, t_b) = send_req(
+        &engine,
+        Method::POST,
+        "/oauth/token",
+        &[("content-type", "application/x-www-form-urlencoded")],
+        form_encode(&[
+            ("grant_type", "authorization_code"),
+            ("client_id", &client_id),
+            ("code", code),
+            ("redirect_uri", cb),
+            ("code_verifier", &verifier),
+            ("resource", "https://MCP.Example.Com/"),
+        ]),
+    )
+    .await;
+    assert_eq!(t_st, StatusCode::OK);
+    let tj = parse_json(&t_b);
+    assert_eq!(tj["scope"], "mcp");
+    let rt = tj["refresh_token"].as_str().unwrap();
+
+    let (rf_st, _, _) = send_req(
+        &engine,
+        Method::POST,
+        "/oauth/token",
+        &[("content-type", "application/x-www-form-urlencoded")],
+        form_encode(&[
+            ("grant_type", "refresh_token"),
+            ("client_id", &client_id),
+            ("refresh_token", rt),
+            ("resource", "HTTPS://mcp.example.com/mcp"),
+        ]),
+    )
+    .await;
+    assert_eq!(rf_st, StatusCode::OK);
+
+    // HTTP loopback keeps mcp_ar_<ar_id> with Path=/oauth/authorize, and Deny returns access_denied.
+    let tmp_http = TempDir::new().unwrap();
+    let http_cfg = build_config(
+        tmp_http.path(),
+        &TestOpts {
+            public_url: "http://127.0.0.1:8080",
+            ..Default::default()
+        },
+    );
+    let http_engine = OAuthEngine::open(http_cfg).unwrap();
+    let http_cid = register_public_client(&http_engine, cb, Some("Loopback App")).await;
+    let (_, ch_deny) = pkce_pair("deny-test");
+    let dq = form_encode(&[
+        ("response_type", "code"),
+        ("client_id", &http_cid),
+        ("redirect_uri", cb),
+        ("code_challenge", &ch_deny),
+        ("code_challenge_method", "S256"),
+        ("state", "deny-state"),
+    ]);
+    let (dg_st, dg_hdr, dg_b) = send_req(
+        &http_engine,
+        Method::GET,
+        &format!("/oauth/authorize?{dq}"),
+        &[],
+        Bytes::new(),
+    )
+    .await;
+    assert_eq!(dg_st, StatusCode::OK);
+    let raw_http_cookie = dg_hdr[header::SET_COOKIE].to_str().unwrap();
+    assert!(raw_http_cookie.starts_with("mcp_ar_"));
+    assert!(raw_http_cookie.contains("Path=/oauth/authorize;"));
+    assert!(!raw_http_cookie.contains("Secure"));
+
+    let d_cookie = extract_cookie_pair(&dg_hdr);
+    let d_html = std::str::from_utf8(&dg_b).unwrap();
+    let d_ar = extract_hidden_input(d_html, "ar_id");
+    let d_csrf = extract_hidden_input(d_html, "csrf_token");
+    assert!(d_html.contains("name=\"decision\" value=\"deny\""));
+
+    let (dp_st, dp_hdr, _) = send_req(
+        &http_engine,
+        Method::POST,
+        "/oauth/authorize",
+        &[
+            ("content-type", "application/x-www-form-urlencoded"),
+            ("cookie", &d_cookie),
+        ],
+        form_encode(&[
+            ("ar_id", &d_ar),
+            ("csrf_token", &d_csrf),
+            ("decision", "deny"),
+        ]),
+    )
+    .await;
+    assert_eq!(dp_st, StatusCode::SEE_OTHER);
+    assert!(
+        dp_hdr[header::SET_COOKIE]
+            .to_str()
+            .unwrap()
+            .contains("Max-Age=0")
+    );
+    let deny_loc = Url::parse(dp_hdr[header::LOCATION].to_str().unwrap()).unwrap();
+    let deny_q: BTreeMap<String, String> = deny_loc.query_pairs().into_owned().collect();
+    assert_eq!(
+        deny_q.get("error").map(String::as_str),
+        Some("access_denied")
+    );
+    assert_eq!(deny_q.get("state").map(String::as_str), Some("deny-state"));
+    assert_eq!(
+        deny_q.get("iss").map(String::as_str),
+        Some("http://127.0.0.1:8080")
+    );
+}
+
+#[tokio::test]
+async fn refresh_grace_defaults_to_access_token_ttl_one_hour_and_syncs_with_access_ttl() {
+    let tmp = TempDir::new().unwrap();
+    let hash = PasswordVerifier::from_plaintext_with_iterations("secret123", 10_000)
+        .unwrap()
+        .encode();
+    let default_cfg = GatewayConfig::from_json_str(
+        &json!({
+            "listen": "127.0.0.1:0",
+            "public_url": "http://127.0.0.1:8080",
+            "state_path": tmp.path().join("default-state.json").to_string_lossy(),
+            "oauth": {
+                "owner_password_hash": hash,
+                "scopes": ["mcp"]
+            },
+            "upstream": {
+                "transport": "http",
+                "url": "http://127.0.0.1:9999/mcp"
+            }
+        })
+        .to_string(),
+        tmp.path(),
+    )
+    .unwrap();
+    assert_eq!(default_cfg.oauth.access_token_ttl_secs, 3600);
+    assert_eq!(default_cfg.oauth.refresh_grace_secs, 3600);
+
+    let synced_cfg = GatewayConfig::from_json_str(
+        &json!({
+            "listen": "127.0.0.1:0",
+            "public_url": "http://127.0.0.1:8080",
+            "state_path": tmp.path().join("synced-state.json").to_string_lossy(),
+            "oauth": {
+                "owner_password_hash": hash,
+                "access_token_ttl_secs": 1800,
+                "scopes": ["mcp"]
+            },
+            "upstream": {
+                "transport": "http",
+                "url": "http://127.0.0.1:9999/mcp"
+            }
+        })
+        .to_string(),
+        tmp.path(),
+    )
+    .unwrap();
+    assert_eq!(synced_cfg.oauth.refresh_grace_secs, 1800);
+
+    let over_cap = GatewayConfig::from_json_str(
+        &json!({
+            "listen": "127.0.0.1:0",
+            "public_url": "http://127.0.0.1:8080",
+            "state_path": tmp.path().join("over-state.json").to_string_lossy(),
+            "oauth": {
+                "owner_password_hash": hash,
+                "refresh_grace_secs": 86_401,
+                "scopes": ["mcp"]
+            },
+            "upstream": {
+                "transport": "http",
+                "url": "http://127.0.0.1:9999/mcp"
+            }
+        })
+        .to_string(),
+        tmp.path(),
+    );
+    assert!(over_cap.is_err());
+}
+
+#[tokio::test]
+async fn converge_policy_preserves_same_client_continuity_past_grace_and_restart_while_enforcing_boundaries()
+ {
+    let tmp = TempDir::new().unwrap();
+    let cfg = build_config(
+        tmp.path(),
+        &TestOpts {
+            refresh_grace_secs: 1,
+            refresh_reuse_policy: "converge",
+            ..Default::default()
+        },
+    );
+    let engine = OAuthEngine::open(Arc::clone(&cfg)).unwrap();
+
+    let cb_a = "http://127.0.0.1:28101/cb";
+    let cb_b = "http://127.0.0.1:28102/cb";
+    let client_a = register_public_client(&engine, cb_a, Some("Parent+Subagents")).await;
+    let client_b = register_public_client(&engine, cb_b, Some("Other Client")).await;
+
+    let (_a0, r0) = mint_public_grant(&engine, &client_a, cb_a, "conv-0").await;
+
+    // Subagent rotates R0 -> R1 -> R2.
+    let (s1, _, b1) = send_req(
+        &engine,
+        Method::POST,
+        "/oauth/token",
+        &[("content-type", "application/x-www-form-urlencoded")],
+        form_encode(&[
+            ("grant_type", "refresh_token"),
+            ("client_id", &client_a),
+            ("refresh_token", &r0),
+        ]),
+    )
+    .await;
+    assert_eq!(s1, StatusCode::OK);
+    let r1 = parse_json(&b1)["refresh_token"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+
+    let (s2, _, b2) = send_req(
+        &engine,
+        Method::POST,
+        "/oauth/token",
+        &[("content-type", "application/x-www-form-urlencoded")],
+        form_encode(&[
+            ("grant_type", "refresh_token"),
+            ("client_id", &client_a),
+            ("refresh_token", &r1),
+        ]),
+    )
+    .await;
+    assert_eq!(s2, StatusCode::OK);
+    let j2 = parse_json(&b2);
+    let a2 = j2["access_token"].as_str().unwrap().to_owned();
+    let r2 = j2["refresh_token"].as_str().unwrap().to_owned();
+
+    // Wait past refresh_grace_secs (1s) so R0 is outside the grace window.
+    tokio::time::sleep(Duration::from_millis(2100)).await;
+
+    // Same authenticated client presenting stale R0 converges to live tip (a2, r2) without revoking grant.
+    let (s_late, _, b_late) = send_req(
+        &engine,
+        Method::POST,
+        "/oauth/token",
+        &[("content-type", "application/x-www-form-urlencoded")],
+        form_encode(&[
+            ("grant_type", "refresh_token"),
+            ("client_id", &client_a),
+            ("refresh_token", &r0),
+        ]),
+    )
+    .await;
+    assert_eq!(s_late, StatusCode::OK);
+    let j_late = parse_json(&b_late);
+    assert_eq!(j_late["access_token"], a2);
+    assert_eq!(j_late["refresh_token"], r2);
+
+    // Cross-client replay of R0 is rejected and does NOT revoke client_a's grant.
+    let (s_cross, _, b_cross) = send_req(
+        &engine,
+        Method::POST,
+        "/oauth/token",
+        &[("content-type", "application/x-www-form-urlencoded")],
+        form_encode(&[
+            ("grant_type", "refresh_token"),
+            ("client_id", &client_b),
+            ("refresh_token", &r0),
+        ]),
+    )
+    .await;
+    assert_eq!(s_cross, StatusCode::BAD_REQUEST);
+    assert_eq!(parse_json(&b_cross)["error"], "invalid_grant");
+
+    // Simulate gateway restart (in-memory grace_cache cleared); stale R0 still converges cleanly.
+    drop(engine);
+    let restarted = OAuthEngine::open(Arc::clone(&cfg)).unwrap();
+    let (s_restart, _, b_restart) = send_req(
+        &restarted,
+        Method::POST,
+        "/oauth/token",
+        &[("content-type", "application/x-www-form-urlencoded")],
+        form_encode(&[
+            ("grant_type", "refresh_token"),
+            ("client_id", &client_a),
+            ("refresh_token", &r0),
+        ]),
+    )
+    .await;
+    assert_eq!(s_restart, StatusCode::OK);
+    let j_restart = parse_json(&b_restart);
+    let r3 = j_restart["refresh_token"].as_str().unwrap().to_owned();
+    assert_ne!(r3, r2);
+
+    // Explicit /oauth/revoke permanently invalidates the entire family including R0 and R3.
+    let (s_rev, _, _) = send_req(
+        &restarted,
+        Method::POST,
+        "/oauth/revoke",
+        &[("content-type", "application/x-www-form-urlencoded")],
+        form_encode(&[("client_id", &client_a), ("token", &r3)]),
+    )
+    .await;
+    assert_eq!(s_rev, StatusCode::OK);
+
+    let (s_after_rev, _, b_after_rev) = send_req(
+        &restarted,
+        Method::POST,
+        "/oauth/token",
+        &[("content-type", "application/x-www-form-urlencoded")],
+        form_encode(&[
+            ("grant_type", "refresh_token"),
+            ("client_id", &client_a),
+            ("refresh_token", &r0),
+        ]),
+    )
+    .await;
+    assert_eq!(s_after_rev, StatusCode::BAD_REQUEST);
+    assert_eq!(parse_json(&b_after_rev)["error"], "invalid_grant");
 }

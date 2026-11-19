@@ -20,6 +20,7 @@ pub struct VerifiedToken {
 pub enum AuthChallenge {
     MissingToken,
     InvalidToken,
+    InsufficientScope,
 }
 
 pub fn empty_body() -> ReplyBody {
@@ -55,4 +56,22 @@ pub fn text_reply(
         .header(header::CACHE_CONTROL, "no-store")
         .body(bytes_body(text))
         .expect("valid text response")
+}
+
+pub fn method_not_allowed(allow: &'static str) -> HttpReply {
+    Response::builder()
+        .status(StatusCode::METHOD_NOT_ALLOWED)
+        .header(header::ALLOW, allow)
+        .header(header::CACHE_CONTROL, "no-store")
+        .body(empty_body())
+        .expect("valid 405 reply")
+}
+
+pub fn hex_nibble(b: u8) -> Option<u8> {
+    match b {
+        b'0'..=b'9' => Some(b - b'0'),
+        b'a'..=b'f' => Some(b - b'a' + 10),
+        b'A'..=b'F' => Some(b - b'A' + 10),
+        _ => None,
+    }
 }

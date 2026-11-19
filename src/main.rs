@@ -1,6 +1,6 @@
 use clap::{Parser, Subcommand};
 use oauth2_mcp_gateway::config::GatewayConfig;
-use oauth2_mcp_gateway::crypto::PasswordVerifier;
+use oauth2_mcp_gateway::crypto::{PasswordVerifier, zeroize_bytes, zeroize_string};
 use std::path::PathBuf;
 use std::process::ExitCode;
 use std::sync::Arc;
@@ -81,21 +81,30 @@ async fn main() -> ExitCode {
                 .take(MAX_PASSWORD_STDIN_BYTES + 1)
                 .read_to_end(&mut raw)
             {
+                zeroize_bytes(&mut raw);
                 eprintln!("oauth2-mcp-gateway: cannot read stdin: {err}");
                 return ExitCode::from(1);
             }
             if raw.len() as u64 > MAX_PASSWORD_STDIN_BYTES {
+                zeroize_bytes(&mut raw);
                 eprintln!(
                     "oauth2-mcp-gateway: password input exceeds {MAX_PASSWORD_STDIN_BYTES} bytes limit"
                 );
                 return ExitCode::from(1);
             }
-            let Ok(buf) = String::from_utf8(raw) else {
-                eprintln!("oauth2-mcp-gateway: password input must be valid UTF-8");
-                return ExitCode::from(1);
+            let mut buf = match String::from_utf8(raw) {
+                Ok(s) => s,
+                Err(err) => {
+                    let mut invalid = err.into_bytes();
+                    zeroize_bytes(&mut invalid);
+                    eprintln!("oauth2-mcp-gateway: password input must be valid UTF-8");
+                    return ExitCode::from(1);
+                }
             };
             let secret = buf.trim_end_matches(['\r', '\n']);
-            match PasswordVerifier::from_plaintext(secret) {
+            let result = PasswordVerifier::from_plaintext(secret);
+            zeroize_string(&mut buf);
+            match result {
                 Ok(v) => {
                     println!("{}", v.encode());
                     ExitCode::SUCCESS
