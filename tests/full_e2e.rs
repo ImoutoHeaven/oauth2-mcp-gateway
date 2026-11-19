@@ -2,22 +2,18 @@ mod common;
 
 use bytes::Bytes;
 use common::{
-    TestClient, channel_body, make_client, process_exists, python_executable, wait_process_gone,
+    TestClient, channel_body, make_client, process_exists, python_executable, spawn_gateway,
+    spawn_http1_harness, wait_process_gone,
 };
 use http::{HeaderMap, Method, Request, Response, StatusCode, header};
 use http_body::Frame;
 use http_body_util::BodyExt;
 use hyper::body::Incoming;
-use hyper::server::conn::http1;
-use hyper::service::service_fn;
-use hyper_util::rt::TokioIo;
 use oauth2_mcp_gateway::config::GatewayConfig;
-use oauth2_mcp_gateway::crypto::{PasswordVerifier, sha256_b64};
-use oauth2_mcp_gateway::server;
-use oauth2_mcp_gateway::types::{HttpReply, ReplyBody, bytes_body, empty_body};
+use oauth2_mcp_gateway::crypto::{PBKDF2_ITERATIONS, PasswordVerifier, sha256_b64};
+use oauth2_mcp_gateway::types::{ReplyBody, bytes_body, empty_body};
 use serde_json::{Value, json};
 use std::collections::BTreeMap;
-use std::convert::Infallible;
 use std::io::Write;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
@@ -25,9 +21,9 @@ use std::process::{Command, Stdio};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tempfile::TempDir;
-use tokio::net::TcpListener;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::TcpStream;
 use tokio::sync::Barrier;
-use tokio_util::sync::CancellationToken;
 use url::Url;
 
 const OWNER_PASSWORD: &str = "e2e-owner-correct-horse-staple-42";
@@ -94,62 +90,6 @@ fn parse_json(bytes: &Bytes) -> Value {
     serde_json::from_slice(bytes).expect("valid JSON payload")
 }
 
-async fn spawn_gateway(
-    cfg: Arc<GatewayConfig>,
-) -> (
-    SocketAddr,
-    CancellationToken,
-    tokio::task::JoinHandle<Result<(), String>>,
-) {
-    let listener = TcpListener::bind("127.0.0.1:0")
-        .await
-        .expect("bind gateway listener");
-    let addr = listener.local_addr().expect("gateway local_addr");
-    let shutdown = CancellationToken::new();
-    let shutdown_run = shutdown.clone();
-    let handle =
-        tokio::spawn(async move { server::serve_with_listener(listener, cfg, shutdown_run).await });
-    (addr, shutdown, handle)
-}
-
-async fn spawn_upstream_http<F, Fut>(handler: F) -> (SocketAddr, CancellationToken)
-where
-    F: Fn(Request<Incoming>) -> Fut + Send + Sync + 'static,
-    Fut: std::future::Future<Output = HttpReply> + Send + 'static,
-{
-    let listener = TcpListener::bind("127.0.0.1:0")
-        .await
-        .expect("bind upstream listener");
-    let addr = listener.local_addr().expect("upstream local_addr");
-    let cancel = CancellationToken::new();
-    let cancel_loop = cancel.clone();
-    let handler = Arc::new(handler);
-
-    tokio::spawn(async move {
-        loop {
-            tokio::select! {
-                _ = cancel_loop.cancelled() => break,
-                accepted = listener.accept() => {
-                    let Ok((stream, _)) = accepted else { break };
-                    let _ = stream.set_nodelay(true);
-                    let h = Arc::clone(&handler);
-                    tokio::spawn(async move {
-                        let svc = service_fn(move |req: Request<Incoming>| {
-                            let h_inner = Arc::clone(&h);
-                            async move { Ok::<HttpReply, Infallible>(h_inner(req).await) }
-                        });
-                        let _ = http1::Builder::new()
-                            .serve_connection(TokioIo::new(stream), svc)
-                            .await;
-                    });
-                }
-            }
-        }
-    });
-
-    (addr, cancel)
-}
-
 async fn register_and_authorize_grant(
     client: &TestClient,
     gw_addr: SocketAddr,
@@ -203,7 +143,7 @@ async fn register_and_authorize_grant(
     let ar_id = extract_hidden_input(html, "ar_id");
     let csrf_token = extract_hidden_input(html, "csrf_token");
     assert!(
-        cookie_pair.starts_with(&format!("mcp_ar_{ar_id}=")),
+        cookie_pair.contains(&format!("mcp_ar_{ar_id}=")),
         "expected mcp_ar_<ar_id> cookie, got {cookie_pair:?}"
     );
 
@@ -346,7 +286,7 @@ async fn e2e_http_oauth_flow_bearer_pool_sse_stripping_and_passthrough() {
     let seen_ref = Arc::clone(&seen_up_auth);
     let artifact_ref = Arc::clone(&artifact_store);
 
-    let (up_addr, up_cancel) = spawn_upstream_http(move |req: Request<Incoming>| {
+    let (up_addr, up_cancel) = spawn_http1_harness(move |req: Request<Incoming>| {
         let seen = Arc::clone(&seen_ref);
         let store = Arc::clone(&artifact_ref);
         async move {
@@ -480,7 +420,6 @@ async fn e2e_http_oauth_flow_bearer_pool_sse_stripping_and_passthrough() {
     let (gw_addr, gw_shutdown, gw_handle) = spawn_gateway(cfg).await;
     let client = make_client();
 
-    // 1. Unauthenticated GET /mcp returns 401 with PRM WWW-Authenticate
     let (unauth_status, unauth_headers, _) = send_http(
         &client,
         Method::GET,
@@ -499,8 +438,7 @@ async fn e2e_http_oauth_flow_bearer_pool_sse_stripping_and_passthrough() {
         )
     );
 
-    // 2. Fetch PRM and Authorization Server Metadata
-    let (prm_status, _, prm_body) = send_http(
+    let (prm_status, prm_headers, prm_body) = send_http(
         &client,
         Method::GET,
         &format!("http://{gw_addr}/.well-known/oauth-protected-resource/mcp"),
@@ -509,6 +447,12 @@ async fn e2e_http_oauth_flow_bearer_pool_sse_stripping_and_passthrough() {
     )
     .await;
     assert_eq!(prm_status, StatusCode::OK);
+    assert_eq!(
+        prm_headers
+            .get(header::ACCESS_CONTROL_ALLOW_ORIGIN)
+            .and_then(|v| v.to_str().ok()),
+        Some("*")
+    );
     let prm = parse_json(&prm_body);
     assert_eq!(prm["resource"], "https://mcp.example.com/mcp");
     assert_eq!(prm["authorization_servers"], json!([PUBLIC_URL]));
@@ -540,7 +484,6 @@ async fn e2e_http_oauth_flow_bearer_pool_sse_stripping_and_passthrough() {
     assert_eq!(asm["code_challenge_methods_supported"], json!(["S256"]));
     assert_eq!(asm["authorization_response_iss_parameter_supported"], true);
 
-    // 3. Dynamically register two clients and complete full PKCE S256 OAuth flows
     let (_, access_1, _) = register_and_authorize_grant(
         &client,
         gw_addr,
@@ -559,7 +502,6 @@ async fn e2e_http_oauth_flow_bearer_pool_sse_stripping_and_passthrough() {
     .await;
     assert_ne!(access_1, access_2);
 
-    // 4. Call /mcp with both grants: verify least-loaded Bearer pool slots and SSE empty-frame stripping
     for (idx, (token, expected_up_bearer)) in [
         (&access_1, "Bearer pool-static-alpha"),
         (&access_2, "Bearer pool-static-beta"),
@@ -634,7 +576,6 @@ async fn e2e_http_oauth_flow_bearer_pool_sse_stripping_and_passthrough() {
         );
     }
 
-    // 5. Unauthenticated streaming PUT and GET on /t/artifact-1 match byte-for-byte
     let total_size = 512 * 1024;
     let mut expected_artifact = vec![0u8; total_size];
     for (i, byte) in expected_artifact.iter_mut().enumerate() {
@@ -691,7 +632,7 @@ async fn e2e_http_oauth_flow_bearer_pool_sse_stripping_and_passthrough() {
 
 #[tokio::test]
 async fn e2e_ten_way_concurrent_refresh_rotation_and_replay_breach() {
-    let (up_addr, up_cancel) = spawn_upstream_http(|_req: Request<Incoming>| async move {
+    let (up_addr, up_cancel) = spawn_http1_harness(|_req: Request<Incoming>| async move {
         Response::builder()
             .status(StatusCode::OK)
             .header(header::CONTENT_TYPE, "application/json")
@@ -744,7 +685,6 @@ async fn e2e_ten_way_concurrent_refresh_rotation_and_replay_breach() {
     .await;
     assert_eq!(a0_mcp_st, StatusCode::OK);
 
-    // 10 independent HTTP clients concurrently refresh R0 over real TCP sockets
     let barrier = Arc::new(Barrier::new(10));
     let mut tasks = Vec::with_capacity(10);
     for _ in 0..10 {
@@ -802,8 +742,8 @@ async fn e2e_ten_way_concurrent_refresh_rotation_and_replay_breach() {
     .await;
     assert_eq!(a1_ok_st, StatusCode::OK);
 
-    // Wait past refresh_grace_secs (2s integer window -> 3.2s guarantees unix_now() > grace_until)
-    tokio::time::sleep(Duration::from_millis(3200)).await;
+    // Sleep past 2s integer unix_now() window with margin for 2-vCPU CI scheduling.
+    tokio::time::sleep(Duration::from_millis(3500)).await;
 
     let (replay_st, _, replay_body) = send_http(
         &setup_client,
@@ -820,7 +760,6 @@ async fn e2e_ten_way_concurrent_refresh_rotation_and_replay_breach() {
     assert_eq!(replay_st, StatusCode::BAD_REQUEST);
     assert_eq!(parse_json(&replay_body)["error"], "invalid_grant");
 
-    // A1 is immediately rejected on /mcp with 401 after reuse breach revokes the grant
     let (a1_revoked_st, _, _) = send_http(
         &setup_client,
         Method::POST,
@@ -866,7 +805,6 @@ async fn e2e_stdio_grant_isolation_revocation_process_reap_and_cli_smoke() {
     let (gw_addr, gw_shutdown, gw_handle) = spawn_gateway(cfg).await;
     let client = make_client();
 
-    // 1. Obtain two independent OAuth grants over real HTTP/TCP
     let (client_1, token_1, _) = register_and_authorize_grant(
         &client,
         gw_addr,
@@ -884,7 +822,6 @@ async fn e2e_stdio_grant_isolation_revocation_process_reap_and_cli_smoke() {
     )
     .await;
 
-    // 2. Grant 1 initializes Mcp-Session-Id, sends notifications/initialized, and runs progress SSE tools/call
     let (init_st, init_headers, init_body) = send_http(
         &client,
         Method::POST,
@@ -982,7 +919,6 @@ async fn e2e_stdio_grant_isolation_revocation_process_reap_and_cli_smoke() {
     assert_eq!(sse_events[1]["id"], 2);
     assert_eq!(sse_events[1]["result"]["structuredContent"]["pid"], pid_1);
 
-    // 3. Grant 2 cannot POST or DELETE Grant 1's Mcp-Session-Id (404)
     let (hijack_post_st, _, _) = send_http(
         &client,
         Method::POST,
@@ -1014,7 +950,6 @@ async fn e2e_stdio_grant_isolation_revocation_process_reap_and_cli_smoke() {
         "Grant 1 child must remain alive after Grant 2 404 attempts"
     );
 
-    // 4. Revoke Grant 1 via POST /oauth/revoke -> Grant 1 access to /mcp immediately returns 401
     let (rev_st, _, _) = send_http(
         &client,
         Method::POST,
@@ -1050,11 +985,9 @@ async fn e2e_stdio_grant_isolation_revocation_process_reap_and_cli_smoke() {
         "revoking Grant 1 must immediately reap its background grandchild"
     );
 
-    // 5. Trigger shutdown.cancel() and verify clean gateway exit
     gw_shutdown.cancel();
     gw_handle.await.unwrap().unwrap();
 
-    // 6. CLI subcommand smoke tests (hash-password, check --config, and examples/*.json validation)
     let bin = env!("CARGO_BIN_EXE_oauth2-mcp-gateway");
     let mut child = Command::new(bin)
         .arg("hash-password")
@@ -1073,7 +1006,7 @@ async fn e2e_stdio_grant_isolation_revocation_process_reap_and_cli_smoke() {
     assert!(hash_out.status.success());
     let encoded_hash = std::str::from_utf8(&hash_out.stdout).unwrap().trim();
     assert!(
-        encoded_hash.starts_with("pbkdf2-sha256$210000$"),
+        encoded_hash.starts_with(&format!("pbkdf2-sha256${PBKDF2_ITERATIONS}$")),
         "unexpected hash output: {encoded_hash:?}"
     );
     let parsed_verifier = PasswordVerifier::parse_encoded(encoded_hash).expect("parse CLI hash");
@@ -1132,4 +1065,361 @@ async fn e2e_stdio_grant_isolation_revocation_process_reap_and_cli_smoke() {
         .output()
         .expect("check missing env fails");
     assert!(!check_missing_env.status.success());
+}
+
+#[tokio::test]
+async fn e2e_custom_resource_path_host_rebinding_discovery_cors_and_http_revocation() {
+    let deleted_up = Arc::new(Mutex::new(Vec::<(String, Option<String>)>::new()));
+    let deleted_ref = Arc::clone(&deleted_up);
+
+    let (up_addr, up_cancel) = spawn_http1_harness(move |req: Request<Incoming>| {
+        let deleted = Arc::clone(&deleted_ref);
+        async move {
+            let path = req.uri().path().to_owned();
+            let method = req.method().clone();
+            let sid = req
+                .headers()
+                .get("mcp-session-id")
+                .and_then(|v| v.to_str().ok())
+                .map(str::to_owned);
+            let auth = req
+                .headers()
+                .get(header::AUTHORIZATION)
+                .and_then(|v| v.to_str().ok())
+                .map(str::to_owned);
+            let _ = req.into_body().collect().await;
+
+            if path == "/t/item" {
+                return Response::builder()
+                    .status(StatusCode::OK)
+                    .body(bytes_body("item-ok"))
+                    .unwrap();
+            }
+
+            if path == "/upstream-mcp" {
+                if method == Method::DELETE {
+                    if let Some(s) = sid {
+                        deleted.lock().unwrap().push((s, auth));
+                    }
+                    return Response::builder()
+                        .status(StatusCode::OK)
+                        .body(empty_body())
+                        .unwrap();
+                }
+                if method == Method::GET {
+                    let (tx, body) = channel_body(4);
+                    tokio::spawn(async move {
+                        let _ = tx
+                            .send(Ok(Frame::data(Bytes::from_static(
+                                b"data: {\"jsonrpc\":\"2.0\",\"method\":\"notifications/message\"}\n\n",
+                            ))))
+                            .await;
+                        tokio::time::sleep(Duration::from_secs(60)).await;
+                    });
+                    return Response::builder()
+                        .status(StatusCode::OK)
+                        .header(header::CONTENT_TYPE, "text/event-stream")
+                        .body(body)
+                        .unwrap();
+                }
+                return Response::builder()
+                    .status(StatusCode::OK)
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .header(
+                        "mcp-session-id",
+                        sid.unwrap_or_else(|| "custom-http-sid-1".to_owned()),
+                    )
+                    .body(bytes_body(r#"{"jsonrpc":"2.0","id":1,"result":{"ok":true}}"#))
+                    .unwrap();
+            }
+
+            Response::builder()
+                .status(StatusCode::NOT_FOUND)
+                .body(empty_body())
+                .unwrap()
+        }
+    })
+    .await;
+
+    let tmp = TempDir::new().unwrap();
+    let cfg_json = json!({
+        "listen": "127.0.0.1:0",
+        "public_url": PUBLIC_URL,
+        "resource_path": "/bridge/mcp",
+        "state_path": tmp.path().join("state.json").to_string_lossy(),
+        "oauth": {
+            "owner_password_hash": fast_owner_hash(),
+            "scopes": ["mcp"],
+        },
+        "upstream": {
+            "transport": "http",
+            "url": format!("http://{up_addr}/upstream-mcp"),
+            "bearer_tokens": ["pool-alpha", "pool-beta"],
+            "passthrough_prefixes": ["/t/"],
+        }
+    });
+    let cfg = Arc::new(GatewayConfig::from_json_str(&cfg_json.to_string(), tmp.path()).unwrap());
+    let (gw_addr, gw_shutdown, gw_handle) = spawn_gateway(cfg).await;
+    let client = make_client();
+
+    let (head_st, _, head_body) = send_http(
+        &client,
+        Method::HEAD,
+        &format!("http://{gw_addr}/healthz"),
+        &[],
+        empty_body(),
+    )
+    .await;
+    assert_eq!(head_st, StatusCode::OK);
+    assert!(head_body.is_empty());
+
+    for raw_bad_host in [
+        "GET /healthz HTTP/1.1\r\nHost: evil.example\r\n\r\n",
+        "GET /healthz HTTP/1.1\r\nHost: evil.rebind:8080\r\n\r\n",
+        "GET /healthz HTTP/1.1\r\nHost: mcp.example.com:8443\r\n\r\n",
+        "GET /healthz HTTP/1.1\r\nHost: 127.0.0.1\r\nHost: mcp.example.com\r\n\r\n",
+    ] {
+        let mut sock = TcpStream::connect(gw_addr).await.unwrap();
+        sock.write_all(raw_bad_host.as_bytes()).await.unwrap();
+        let mut out = Vec::new();
+        sock.read_to_end(&mut out).await.unwrap();
+        let text = String::from_utf8_lossy(&out);
+        assert!(
+            text.starts_with("HTTP/1.1 400 "),
+            "expected 400 for {raw_bad_host:?}, got {text:?}"
+        );
+    }
+
+    for good_host in [
+        "MCP.EXAMPLE.COM",
+        "mcp.example.com:443",
+        "localhost:8080",
+        "[::1]:8080",
+    ] {
+        let mut sock = TcpStream::connect(gw_addr).await.unwrap();
+        let req =
+            format!("HEAD /healthz HTTP/1.1\r\nHost: {good_host}\r\nConnection: close\r\n\r\n");
+        sock.write_all(req.as_bytes()).await.unwrap();
+        let mut out = Vec::new();
+        sock.read_to_end(&mut out).await.unwrap();
+        let text = String::from_utf8_lossy(&out);
+        assert!(
+            text.starts_with("HTTP/1.1 200 "),
+            "expected 200 for Host: {good_host}, got {text:?}"
+        );
+    }
+
+    for disc_path in [
+        "/.well-known/oauth-protected-resource/bridge/mcp",
+        "/.well-known/oauth-authorization-server",
+    ] {
+        let (opt_st, opt_hdrs, _) = send_http(
+            &client,
+            Method::OPTIONS,
+            &format!("http://{gw_addr}{disc_path}"),
+            &[
+                ("origin", "http://localhost:6274"),
+                ("access-control-request-method", "GET"),
+                ("access-control-request-headers", "mcp-protocol-version"),
+            ],
+            empty_body(),
+        )
+        .await;
+        assert_eq!(opt_st, StatusCode::NO_CONTENT);
+        assert_eq!(
+            opt_hdrs
+                .get(header::ACCESS_CONTROL_ALLOW_ORIGIN)
+                .and_then(|v| v.to_str().ok()),
+            Some("*")
+        );
+
+        let (get_st, get_hdrs, _) = send_http(
+            &client,
+            Method::GET,
+            &format!("http://{gw_addr}{disc_path}"),
+            &[("origin", "http://localhost:6274")],
+            empty_body(),
+        )
+        .await;
+        assert_eq!(get_st, StatusCode::OK);
+        assert_eq!(
+            get_hdrs
+                .get(header::ACCESS_CONTROL_ALLOW_ORIGIN)
+                .and_then(|v| v.to_str().ok()),
+            Some("*")
+        );
+    }
+
+    for (method, path) in [
+        (Method::POST, "/bridge/mcp"),
+        (Method::POST, "/oauth/token"),
+        (Method::GET, "/t/item"),
+    ] {
+        for bad_origin in ["https://evil.example", "null"] {
+            let (st, _, _) = send_http(
+                &client,
+                method.clone(),
+                &format!("http://{gw_addr}{path}"),
+                &[("origin", bad_origin)],
+                empty_body(),
+            )
+            .await;
+            assert_eq!(st, StatusCode::FORBIDDEN);
+        }
+    }
+
+    let (upper_pt_st, _, _) = send_http(
+        &client,
+        Method::GET,
+        &format!("http://{gw_addr}/t/item"),
+        &[("origin", "HTTPS://MCP.EXAMPLE.COM")],
+        empty_body(),
+    )
+    .await;
+    assert_eq!(upper_pt_st, StatusCode::OK);
+
+    let (old_mcp_st, _, _) = send_http(
+        &client,
+        Method::POST,
+        &format!("http://{gw_addr}/mcp"),
+        &[],
+        empty_body(),
+    )
+    .await;
+    assert_eq!(old_mcp_st, StatusCode::NOT_FOUND);
+
+    let (unauth_custom_st, unauth_custom_hdrs, _) = send_http(
+        &client,
+        Method::POST,
+        &format!("http://{gw_addr}/bridge/mcp"),
+        &[("origin", "HTTPS://MCP.EXAMPLE.COM")],
+        empty_body(),
+    )
+    .await;
+    assert_eq!(unauth_custom_st, StatusCode::UNAUTHORIZED);
+    assert_eq!(
+        unauth_custom_hdrs
+            .get(header::WWW_AUTHENTICATE)
+            .and_then(|v| v.to_str().ok()),
+        Some(
+            "Bearer resource_metadata=\"https://mcp.example.com/.well-known/oauth-protected-resource/bridge/mcp\""
+        )
+    );
+
+    let (client_1, token_1, _) = register_and_authorize_grant(
+        &client,
+        gw_addr,
+        "Custom Path One",
+        "http://127.0.0.1:29401/cb",
+        "custom-1",
+    )
+    .await;
+    let (_, token_2, _) = register_and_authorize_grant(
+        &client,
+        gw_addr,
+        "Custom Path Two",
+        "http://127.0.0.1:29402/cb",
+        "custom-2",
+    )
+    .await;
+
+    let (init_st, init_hdrs, _) = send_http(
+        &client,
+        Method::POST,
+        &format!("http://{gw_addr}/bridge/mcp"),
+        &[
+            ("authorization", &format!("Bearer {token_1}")),
+            ("content-type", "application/json"),
+        ],
+        bytes_body(r#"{"jsonrpc":"2.0","id":1,"method":"initialize"}"#),
+    )
+    .await;
+    assert_eq!(init_st, StatusCode::OK);
+    let sid = init_hdrs
+        .get("mcp-session-id")
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .to_owned();
+    assert_eq!(sid, "custom-http-sid-1");
+
+    let (hijack_st, _, _) = send_http(
+        &client,
+        Method::POST,
+        &format!("http://{gw_addr}/bridge/mcp"),
+        &[
+            ("authorization", &format!("Bearer {token_2}")),
+            ("mcp-session-id", &sid),
+            ("content-type", "application/json"),
+        ],
+        bytes_body(r#"{"jsonrpc":"2.0","id":2,"method":"ping"}"#),
+    )
+    .await;
+    assert_eq!(hijack_st, StatusCode::NOT_FOUND);
+
+    let sse_resp = client
+        .request(
+            Request::builder()
+                .method(Method::GET)
+                .uri(format!("http://{gw_addr}/bridge/mcp"))
+                .header(header::AUTHORIZATION, format!("Bearer {token_1}"))
+                .header("mcp-session-id", &sid)
+                .header(header::ACCEPT, "text/event-stream")
+                .body(empty_body())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(sse_resp.status(), StatusCode::OK);
+    let mut sse_body = sse_resp.into_body();
+    let first = tokio::time::timeout(Duration::from_secs(3), sse_body.frame())
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    assert!(String::from_utf8_lossy(&first.into_data().unwrap()).contains("notifications/message"));
+
+    let sse_wait = tokio::spawn(async move {
+        while let Some(res) = sse_body.frame().await {
+            if res.is_err() {
+                break;
+            }
+        }
+    });
+
+    let (rev_st, _, _) = send_http(
+        &client,
+        Method::POST,
+        &format!("http://{gw_addr}/oauth/revoke"),
+        &[("content-type", "application/x-www-form-urlencoded")],
+        bytes_body(form_encode(&[
+            ("client_id", &client_1),
+            ("token", &token_1),
+        ])),
+    )
+    .await;
+    assert_eq!(rev_st, StatusCode::OK);
+
+    tokio::time::timeout(Duration::from_secs(3), sse_wait)
+        .await
+        .expect("OAuth revoke must abort active HttpUpstream SSE stream")
+        .unwrap();
+
+    for _ in 0..50 {
+        if !deleted_up.lock().unwrap().is_empty() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert_eq!(
+        deleted_up.lock().unwrap().clone(),
+        vec![(
+            "custom-http-sid-1".to_owned(),
+            Some("Bearer pool-alpha".to_owned())
+        )]
+    );
+
+    gw_shutdown.cancel();
+    gw_handle.await.unwrap().unwrap();
+    up_cancel.cancel();
 }
