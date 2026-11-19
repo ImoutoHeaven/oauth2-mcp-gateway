@@ -112,11 +112,15 @@ impl PersistedState {
 #[derive(Clone, Debug)]
 pub struct StateStore {
     path: PathBuf,
+    save_lock: std::sync::Arc<std::sync::Mutex<()>>,
 }
 
 impl StateStore {
     pub fn open(path: PathBuf, now: u64) -> Result<(Self, PersistedState), String> {
-        let store = Self { path };
+        let store = Self {
+            path,
+            save_lock: std::sync::Arc::new(std::sync::Mutex::new(())),
+        };
         match fs::symlink_metadata(&store.path) {
             Ok(meta) => {
                 validate_existing_metadata(&store.path, &meta)?;
@@ -143,6 +147,10 @@ impl StateStore {
     }
 
     pub fn save(&self, state: &PersistedState) -> Result<(), String> {
+        let _save_guard = self
+            .save_lock
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let parent = parent_dir(&self.path);
         fs::create_dir_all(parent)
             .map_err(|e| format!("cannot create state directory {}: {e}", parent.display()))?;
@@ -151,6 +159,11 @@ impl StateStore {
 
         let payload = serde_json::to_vec_pretty(state)
             .map_err(|e| format!("cannot serialize OAuth state: {e}"))?;
+        if payload.len() as u64 > MAX_STATE_FILE_BYTES {
+            return Err(format!(
+                "serialized OAuth state exceeds maximum size limit ({MAX_STATE_FILE_BYTES} bytes)"
+            ));
+        }
         let base_name = self
             .path
             .file_name()
@@ -239,7 +252,7 @@ fn read_state_file(path: &Path) -> Result<PersistedState, String> {
         use std::os::unix::fs::OpenOptionsExt;
         opts.custom_flags(libc::O_NOFOLLOW);
     }
-    let mut file = opts
+    let file = opts
         .open(path)
         .map_err(|e| format!("cannot open state file {}: {e}", path.display()))?;
     let meta = file
@@ -252,9 +265,16 @@ fn read_state_file(path: &Path) -> Result<PersistedState, String> {
             path.display()
         ));
     }
-    let mut buf = Vec::with_capacity(meta.len() as usize);
-    file.read_to_end(&mut buf)
+    let mut buf = Vec::with_capacity((meta.len() as usize).min(MAX_STATE_FILE_BYTES as usize));
+    file.take(MAX_STATE_FILE_BYTES + 1)
+        .read_to_end(&mut buf)
         .map_err(|e| format!("cannot read state file {}: {e}", path.display()))?;
+    if buf.len() as u64 > MAX_STATE_FILE_BYTES {
+        return Err(format!(
+            "state file {} exceeds maximum size limit",
+            path.display()
+        ));
+    }
     let parsed: PersistedState = serde_json::from_slice(&buf)
         .map_err(|e| format!("invalid state JSON in {}: {e}", path.display()))?;
     if parsed.version != STATE_VERSION {
@@ -312,9 +332,8 @@ fn sync_directory(dir: &Path) -> Result<(), String> {
     }
     #[cfg(not(unix))]
     {
-        let dir_file = std::fs::File::open(dir)
-            .map_err(|e| format!("cannot open state directory {}: {e}", dir.display()))?;
-        let _ = dir_file.sync_all();
+        // Windows does not support File::open on directories (ERROR_ACCESS_DENIED).
+        let _ = dir;
     }
     Ok(())
 }
