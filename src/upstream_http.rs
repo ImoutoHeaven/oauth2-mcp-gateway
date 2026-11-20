@@ -1,7 +1,8 @@
 use crate::config::HttpUpstreamSettings;
 use crate::crypto::constant_time_eq_str;
 use crate::types::{
-    HttpReply, ReplyBody, VerifiedToken, bytes_body, empty_body, hex_nibble, method_not_allowed,
+    ByteBudget, ByteLease, HttpReply, ReplyBody, VerifiedToken, bytes_body, empty_body, hex_nibble,
+    method_not_allowed,
 };
 use bytes::{Bytes, BytesMut};
 use http::{
@@ -24,9 +25,28 @@ use tokio::task::JoinSet;
 use tokio_util::sync::CancellationToken;
 
 pub const MAX_MCP_BODY_BYTES: usize = 16 * 1024 * 1024;
-const MAX_PRIMING_BUFFER_BYTES: usize = 1024 * 1024;
-const MAX_HTTP_SESSIONS: usize = 4096;
-const MAX_HTTP_SESSIONS_PER_GRANT: usize = 32;
+pub const MAX_PRIMING_BUFFER_BYTES: usize = 1024 * 1024;
+const PRIMING_FLUSH_CHUNK_BYTES: usize = 64 * 1024;
+
+pub const MAX_HTTP_SESSIONS: usize = 4096;
+pub const MAX_HTTP_SESSIONS_PER_GRANT: usize = 32;
+
+#[derive(Clone, Copy, Debug)]
+pub struct HttpLimits {
+    pub max_priming_buffer_bytes: usize,
+    pub max_sessions: usize,
+    pub max_sessions_per_grant: usize,
+}
+
+impl Default for HttpLimits {
+    fn default() -> Self {
+        Self {
+            max_priming_buffer_bytes: MAX_PRIMING_BUFFER_BYTES,
+            max_sessions: MAX_HTTP_SESSIONS,
+            max_sessions_per_grant: MAX_HTTP_SESSIONS_PER_GRANT,
+        }
+    }
+}
 const MAX_GRANT_EPOCHS: usize = 4096;
 const MAX_SESSION_ID_LEN: usize = 1024;
 const MCP_BODY_READ_TIMEOUT: Duration = Duration::from_secs(30);
@@ -51,9 +71,21 @@ impl HttpClient {
 }
 
 struct SessionBinding {
+    binding_id: u64,
     grant_id: String,
     pool_slot: usize,
     last_used_seq: u64,
+    active_post_streams: usize,
+    cancel: CancellationToken,
+}
+
+enum BindOutcome {
+    Bound {
+        binding_id: u64,
+        session_cancel: CancellationToken,
+        evicted: Option<(String, usize, CancellationToken)>,
+    },
+    CapacityExhausted,
 }
 
 struct ActiveGrantEntry {
@@ -116,51 +148,79 @@ impl HttpSessionState {
         sid: String,
         grant_id: &str,
         pool_slot: usize,
-    ) -> Option<(String, usize)> {
-        let seq = self.next_seq();
-        if let Some(existing) = self.sessions.get_mut(&sid) {
+        limits: HttpLimits,
+    ) -> BindOutcome {
+        if self.sessions.contains_key(&sid) {
+            let seq = self.next_seq();
+            let existing = self.sessions.get_mut(&sid).expect("checked above");
             existing.grant_id.clear();
             existing.grant_id.push_str(grant_id);
             existing.pool_slot = pool_slot;
             existing.last_used_seq = seq;
-            return None;
+            return BindOutcome::Bound {
+                binding_id: existing.binding_id,
+                session_cancel: existing.cancel.clone(),
+                evicted: None,
+            };
         }
-        let mut evicted = None;
+
+        let per_grant_cap = limits.max_sessions_per_grant.max(1);
+        let global_cap = limits.max_sessions.max(1);
         let grant_count = self
             .sessions
             .values()
-            .filter(|b| b.grant_id == grant_id)
+            .filter(|b| constant_time_eq_str(&b.grant_id, grant_id))
             .count();
-        if grant_count >= MAX_HTTP_SESSIONS_PER_GRANT {
-            if let Some((evict_key, evict_slot)) = self
+
+        let mut evicted = None;
+        if grant_count >= per_grant_cap {
+            let Some(evict_key) = self
                 .sessions
                 .iter()
-                .filter(|(_, b)| b.grant_id == grant_id)
+                .filter(|(_, b)| {
+                    constant_time_eq_str(&b.grant_id, grant_id) && b.active_post_streams == 0
+                })
                 .min_by_key(|(_, b)| b.last_used_seq)
-                .map(|(k, b)| (k.clone(), b.pool_slot))
-            {
-                self.sessions.remove(&evict_key);
-                evicted = Some((evict_key, evict_slot));
+                .map(|(k, _)| k.clone())
+            else {
+                return BindOutcome::CapacityExhausted;
+            };
+            if let Some(removed) = self.sessions.remove(&evict_key) {
+                evicted = Some((evict_key, removed.pool_slot, removed.cancel));
             }
-        } else if self.sessions.len() >= MAX_HTTP_SESSIONS
-            && let Some((evict_key, evict_slot)) = self
+        } else if self.sessions.len() >= global_cap {
+            let Some(evict_key) = self
                 .sessions
                 .iter()
+                .filter(|(_, b)| b.active_post_streams == 0)
                 .min_by_key(|(_, b)| b.last_used_seq)
-                .map(|(k, b)| (k.clone(), b.pool_slot))
-        {
-            self.sessions.remove(&evict_key);
-            evicted = Some((evict_key, evict_slot));
+                .map(|(k, _)| k.clone())
+            else {
+                return BindOutcome::CapacityExhausted;
+            };
+            if let Some(removed) = self.sessions.remove(&evict_key) {
+                evicted = Some((evict_key, removed.pool_slot, removed.cancel));
+            }
         }
+
+        let seq = self.next_seq();
+        let cancel = CancellationToken::new();
         self.sessions.insert(
             sid,
             SessionBinding {
+                binding_id: seq,
                 grant_id: grant_id.to_owned(),
                 pool_slot,
                 last_used_seq: seq,
+                active_post_streams: 0,
+                cancel: cancel.clone(),
             },
         );
-        evicted
+        BindOutcome::Bound {
+            binding_id: seq,
+            session_cancel: cancel,
+            evicted,
+        }
     }
 
     fn acquire_grant_stream(
@@ -168,6 +228,7 @@ impl HttpSessionState {
         grant_id: &str,
         root_cancel: &CancellationToken,
         state_arc: &Arc<Mutex<Self>>,
+        post_claim: Option<(String, u64)>,
     ) -> (CancellationToken, GrantStreamGuard) {
         let entry = self
             .active_grants
@@ -181,7 +242,9 @@ impl HttpSessionState {
         let guard = GrantStreamGuard {
             state: Arc::clone(state_arc),
             grant_id: grant_id.to_owned(),
-            cancel: cancel.clone(),
+            grant_cancel: cancel.clone(),
+            post_sessions: [post_claim, None],
+            refresh_seq_on_drop: false,
         };
         (cancel, guard)
     }
@@ -190,16 +253,38 @@ impl HttpSessionState {
 struct GrantStreamGuard {
     state: Arc<Mutex<HttpSessionState>>,
     grant_id: String,
-    cancel: CancellationToken,
+    grant_cancel: CancellationToken,
+    post_sessions: [Option<(String, u64)>; 2],
+    refresh_seq_on_drop: bool,
 }
 
 impl Drop for GrantStreamGuard {
     fn drop(&mut self) {
-        if self.cancel.is_cancelled() {
+        let has_post = self.post_sessions.iter().any(Option::is_some);
+        if self.grant_cancel.is_cancelled() && !has_post {
             return;
         }
         let mut st = self.state.lock().unwrap_or_else(|p| p.into_inner());
-        if let Some(entry) = st.active_grants.get_mut(&self.grant_id)
+        if has_post {
+            let seq = if self.refresh_seq_on_drop {
+                Some(st.next_seq())
+            } else {
+                None
+            };
+            for slot in &mut self.post_sessions {
+                if let Some((sid, bid)) = slot.take()
+                    && let Some(binding) = st.sessions.get_mut(&sid)
+                    && binding.binding_id == bid
+                {
+                    binding.active_post_streams = binding.active_post_streams.saturating_sub(1);
+                    if let Some(s) = seq {
+                        binding.last_used_seq = s;
+                    }
+                }
+            }
+        }
+        if !self.grant_cancel.is_cancelled()
+            && let Some(entry) = st.active_grants.get_mut(&self.grant_id)
             && !entry.cancel.is_cancelled()
         {
             entry.active_streams = entry.active_streams.saturating_sub(1);
@@ -212,6 +297,8 @@ impl Drop for GrantStreamGuard {
 
 pub struct HttpUpstream {
     settings: HttpUpstreamSettings,
+    budget: Arc<ByteBudget>,
+    limits: HttpLimits,
     client: HttpClient,
     origin_base_str: String,
     mcp_url_str: String,
@@ -223,6 +310,14 @@ pub struct HttpUpstream {
 
 impl HttpUpstream {
     pub fn new(settings: HttpUpstreamSettings) -> Result<Self, String> {
+        Self::with_limits(settings, ByteBudget::global(), HttpLimits::default())
+    }
+
+    pub fn with_limits(
+        settings: HttpUpstreamSettings,
+        budget: Arc<ByteBudget>,
+        limits: HttpLimits,
+    ) -> Result<Self, String> {
         let mut http_connector = HttpConnector::new();
         http_connector.set_connect_timeout(Some(CONNECT_TIMEOUT));
         http_connector.set_nodelay(true);
@@ -273,6 +368,8 @@ impl HttpUpstream {
 
         Ok(Self {
             settings,
+            budget,
+            limits,
             client,
             origin_base_str,
             mcp_url_str,
@@ -284,7 +381,10 @@ impl HttpUpstream {
     }
 
     pub async fn terminate_grant(&self, grant_id: &str) {
-        let (grant_cancel, owned_sessions): (Option<CancellationToken>, Vec<(String, usize)>) = {
+        let (grant_cancel, owned_sessions): (
+            Option<CancellationToken>,
+            Vec<(String, usize, CancellationToken)>,
+        ) = {
             let mut st = self.state.lock().unwrap_or_else(|p| p.into_inner());
             st.bump_grant_epoch(grant_id);
             let cancel = st.active_grants.remove(grant_id).map(|e| e.cancel);
@@ -297,7 +397,7 @@ impl HttpUpstream {
             let mut owned = Vec::with_capacity(keys.len());
             for k in keys {
                 if let Some(b) = st.sessions.remove(&k) {
-                    owned.push((k, b.pool_slot));
+                    owned.push((k, b.pool_slot, b.cancel));
                 }
             }
             (cancel, owned)
@@ -306,13 +406,16 @@ impl HttpUpstream {
         if let Some(cancel) = grant_cancel {
             cancel.cancel();
         }
+        for (_, _, sc) in &owned_sessions {
+            sc.cancel();
+        }
 
         if owned_sessions.is_empty() {
             return;
         }
 
         let mut deletes = JoinSet::new();
-        for (sid, pool_slot) in owned_sessions {
+        for (sid, pool_slot, _) in owned_sessions {
             if let Some(req) = self.build_session_delete_request(&sid, pool_slot) {
                 let client = self.client.clone();
                 let timeout_dur = REVOKE_DELETE_TIMEOUT
@@ -330,8 +433,10 @@ impl HttpUpstream {
         let cancels: Vec<CancellationToken> = {
             let mut st = self.state.lock().unwrap_or_else(|p| p.into_inner());
             st.shutting_down = true;
-            st.sessions.clear();
-            st.active_grants.drain().map(|(_, e)| e.cancel).collect()
+            let mut all: Vec<CancellationToken> =
+                st.sessions.drain().map(|(_, b)| b.cancel).collect();
+            all.extend(st.active_grants.drain().map(|(_, e)| e.cancel));
+            all
         };
         for c in cancels {
             c.cancel();
@@ -428,6 +533,7 @@ impl HttpUpstream {
             incoming.map_err(io::Error::other),
             self.shutdown_token.child_token(),
             None,
+            None,
             timeout_dur,
         )
         .boxed();
@@ -454,6 +560,7 @@ impl HttpUpstream {
         let out_body = GrantBoundBody::new(
             up_body.map_err(io::Error::other),
             self.shutdown_token.child_token(),
+            None,
             None,
             timeout_dur,
         )
@@ -497,11 +604,14 @@ impl HttpUpstream {
             return close_empty_reply(StatusCode::BAD_REQUEST);
         };
 
-        let (start_epoch, grant_cancel, stream_guard) = {
+        let (start_epoch, grant_cancel, req_session_cancel, req_binding_id, mut stream_guard) = {
             let mut st = self.state.lock().unwrap_or_else(|p| p.into_inner());
             if st.shutting_down {
                 return empty_status_reply(StatusCode::SERVICE_UNAVAILABLE);
             }
+            let mut session_cancel = None;
+            let mut binding_id = None;
+            let mut post_claim = None;
             if let Some(ref sid) = req_sid {
                 let owned = st
                     .sessions
@@ -510,15 +620,31 @@ impl HttpUpstream {
                 if !owned {
                     return empty_status_reply(StatusCode::NOT_FOUND);
                 }
-                let seq = st.next_seq();
+                let seq = if method == Method::POST {
+                    Some(st.next_seq())
+                } else {
+                    None
+                };
                 if let Some(b) = st.sessions.get_mut(sid) {
-                    b.last_used_seq = seq;
+                    if let Some(s) = seq {
+                        b.last_used_seq = s;
+                    }
+                    binding_id = Some(b.binding_id);
+                    session_cancel = Some(b.cancel.clone());
+                    if method == Method::POST {
+                        b.active_post_streams += 1;
+                        post_claim = Some((sid.clone(), b.binding_id));
+                    }
                 }
             }
             let epoch = st.grant_epoch(&token.grant_id);
-            let (cancel, guard) =
-                st.acquire_grant_stream(&token.grant_id, &self.shutdown_token, &self.state);
-            (epoch, cancel, guard)
+            let (cancel, guard) = st.acquire_grant_stream(
+                &token.grant_id,
+                &self.shutdown_token,
+                &self.state,
+                post_claim,
+            );
+            (epoch, cancel, session_cancel, binding_id, guard)
         };
 
         let (parts, incoming) = req.into_parts();
@@ -565,9 +691,20 @@ impl HttpUpstream {
         };
 
         let timeout_dur = Duration::from_secs(self.settings.request_timeout_secs);
+        let get_session_cancel = req_session_cancel
+            .as_ref()
+            .filter(|_| method == Method::GET);
         let up_resp = tokio::select! {
             _ = grant_cancel.cancelled() => {
                 return empty_status_reply(StatusCode::SERVICE_UNAVAILABLE);
+            }
+            _ = async {
+                match get_session_cancel {
+                    Some(sc) => sc.cancelled().await,
+                    None => std::future::pending::<()>().await,
+                }
+            } => {
+                return empty_status_reply(StatusCode::NOT_FOUND);
             }
             res = tokio::time::timeout(timeout_dur, self.client.request(out_req)) => match res {
                 Ok(Ok(resp)) => resp,
@@ -591,6 +728,8 @@ impl HttpUpstream {
         };
 
         let mut pending_deletes: Vec<(String, usize)> = Vec::new();
+        let mut cancels_to_fire: Vec<CancellationToken> = Vec::new();
+        let mut body_session_cancel: Option<CancellationToken> = None;
         let session_outcome = {
             let mut st = self.state.lock().unwrap_or_else(|p| p.into_inner());
             if st.shutting_down || st.grant_epoch(&token.grant_id) != start_epoch {
@@ -600,20 +739,27 @@ impl HttpUpstream {
                 Err(StatusCode::SERVICE_UNAVAILABLE)
             } else if method == Method::DELETE || up_parts.status == StatusCode::NOT_FOUND {
                 if let Some(ref sid) = req_sid
-                    && st
-                        .sessions
-                        .get(sid)
-                        .is_some_and(|b| constant_time_eq_str(&b.grant_id, &token.grant_id))
+                    && st.sessions.get(sid).is_some_and(|b| {
+                        Some(b.binding_id) == req_binding_id
+                            && constant_time_eq_str(&b.grant_id, &token.grant_id)
+                    })
+                    && let Some(removed) = st.sessions.remove(sid)
                 {
-                    st.sessions.remove(sid);
+                    cancels_to_fire.push(removed.cancel);
                 }
                 Ok(())
             } else if let Some(ref sid) = req_sid
-                && !st
-                    .sessions
-                    .get(sid)
-                    .is_some_and(|b| constant_time_eq_str(&b.grant_id, &token.grant_id))
+                && !st.sessions.get(sid).is_some_and(|b| {
+                    Some(b.binding_id) == req_binding_id
+                        && constant_time_eq_str(&b.grant_id, &token.grant_id)
+                })
             {
+                if let Some(ref rsid) = resp_sid
+                    && req_sid.as_deref() != Some(rsid.as_str())
+                    && !st.sessions.contains_key(rsid)
+                {
+                    pending_deletes.push((rsid.clone(), token.pool_slot));
+                }
                 Err(StatusCode::NOT_FOUND)
             } else if let Some(ref rsid) = resp_sid
                 && st
@@ -623,23 +769,70 @@ impl HttpUpstream {
             {
                 Err(StatusCode::BAD_GATEWAY)
             } else {
+                body_session_cancel = req_session_cancel;
+                let mut outcome = Ok(());
                 if up_parts.status.is_success() {
-                    if let Some(ref sid) = req_sid
-                        && let Some(evicted) =
-                            st.bind_session(sid.clone(), &token.grant_id, token.pool_slot)
-                    {
-                        pending_deletes.push(evicted);
+                    if let Some(ref sid) = req_sid {
+                        let seq = if method == Method::POST {
+                            Some(st.next_seq())
+                        } else {
+                            None
+                        };
+                        if let Some(b) = st.sessions.get_mut(sid) {
+                            b.pool_slot = token.pool_slot;
+                            if let Some(s) = seq {
+                                b.last_used_seq = s;
+                            }
+                            body_session_cancel = Some(b.cancel.clone());
+                        }
                     }
                     if let Some(ref rsid) = resp_sid
-                        && let Some(evicted) =
-                            st.bind_session(rsid.clone(), &token.grant_id, token.pool_slot)
+                        && req_sid.as_deref() != Some(rsid.as_str())
                     {
-                        pending_deletes.push(evicted);
+                        let was_existing = st.sessions.contains_key(rsid);
+                        match st.bind_session(
+                            rsid.clone(),
+                            &token.grant_id,
+                            token.pool_slot,
+                            self.limits,
+                        ) {
+                            BindOutcome::Bound {
+                                binding_id,
+                                session_cancel,
+                                evicted,
+                            } => {
+                                body_session_cancel = Some(session_cancel);
+                                if let Some((ev_sid, ev_slot, ev_cancel)) = evicted {
+                                    cancels_to_fire.push(ev_cancel);
+                                    pending_deletes.push((ev_sid, ev_slot));
+                                }
+                                if method == Method::POST
+                                    && let Some(b) = st.sessions.get_mut(rsid)
+                                {
+                                    b.active_post_streams += 1;
+                                    stream_guard.post_sessions[1] =
+                                        Some((rsid.clone(), binding_id));
+                                }
+                            }
+                            BindOutcome::CapacityExhausted => {
+                                if !was_existing {
+                                    pending_deletes.push((rsid.clone(), token.pool_slot));
+                                }
+                                outcome = Err(StatusCode::SERVICE_UNAVAILABLE);
+                            }
+                        }
+                    }
+                    if outcome.is_ok() && method == Method::POST {
+                        stream_guard.refresh_seq_on_drop = true;
                     }
                 }
-                Ok(())
+                outcome
             }
         };
+
+        for c in cancels_to_fire {
+            c.cancel();
+        }
 
         for (sid, slot) in pending_deletes {
             if let Some(del_req) = self.build_session_delete_request(&sid, slot) {
@@ -671,8 +864,13 @@ impl HttpUpstream {
 
         let out_body: ReplyBody = if is_sse {
             GrantBoundBody::new(
-                SsePrimingFilterBody::new(up_body),
+                SsePrimingFilterBody::new(
+                    up_body,
+                    Arc::clone(&self.budget),
+                    self.limits.max_priming_buffer_bytes,
+                ),
                 grant_cancel,
+                body_session_cancel,
                 Some(stream_guard),
                 timeout_dur,
             )
@@ -681,6 +879,7 @@ impl HttpUpstream {
             GrantBoundBody::new(
                 up_body.map_err(io::Error::other),
                 grant_cancel,
+                body_session_cancel,
                 Some(stream_guard),
                 timeout_dur,
             )
@@ -731,12 +930,22 @@ impl<B> GrantBoundBody<B> {
     fn new(
         inner: B,
         cancel: CancellationToken,
+        session_cancel: Option<CancellationToken>,
         guard: Option<GrantStreamGuard>,
         frame_timeout: Duration,
     ) -> Self {
+        let fut: Pin<Box<dyn Future<Output = ()> + Send>> = match session_cancel {
+            Some(sc) => Box::pin(async move {
+                tokio::select! {
+                    _ = cancel.cancelled() => {}
+                    _ = sc.cancelled() => {}
+                }
+            }),
+            None => Box::pin(cancel.cancelled_owned()),
+        };
         Self {
             inner,
-            cancel_fut: Mutex::new(Box::pin(cancel.cancelled_owned())),
+            cancel_fut: Mutex::new(fut),
             frame_timeout,
             idle_sleep: Box::pin(tokio::time::sleep(frame_timeout)),
             guard,
@@ -1062,22 +1271,58 @@ fn empty_status_reply(status: StatusCode) -> HttpReply {
 struct SsePrimingFilterBody<B> {
     inner: B,
     buf: BytesMut,
+    lease: Option<ByteLease>,
+    budget: Arc<ByteBudget>,
+    max_priming_bytes: usize,
     scan_pos: usize,
     line_start: usize,
     filtering: bool,
+    inner_eof: bool,
     pending_frame: Option<Frame<Bytes>>,
 }
 
 impl<B> SsePrimingFilterBody<B> {
-    fn new(inner: B) -> Self {
+    fn new(inner: B, budget: Arc<ByteBudget>, max_priming_bytes: usize) -> Self {
         Self {
             inner,
             buf: BytesMut::new(),
+            lease: None,
+            budget,
+            max_priming_bytes,
             scan_pos: 0,
             line_start: 0,
             filtering: true,
+            inner_eof: false,
             pending_frame: None,
         }
+    }
+
+    fn reserve_buf_lease(&mut self, target_len: usize) -> bool {
+        match self.lease.as_mut() {
+            Some(lease) => lease.try_reserve(target_len),
+            None => match ByteBudget::try_acquire(&self.budget, target_len) {
+                Some(lease) => {
+                    self.lease = Some(lease);
+                    true
+                }
+                None => false,
+            },
+        }
+    }
+
+    fn sync_buf_lease(&mut self) {
+        if self.buf.is_empty() {
+            self.buf = BytesMut::new();
+            self.lease = None;
+        } else if let Some(ref mut lease) = self.lease {
+            lease.shrink_to(self.buf.len());
+        }
+    }
+
+    fn clear_buffers(&mut self) {
+        self.buf = BytesMut::new();
+        self.lease = None;
+        self.pending_frame = None;
     }
 }
 
@@ -1095,17 +1340,26 @@ where
     ) -> Poll<Option<Result<Frame<Self::Data>, Self::Error>>> {
         let this = self.get_mut();
         loop {
-            if !this.filtering && !this.buf.is_empty() {
-                let out = this.buf.split().freeze();
-                return Poll::Ready(Some(Ok(Frame::data(out))));
+            if !this.filtering {
+                if !this.buf.is_empty() {
+                    let take = this.buf.len().min(PRIMING_FLUSH_CHUNK_BYTES);
+                    let out = this.buf.split_to(take).freeze();
+                    this.sync_buf_lease();
+                    return Poll::Ready(Some(Ok(Frame::data(out))));
+                }
+                if let Some(frame) = this.pending_frame.take() {
+                    return Poll::Ready(Some(Ok(frame)));
+                }
             }
-            if let Some(frame) = this.pending_frame.take() {
-                return Poll::Ready(Some(Ok(frame)));
+
+            if this.inner_eof {
+                return Poll::Ready(None);
             }
 
             match Pin::new(&mut this.inner).poll_frame(cx) {
                 Poll::Pending => return Poll::Pending,
                 Poll::Ready(Some(Err(err))) => {
+                    this.clear_buffers();
                     return Poll::Ready(Some(Err(io::Error::other(err))));
                 }
                 Poll::Ready(Some(Ok(frame))) => {
@@ -1113,21 +1367,47 @@ where
                         return Poll::Ready(Some(Ok(frame)));
                     }
                     match frame.into_data() {
-                        Ok(chunk) => {
+                        Ok(mut chunk) => {
                             if chunk.is_empty() {
                                 continue;
                             }
-                            this.buf.extend_from_slice(&chunk);
-                            scan_priming_buffer(
-                                &mut this.buf,
-                                &mut this.scan_pos,
-                                &mut this.line_start,
-                                &mut this.filtering,
-                                false,
-                            );
-                            if !this.filtering && !this.buf.is_empty() {
-                                let out = this.buf.split().freeze();
-                                return Poll::Ready(Some(Ok(Frame::data(out))));
+                            while this.filtering && !chunk.is_empty() {
+                                if this.scan_pos == this.buf.len()
+                                    && this.line_start == this.buf.len()
+                                    && starts_with_sse_data(&chunk)
+                                {
+                                    this.filtering = false;
+                                    break;
+                                }
+                                let room = this.max_priming_bytes.saturating_sub(this.buf.len());
+                                if room == 0 {
+                                    this.filtering = false;
+                                    break;
+                                }
+                                let take = next_priming_step_len(&chunk, room);
+                                let target_len = this.buf.len() + take;
+                                if !this.reserve_buf_lease(target_len) {
+                                    this.clear_buffers();
+                                    return Poll::Ready(Some(Err(io::Error::other(
+                                        "process active byte budget exceeded",
+                                    ))));
+                                }
+                                this.buf.extend_from_slice(&chunk[..take]);
+                                chunk = chunk.slice(take..);
+                                scan_priming_buffer(
+                                    &mut this.buf,
+                                    &mut this.scan_pos,
+                                    &mut this.line_start,
+                                    &mut this.filtering,
+                                    false,
+                                );
+                                this.sync_buf_lease();
+                            }
+                            if !this.filtering && !chunk.is_empty() {
+                                if this.buf.is_empty() {
+                                    return Poll::Ready(Some(Ok(Frame::data(chunk))));
+                                }
+                                this.pending_frame = Some(Frame::data(chunk));
                             }
                         }
                         Err(non_data_frame) => {
@@ -1138,18 +1418,19 @@ where
                                 &mut this.filtering,
                                 true,
                             );
+                            this.sync_buf_lease();
                             if !this.filtering && !this.buf.is_empty() {
                                 this.pending_frame = Some(non_data_frame);
-                                let out = this.buf.split().freeze();
-                                return Poll::Ready(Some(Ok(Frame::data(out))));
+                                continue;
                             }
                             this.filtering = false;
-                            this.buf.clear();
+                            this.clear_buffers();
                             return Poll::Ready(Some(Ok(non_data_frame)));
                         }
                     }
                 }
                 Poll::Ready(None) => {
+                    this.inner_eof = true;
                     if this.filtering {
                         scan_priming_buffer(
                             &mut this.buf,
@@ -1158,12 +1439,12 @@ where
                             &mut this.filtering,
                             true,
                         );
+                        this.sync_buf_lease();
                         if !this.filtering && !this.buf.is_empty() {
-                            let out = this.buf.split().freeze();
-                            return Poll::Ready(Some(Ok(Frame::data(out))));
+                            continue;
                         }
                         this.filtering = false;
-                        this.buf.clear();
+                        this.clear_buffers();
                     }
                     return Poll::Ready(None);
                 }
@@ -1173,6 +1454,23 @@ where
 
     fn size_hint(&self) -> SizeHint {
         SizeHint::default()
+    }
+}
+
+fn starts_with_sse_data(chunk: &[u8]) -> bool {
+    chunk.starts_with(b"data:") || chunk.starts_with(b"data\n") || chunk.starts_with(b"data\r")
+}
+
+fn next_priming_step_len(chunk: &[u8], room: usize) -> usize {
+    let window = &chunk[..chunk.len().min(room)];
+    if let Some(pos) = window.iter().position(|&b| b == b'\n' || b == b'\r') {
+        if window[pos] == b'\r' && pos + 1 < window.len() && window[pos + 1] == b'\n' {
+            pos + 2
+        } else {
+            pos + 1
+        }
+    } else {
+        window.len()
     }
 }
 
@@ -1199,9 +1497,7 @@ fn scan_priming_buffer(
                 (*scan_pos, *scan_pos + 1)
             } else {
                 // Pause at trailing CR in case LF arrives next, unless line is already data.
-                if is_sse_data_line(&buf[*line_start..*scan_pos])
-                    || buf.len() > MAX_PRIMING_BUFFER_BYTES
-                {
+                if is_sse_data_line(&buf[*line_start..*scan_pos]) {
                     *filtering = false;
                 }
                 return;
@@ -1227,10 +1523,7 @@ fn scan_priming_buffer(
     }
 
     let tail = &buf[*line_start..];
-    if tail.starts_with(b"data:")
-        || (eof && is_sse_data_line(tail))
-        || buf.len() > MAX_PRIMING_BUFFER_BYTES
-    {
+    if tail.starts_with(b"data:") || (eof && is_sse_data_line(tail)) {
         *filtering = false;
     }
 }
@@ -1280,5 +1573,444 @@ mod tests {
         );
         assert!(!filtering);
         assert_eq!(&buf[..], b"id: ev-cr\rdata\r\r");
+    }
+
+    #[tokio::test]
+    async fn sse_priming_filter_enforces_pre_append_cap_and_budget_boundaries() {
+        let cap = 128usize;
+        let budget = ByteBudget::new(4096);
+
+        for priming_len in [cap - 1, cap] {
+            let mut priming = vec![b':'];
+            priming.extend(std::iter::repeat_n(b'p', priming_len - 3));
+            priming.extend_from_slice(b"\n\n");
+            assert_eq!(priming.len(), priming_len);
+
+            let mut single_chunk = priming;
+            single_chunk.extend_from_slice(b"data: {\"ok\":true}\n\n");
+            let inner = bytes_body(single_chunk);
+            let mut filter = SsePrimingFilterBody::new(inner, Arc::clone(&budget), cap);
+            let out = BodyExt::collect(&mut filter).await.unwrap().to_bytes();
+            assert_eq!(&out[..], b"data: {\"ok\":true}\n\n");
+            assert_eq!(budget.used(), 0);
+        }
+
+        // N + 1 priming block without blank line stops filtering before exceeding `cap` in `buf`.
+        let mut oversized_priming = vec![b':'];
+        oversized_priming.extend(std::iter::repeat_n(b'q', cap - 2));
+        oversized_priming.extend_from_slice(b"\n\n");
+        assert_eq!(oversized_priming.len(), cap + 1);
+        let mut big_chunk = oversized_priming.clone();
+        big_chunk.extend(std::iter::repeat_n(b'x', 256 * 1024));
+        big_chunk.extend_from_slice(b"\ndata: {\"ok\":true}\n\n");
+
+        let expected = big_chunk.clone();
+        let mut filter = SsePrimingFilterBody::new(bytes_body(big_chunk), Arc::clone(&budget), cap);
+        let mut collected = Vec::new();
+        while let Some(frame) = BodyExt::frame(&mut filter).await {
+            assert!(
+                filter.buf.len() <= cap,
+                "priming buf exceeded cap: {}",
+                filter.buf.len()
+            );
+            if let Ok(data) = frame.unwrap().into_data() {
+                collected.extend_from_slice(&data);
+            }
+        }
+        assert_eq!(collected, expected);
+        assert_eq!(budget.used(), 0);
+
+        // Exact N-1 / N pass and N+1 non-blocking reject on process ByteBudget, releasing held bytes.
+        let tight_limit = 64usize;
+        let tight_budget = ByteBudget::new(tight_limit);
+        for len in [tight_limit - 1, tight_limit] {
+            let mut priming = vec![b':'];
+            priming.extend(std::iter::repeat_n(b'm', len - 3));
+            priming.extend_from_slice(b"\n\ndata: 1\n\n");
+            let mut f =
+                SsePrimingFilterBody::new(bytes_body(priming), Arc::clone(&tight_budget), 512);
+            let out = BodyExt::collect(&mut f).await.unwrap().to_bytes();
+            assert_eq!(&out[..], b"data: 1\n\n");
+            assert_eq!(tight_budget.used(), 0);
+        }
+
+        let (mut tx, rx) = tokio::sync::mpsc::channel::<Result<Frame<Bytes>, io::Error>>(4);
+        let rx_body = futures_channel_body(rx);
+        let mut f_over = SsePrimingFilterBody::new(rx_body, Arc::clone(&tight_budget), 512);
+
+        let mut part1 = vec![b':'];
+        part1.extend(std::iter::repeat_n(b'a', tight_limit - 1));
+        assert_eq!(part1.len(), tight_limit);
+        tx.send(Ok(Frame::data(Bytes::from(part1)))).await.unwrap();
+
+        let waker = std::task::Waker::noop();
+        let mut cx = Context::from_waker(waker);
+        assert!(Pin::new(&mut f_over).poll_frame(&mut cx).is_pending());
+        assert_eq!(tight_budget.used(), tight_limit);
+
+        // Appending 1 more byte (N + 1) must fail non-blockingly and release all `tight_limit` held bytes.
+        tx.send(Ok(Frame::data(Bytes::from_static(b"z"))))
+            .await
+            .unwrap();
+        let res = Pin::new(&mut f_over).poll_frame(&mut cx);
+        match res {
+            Poll::Ready(Some(Err(err))) => {
+                assert!(
+                    err.to_string().contains("byte budget"),
+                    "unexpected err: {err}"
+                );
+            }
+            other => panic!("expected budget error at N+1, got {other:?}"),
+        }
+        assert_eq!(
+            tight_budget.used(),
+            0,
+            "failed growth must immediately release previously held lease"
+        );
+        let _ = &mut tx;
+    }
+
+    struct MpscBody {
+        rx: tokio::sync::mpsc::Receiver<Result<Frame<Bytes>, io::Error>>,
+    }
+
+    impl Body for MpscBody {
+        type Data = Bytes;
+        type Error = io::Error;
+
+        fn poll_frame(
+            mut self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+        ) -> Poll<Option<Result<Frame<Self::Data>, Self::Error>>> {
+            self.rx.poll_recv(cx)
+        }
+    }
+
+    fn futures_channel_body(
+        rx: tokio::sync::mpsc::Receiver<Result<Frame<Bytes>, io::Error>>,
+    ) -> ReplyBody {
+        MpscBody { rx }.boxed()
+    }
+
+    #[test]
+    fn bind_session_enforces_global_cap_and_active_post_protection() {
+        let mut st = HttpSessionState::new();
+        let limits = HttpLimits {
+            max_priming_buffer_bytes: 1024,
+            max_sessions: 2,
+            max_sessions_per_grant: 4,
+        };
+
+        assert!(matches!(
+            st.bind_session("s1".to_owned(), "g1", 0, limits),
+            BindOutcome::Bound { evicted: None, .. }
+        ));
+        assert!(matches!(
+            st.bind_session("s2".to_owned(), "g2", 1, limits),
+            BindOutcome::Bound { evicted: None, .. }
+        ));
+
+        // Mark oldest global session s1 as having an active POST stream; s3 must evict s2 instead of s1.
+        st.sessions.get_mut("s1").unwrap().active_post_streams = 1;
+        match st.bind_session("s3".to_owned(), "g3", 2, limits) {
+            BindOutcome::Bound {
+                evicted: Some((ev_sid, ev_slot, ev_cancel)),
+                ..
+            } => {
+                assert_eq!(ev_sid, "s2");
+                assert_eq!(ev_slot, 1);
+                ev_cancel.cancel();
+                assert!(ev_cancel.is_cancelled());
+            }
+            _ => panic!("expected s2 to be evicted under global cap"),
+        }
+        assert!(st.sessions.contains_key("s1"));
+        assert!(st.sessions.contains_key("s3"));
+
+        // When both global slots have active POST streams, a 3rd distinct session returns CapacityExhausted.
+        st.sessions.get_mut("s3").unwrap().active_post_streams = 1;
+        assert!(matches!(
+            st.bind_session("s4".to_owned(), "g4", 0, limits),
+            BindOutcome::CapacityExhausted
+        ));
+        assert!(!st.sessions.contains_key("s4"));
+        assert_eq!(st.sessions.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn stale_generation_responses_do_not_delete_or_pollute_rebound_same_sid() {
+        use hyper::server::conn::http1;
+        use hyper::service::service_fn;
+        use hyper_util::rt::TokioIo;
+        use tokio::net::TcpListener;
+        use tokio::sync::{Notify, oneshot};
+
+        type GateEntry = (
+            String,
+            oneshot::Sender<(StatusCode, Option<&'static str>, &'static str)>,
+        );
+        let gates: Arc<Mutex<Vec<GateEntry>>> = Arc::new(Mutex::new(Vec::new()));
+        let gate_notify = Arc::new(Notify::new());
+
+        let up_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let up_addr = up_listener.local_addr().unwrap();
+        let gates_up = Arc::clone(&gates);
+        let notify_up = Arc::clone(&gate_notify);
+        let up_task = tokio::spawn(async move {
+            loop {
+                let Ok((stream, _)) = up_listener.accept().await else {
+                    break;
+                };
+                let gates_conn = Arc::clone(&gates_up);
+                let notify_conn = Arc::clone(&notify_up);
+                tokio::spawn(async move {
+                    let svc = service_fn(move |req: Request<Incoming>| {
+                        let gates_req = Arc::clone(&gates_conn);
+                        let notify_req = Arc::clone(&notify_conn);
+                        async move {
+                            let method = req.method().clone();
+                            let tag = req
+                                .headers()
+                                .get("x-test-tag")
+                                .and_then(|v| v.to_str().ok())
+                                .unwrap_or("")
+                                .to_owned();
+                            let _ = req.into_body().collect().await;
+                            if method == Method::DELETE {
+                                return Ok::<_, std::convert::Infallible>(
+                                    Response::builder()
+                                        .status(StatusCode::OK)
+                                        .body(empty_body())
+                                        .unwrap(),
+                                );
+                            }
+                            if tag.starts_with("gated-") {
+                                let (tx, rx) = oneshot::channel();
+                                gates_req.lock().unwrap().push((tag, tx));
+                                notify_req.notify_waiters();
+                                let (status, sid_opt, body_str) = rx.await.unwrap();
+                                let mut b = Response::builder()
+                                    .status(status)
+                                    .header(header::CONTENT_TYPE, "application/json");
+                                if let Some(sid) = sid_opt {
+                                    b = b.header("mcp-session-id", sid);
+                                }
+                                return Ok(b.body(bytes_body(body_str)).unwrap());
+                            }
+                            Ok(Response::builder()
+                                .status(StatusCode::OK)
+                                .header(header::CONTENT_TYPE, "application/json")
+                                .header("mcp-session-id", "reused-sid")
+                                .body(bytes_body(r#"{"jsonrpc":"2.0","id":1,"result":{}}"#))
+                                .unwrap())
+                        }
+                    });
+                    let _ = http1::Builder::new()
+                        .serve_connection(TokioIo::new(stream), svc)
+                        .await;
+                });
+            }
+        });
+
+        let up = Arc::new(
+            HttpUpstream::new(HttpUpstreamSettings {
+                url: url::Url::parse(&format!("http://{up_addr}/mcp")).unwrap(),
+                origin_base: url::Url::parse(&format!("http://{up_addr}")).unwrap(),
+                public_is_https: false,
+                bearer_tokens: Vec::new(),
+                passthrough_prefixes: Vec::new(),
+                request_timeout_secs: 30,
+            })
+            .unwrap(),
+        );
+
+        let gw_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let gw_addr = gw_listener.local_addr().unwrap();
+        let up_gw = Arc::clone(&up);
+        let gw_task = tokio::spawn(async move {
+            loop {
+                let Ok((stream, _)) = gw_listener.accept().await else {
+                    break;
+                };
+                let up_conn = Arc::clone(&up_gw);
+                tokio::spawn(async move {
+                    let svc = service_fn(move |req: Request<Incoming>| {
+                        let up_req = Arc::clone(&up_conn);
+                        async move {
+                            let tok = VerifiedToken {
+                                grant_id: "g-rebind".to_owned(),
+                                client_id: "c1".to_owned(),
+                                pool_slot: 0,
+                                scopes: vec!["mcp".to_owned()],
+                                resource: "https://mcp.example.com/mcp".to_owned(),
+                            };
+                            Ok::<_, std::convert::Infallible>(up_req.handle_mcp(req, &tok).await)
+                        }
+                    });
+                    let _ = http1::Builder::new()
+                        .serve_connection(TokioIo::new(stream), svc)
+                        .await;
+                });
+            }
+        });
+
+        let client: Client<HttpConnector, ReplyBody> =
+            Client::builder(TokioExecutor::new()).build(HttpConnector::new());
+
+        // 1. Bind generation 1 of "reused-sid".
+        let init1 = client
+            .request(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri(format!("http://{gw_addr}/mcp"))
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(bytes_body(
+                        r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(init1.status(), StatusCode::OK);
+        let _ = init1.into_body().collect().await.unwrap();
+        let gen1_bid = up.state.lock().unwrap().sessions["reused-sid"].binding_id;
+
+        // 2. Launch two in-flight POSTs against generation 1 ("gated-404" and "gated-200").
+        let spawn_gated = |tag: &'static str| {
+            let c = client.clone();
+            tokio::spawn(async move {
+                let resp = c
+                    .request(
+                        Request::builder()
+                            .method(Method::POST)
+                            .uri(format!("http://{gw_addr}/mcp"))
+                            .header("mcp-session-id", "reused-sid")
+                            .header("x-test-tag", tag)
+                            .header(header::CONTENT_TYPE, "application/json")
+                            .body(bytes_body(
+                                r#"{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{}}"#,
+                            ))
+                            .unwrap(),
+                    )
+                    .await
+                    .unwrap();
+                let status = resp.status();
+                let _ = resp.into_body().collect().await.unwrap();
+                status
+            })
+        };
+        let fut_404 = spawn_gated("gated-404");
+        let fut_200 = spawn_gated("gated-200");
+
+        while gates.lock().unwrap().len() < 2 {
+            let n = gate_notify.notified();
+            tokio::pin!(n);
+            n.as_mut().enable();
+            if gates.lock().unwrap().len() >= 2 {
+                break;
+            }
+            n.await;
+        }
+        assert_eq!(
+            up.state.lock().unwrap().sessions["reused-sid"].active_post_streams,
+            2
+        );
+
+        // 3. DELETE generation 1, then re-initialize the exact same session ID ("reused-sid", generation 2).
+        let del = client
+            .request(
+                Request::builder()
+                    .method(Method::DELETE)
+                    .uri(format!("http://{gw_addr}/mcp"))
+                    .header("mcp-session-id", "reused-sid")
+                    .body(empty_body())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(del.status(), StatusCode::OK);
+        let _ = del.into_body().collect().await.unwrap();
+
+        let init2 = client
+            .request(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri(format!("http://{gw_addr}/mcp"))
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(bytes_body(
+                        r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(init2.status(), StatusCode::OK);
+        let _ = init2.into_body().collect().await.unwrap();
+
+        let (gen2_bid, gen2_cancel) = {
+            let st = up.state.lock().unwrap();
+            let b = &st.sessions["reused-sid"];
+            assert_ne!(b.binding_id, gen1_bid);
+            assert_eq!(b.active_post_streams, 0);
+            (b.binding_id, b.cancel.clone())
+        };
+
+        // 4. Release generation 1's late 404 and late 200 responses: neither may delete, cancel, or stream onto generation 2!
+        let drained: Vec<GateEntry> = std::mem::take(&mut *gates.lock().unwrap());
+        for (tag, tx) in drained {
+            if tag == "gated-404" {
+                tx.send((StatusCode::NOT_FOUND, None, "")).unwrap();
+            } else {
+                tx.send((
+                    StatusCode::OK,
+                    Some("reused-sid"),
+                    r#"{"jsonrpc":"2.0","id":2,"result":{"stale":true}}"#,
+                ))
+                .unwrap();
+            }
+        }
+        assert_eq!(fut_404.await.unwrap(), StatusCode::NOT_FOUND);
+        assert_eq!(
+            fut_200.await.unwrap(),
+            StatusCode::NOT_FOUND,
+            "stale generation-1 200 response must be rejected with 404 instead of streaming onto generation 2"
+        );
+
+        {
+            let st = up.state.lock().unwrap();
+            let b = st
+                .sessions
+                .get("reused-sid")
+                .expect("generation 2 must survive stale generation 1 404");
+            assert_eq!(b.binding_id, gen2_bid);
+            assert_eq!(b.active_post_streams, 0);
+            assert!(!gen2_cancel.is_cancelled());
+        }
+
+        // 5. Generation 2 remains usable for fresh POST calls.
+        let fresh = client
+            .request(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri(format!("http://{gw_addr}/mcp"))
+                    .header("mcp-session-id", "reused-sid")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(bytes_body(
+                        r#"{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{}}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(fresh.status(), StatusCode::OK);
+        let _ = fresh.into_body().collect().await.unwrap();
+        assert_eq!(
+            up.state.lock().unwrap().sessions["reused-sid"].active_post_streams,
+            0
+        );
+
+        up.shutdown().await;
+        gw_task.abort();
+        up_task.abort();
     }
 }

@@ -13,9 +13,9 @@ use oauth2_mcp_gateway::config::{
     GatewayConfig, HttpUpstreamSettings, StdioUpstreamSettings, UpstreamSettings,
 };
 use oauth2_mcp_gateway::crypto::PasswordVerifier;
-use oauth2_mcp_gateway::types::{VerifiedToken, bytes_body, empty_body};
-use oauth2_mcp_gateway::upstream_http::HttpUpstream;
-use oauth2_mcp_gateway::upstream_stdio::StdioUpstream;
+use oauth2_mcp_gateway::types::{ByteBudget, VerifiedToken, bytes_body, empty_body};
+use oauth2_mcp_gateway::upstream_http::{HttpLimits, HttpUpstream};
+use oauth2_mcp_gateway::upstream_stdio::{StdioLimits, StdioUpstream};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
@@ -3373,6 +3373,3596 @@ async fn http_per_grant_session_cap_evicts_lru_sends_delete_and_returns_404_on_r
     assert_eq!(live_resp.status(), StatusCode::OK);
 
     up.shutdown().await;
+    gw_cancel.cancel();
+    up_cancel.cancel();
+}
+
+#[tokio::test]
+async fn http_large_json_and_sse_priming_passthrough_and_slow_receiver_budget_backpressure() {
+    let payload_len = 18 * 1024 * 1024usize; // > 16 MiB inbound cap
+    let (up_addr, up_cancel) = spawn_http1_harness(move |req: Request<Incoming>| async move {
+        let mode = req
+            .headers()
+            .get("x-test-mode")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("json")
+            .to_owned();
+        let _ = req.into_body().collect().await;
+
+        if mode == "json_18m" {
+            let (tx, body) = channel_body(8);
+            tokio::spawn(async move {
+                let _ = tx
+                    .send(Ok(Frame::data(Bytes::from_static(
+                        br#"{"jsonrpc":"2.0","id":1,"result":{"blob":""#,
+                    ))))
+                    .await;
+                let chunk = Bytes::from(vec![b'J'; 256 * 1024]);
+                let mut rem = payload_len;
+                while rem > 0 {
+                    let n = rem.min(chunk.len());
+                    if tx.send(Ok(Frame::data(chunk.slice(..n)))).await.is_err() {
+                        return;
+                    }
+                    rem -= n;
+                }
+                let _ = tx
+                    .send(Ok(Frame::data(Bytes::from_static(br#""}}"#))))
+                    .await;
+            });
+            return Response::builder()
+                .status(StatusCode::OK)
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(body)
+                .unwrap();
+        }
+
+        if mode == "sse_big_priming_and_18m" {
+            let (tx, body) = channel_body(8);
+            tokio::spawn(async move {
+                // Single 1.5 MiB priming chunk (> 1 MiB cap) followed by 18 MiB SSE data event.
+                let mut prime = vec![b':'];
+                prime.extend(std::iter::repeat_n(b'P', 1536 * 1024));
+                prime.extend_from_slice(
+                    b"\nid: big-ev\ndata: {\"jsonrpc\":\"2.0\",\"id\":2,\"result\":{\"blob\":\"",
+                );
+                if tx.send(Ok(Frame::data(Bytes::from(prime)))).await.is_err() {
+                    return;
+                }
+                let chunk = Bytes::from(vec![b'S'; 256 * 1024]);
+                let mut rem = payload_len;
+                while rem > 0 {
+                    let n = rem.min(chunk.len());
+                    if tx.send(Ok(Frame::data(chunk.slice(..n)))).await.is_err() {
+                        return;
+                    }
+                    rem -= n;
+                }
+                let _ = tx
+                    .send(Ok(Frame::data(Bytes::from_static(br#""}}"#))))
+                    .await;
+                let _ = tx.send(Ok(Frame::data(Bytes::from_static(b"\n\n")))).await;
+            });
+            return Response::builder()
+                .status(StatusCode::OK)
+                .header(header::CONTENT_TYPE, "text/event-stream")
+                .body(body)
+                .unwrap();
+        }
+
+        if mode == "sse_hold_priming" {
+            let (tx, body) = channel_body(4);
+            tokio::spawn(async move {
+                let mut prime = vec![b':'];
+                prime.extend(std::iter::repeat_n(b'H', 3499));
+                let _ = tx.send(Ok(Frame::data(Bytes::from(prime)))).await;
+                tokio::time::sleep(Duration::from_secs(30)).await;
+                drop(tx);
+            });
+            return Response::builder()
+                .status(StatusCode::OK)
+                .header(header::CONTENT_TYPE, "text/event-stream")
+                .body(body)
+                .unwrap();
+        }
+
+        if mode == "sse_over_budget" {
+            let (tx, body) = channel_body(4);
+            tokio::spawn(async move {
+                let mut prime = vec![b':'];
+                prime.extend(std::iter::repeat_n(b'O', 1023));
+                let _ = tx.send(Ok(Frame::data(Bytes::from(prime)))).await;
+                let _ = tx
+                    .send(Ok(Frame::data(Bytes::from_static(
+                        b"\n\ndata: {\"jsonrpc\":\"2.0\",\"id\":4,\"result\":{}}\n\n",
+                    ))))
+                    .await;
+            });
+            return Response::builder()
+                .status(StatusCode::OK)
+                .header(header::CONTENT_TYPE, "text/event-stream")
+                .body(body)
+                .unwrap();
+        }
+
+        if mode == "sse_direct_data" {
+            return Response::builder()
+                .status(StatusCode::OK)
+                .header(header::CONTENT_TYPE, "text/event-stream")
+                .body(bytes_body(
+                    "data: {\"jsonrpc\":\"2.0\",\"id\":5,\"result\":{\"fast\":true}}\n\n",
+                ))
+                .unwrap();
+        }
+
+        Response::builder()
+            .status(StatusCode::OK)
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(bytes_body(
+                r#"{"jsonrpc":"2.0","id":6,"result":{"ctrl":true}}"#,
+            ))
+            .unwrap()
+    })
+    .await;
+
+    let budget = ByteBudget::new(4096);
+    let up = Arc::new(
+        HttpUpstream::with_limits(
+            HttpUpstreamSettings {
+                url: Url::parse(&format!("http://{up_addr}/mcp")).unwrap(),
+                origin_base: Url::parse(&format!("http://{up_addr}")).unwrap(),
+                public_is_https: false,
+                bearer_tokens: Vec::new(),
+                passthrough_prefixes: Vec::new(),
+                request_timeout_secs: 30,
+            },
+            Arc::clone(&budget),
+            HttpLimits {
+                max_priming_buffer_bytes: 8192,
+                ..HttpLimits::default()
+            },
+        )
+        .unwrap(),
+    );
+    let up_srv = Arc::clone(&up);
+    let (gw_addr, gw_cancel) = spawn_http1_harness(move |req: Request<Incoming>| {
+        let up_srv = Arc::clone(&up_srv);
+        async move {
+            up_srv
+                .handle_mcp(req, &make_token("grant-http-big", 0))
+                .await
+        }
+    })
+    .await;
+
+    let client = make_client();
+
+    // 1. Stream 18 MiB application/json response through HttpUpstream.
+    let resp_json = client
+        .request(
+            Request::builder()
+                .method(Method::POST)
+                .uri(format!("http://{gw_addr}/mcp"))
+                .header("x-test-mode", "json_18m")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(bytes_body(
+                    r#"{"jsonrpc":"2.0","id":1,"method":"tools/call"}"#,
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp_json.status(), StatusCode::OK);
+    let mut json_total = 0usize;
+    let mut j_body = resp_json.into_body();
+    while let Some(frame) = j_body.frame().await {
+        if let Ok(data) = frame.unwrap().into_data() {
+            json_total += data.len();
+        }
+    }
+    assert_eq!(
+        json_total,
+        payload_len + br#"{"jsonrpc":"2.0","id":1,"result":{"blob":""#.len() + br#""}}"#.len()
+    );
+    assert_eq!(budget.used(), 0);
+
+    // 2. Stream 18 MiB text/event-stream with 1.5 MiB single-chunk priming preamble (even with 4 KiB budget, stops at 8 KiB cap? Wait: cap=8192 > budget=4096 would hit budget if >4096; test default cap with default budget too!).
+    let default_up = Arc::new(
+        HttpUpstream::new(HttpUpstreamSettings {
+            url: Url::parse(&format!("http://{up_addr}/mcp")).unwrap(),
+            origin_base: Url::parse(&format!("http://{up_addr}")).unwrap(),
+            public_is_https: false,
+            bearer_tokens: Vec::new(),
+            passthrough_prefixes: Vec::new(),
+            request_timeout_secs: 30,
+        })
+        .unwrap(),
+    );
+    let def_srv = Arc::clone(&default_up);
+    let (gw_def_addr, gw_def_cancel) = spawn_http1_harness(move |req: Request<Incoming>| {
+        let def_srv = Arc::clone(&def_srv);
+        async move {
+            def_srv
+                .handle_mcp(req, &make_token("grant-http-def", 0))
+                .await
+        }
+    })
+    .await;
+
+    let resp_sse = client
+        .request(
+            Request::builder()
+                .method(Method::POST)
+                .uri(format!("http://{gw_def_addr}/mcp"))
+                .header("x-test-mode", "sse_big_priming_and_18m")
+                .header(header::ACCEPT, "text/event-stream")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(bytes_body(
+                    r#"{"jsonrpc":"2.0","id":2,"method":"tools/call"}"#,
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp_sse.status(), StatusCode::OK);
+    let mut sse_total = 0usize;
+    let mut s_body = resp_sse.into_body();
+    while let Some(frame) = s_body.frame().await {
+        if let Ok(data) = frame.unwrap().into_data() {
+            sse_total += data.len();
+        }
+    }
+    assert!(sse_total > payload_len + 1536 * 1024);
+
+    // 3. Slow/stalled priming stream holds 3500 bytes in `budget` (limit 4096); second 1024-byte priming stream fails non-blockingly while control paths succeed.
+    let gw_hold_uri = format!("http://{gw_addr}/mcp");
+    let hold_client = client.clone();
+    let hold_task = tokio::spawn(async move {
+        let resp = hold_client
+            .request(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri(gw_hold_uri)
+                    .header("x-test-mode", "sse_hold_priming")
+                    .header(header::ACCEPT, "text/event-stream")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(bytes_body(
+                        r#"{"jsonrpc":"2.0","id":3,"method":"tools/call"}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let mut body = resp.into_body();
+        let _ = body.frame().await;
+    });
+
+    wait_until(|| budget.used() == 3500).await;
+
+    // Over-budget priming stream fails fast without blocking.
+    let over_outcome = tokio::time::timeout(Duration::from_secs(2), async {
+        let resp = client
+            .request(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri(format!("http://{gw_addr}/mcp"))
+                    .header("x-test-mode", "sse_over_budget")
+                    .header(header::ACCEPT, "text/event-stream")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(bytes_body(
+                        r#"{"jsonrpc":"2.0","id":4,"method":"tools/call"}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .map_err(|e| e.to_string())?;
+        resp.into_body().collect().await.map_err(|e| e.to_string())
+    })
+    .await
+    .expect("over-budget priming stream must not block");
+    assert!(
+        over_outcome.is_err(),
+        "over-budget SSE priming stream must abort with error"
+    );
+    assert_eq!(budget.used(), 3500);
+
+    // Control paths (JSON response & direct `data:` SSE without priming buffer) still succeed!
+    let ctrl_json = client
+        .request(
+            Request::builder()
+                .method(Method::POST)
+                .uri(format!("http://{gw_addr}/mcp"))
+                .header("x-test-mode", "ctrl_json")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(bytes_body(r#"{"jsonrpc":"2.0","id":6,"method":"ping"}"#))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(ctrl_json.status(), StatusCode::OK);
+    let ctrl_val: Value =
+        serde_json::from_slice(&ctrl_json.into_body().collect().await.unwrap().to_bytes()).unwrap();
+    assert_eq!(ctrl_val["result"]["ctrl"], true);
+
+    let direct_sse = client
+        .request(
+            Request::builder()
+                .method(Method::POST)
+                .uri(format!("http://{gw_addr}/mcp"))
+                .header("x-test-mode", "sse_direct_data")
+                .header(header::ACCEPT, "text/event-stream")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(bytes_body(
+                    r#"{"jsonrpc":"2.0","id":5,"method":"tools/call"}"#,
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(direct_sse.status(), StatusCode::OK);
+    let direct_bytes = direct_sse.into_body().collect().await.unwrap().to_bytes();
+    assert!(
+        std::str::from_utf8(&direct_bytes)
+            .unwrap()
+            .contains("\"fast\":true")
+    );
+
+    // Cancelling the stalled receiver releases the priming lease.
+    hold_task.abort();
+    let _ = hold_task.await;
+    up.terminate_grant("grant-http-big").await;
+    wait_until(|| budget.used() == 0).await;
+
+    default_up.shutdown().await;
+    up.shutdown().await;
+    gw_def_cancel.cancel();
+    gw_cancel.cancel();
+    up_cancel.cancel();
+}
+
+fn write_multimodal_stdio_mock_script(dir: &Path) -> std::path::PathBuf {
+    let path = dir.join("multimodal_stdio_mock.py");
+    let script = r##"import json, os, sys, threading, time
+
+pid = os.getpid()
+out_lock = threading.Lock()
+gate_events = {}
+burst_flushed_events = {}
+waiter_cond = threading.Condition()
+gate_waiter_counts = {}
+spew_after_init = int(os.environ.get("MOCK_SPEW_AFTER_INIT_BYTES", "0"))
+
+def write_raw(data: bytes):
+    with out_lock:
+        sys.stdout.buffer.write(data)
+        sys.stdout.buffer.flush()
+
+def build_tail_id_line(req_id, target_bytes: int) -> bytes:
+    prefix = b'{"jsonrpc":"2.0","result":{"content":[{"type":"image","mimeType":"image/png","data":"'
+    suffix = (
+        b'"}],"_meta":{"explicit_null":null,"nested":{"method":"GET","arr":[{"method":1}]}}},"id":'
+        + json.dumps(req_id, separators=(",", ":")).encode("utf-8")
+        + b"}\n"
+    )
+    pad_len = target_bytes - len(prefix) - len(suffix)
+    assert pad_len >= 0, f"target_bytes {target_bytes} too small"
+    return prefix + (b"A" * pad_len) + suffix
+
+for raw_line in sys.stdin.buffer:
+    line = raw_line.decode("utf-8").strip()
+    if not line:
+        continue
+    msg = json.loads(line)
+    method = msg.get("method")
+    req_id = msg.get("id")
+
+    if method == "initialize":
+        resp = {
+            "jsonrpc": "2.0",
+            "id": req_id,
+            "result": {
+                "protocolVersion": "2025-06-18",
+                "capabilities": {},
+                "serverInfo": {"name": "mm-mock", "version": "0.1"},
+                "_meta": {"pid": pid},
+            },
+        }
+        out = (json.dumps(resp, separators=(",", ":")) + "\n").encode("utf-8")
+        if spew_after_init > 0:
+            out += b'{"jsonrpc":"2.0","unsolicited":"' + (b"U" * spew_after_init) + b'"}\n'
+        write_raw(out)
+        continue
+
+    if method == "notifications/cancelled":
+        flag_dir = os.environ.get("MOCK_CANCEL_DIR")
+        if flag_dir:
+            cid = msg.get("params", {}).get("requestId")
+            with open(os.path.join(flag_dir, f"cancelled_{cid}.flag"), "w", encoding="utf-8") as cf:
+                cf.write("1")
+        continue
+
+    if method == "notifications/spew_unsolicited_large":
+        nbytes = int(msg.get("params", {}).get("bytes", 600))
+        write_raw(b'{"jsonrpc":"2.0","unsolicited":"' + (b"U" * nbytes) + b'"}\n')
+        continue
+
+    if method == "notifications/gate_open":
+        p = msg.get("params", {})
+        gate = p.get("gate", "default")
+        wait_b = p.get("wait_burst", False)
+        def do_open(g, wb):
+            if wb:
+                bev = burst_flushed_events.setdefault(g, threading.Event())
+                bev.wait(timeout=10.0)
+            ev = gate_events.setdefault(g, threading.Event())
+            ev.set()
+        threading.Thread(target=do_open, args=(gate, wait_b), daemon=True).start()
+        continue
+
+    if method != "tools/call":
+        continue
+
+    params = msg.get("params", {})
+    name = params.get("name")
+    args = params.get("arguments", {})
+    ptok = params.get("_meta", {}).get("progressToken")
+
+    if name == "small_echo":
+        resp = {"jsonrpc": "2.0", "id": req_id, "result": {"ok": True, "pid": pid, "tag": args.get("tag", "")}}
+        write_raw((json.dumps(resp, separators=(",", ":")) + "\n").encode("utf-8"))
+    elif name == "exact_tail_id":
+        target = int(args["target_bytes"])
+        write_raw(build_tail_id_line(req_id, target))
+    elif name == "wait_gate":
+        gate = args.get("gate", "default")
+        ev = gate_events.setdefault(gate, threading.Event())
+        with waiter_cond:
+            gate_waiter_counts[gate] = gate_waiter_counts.get(gate, 0) + 1
+            waiter_cond.notify_all()
+        def wait_and_reply(rid, g_ev):
+            g_ev.wait(timeout=10.0)
+            r = {"jsonrpc": "2.0", "id": rid, "result": {"should_never_arrive": True}}
+            write_raw((json.dumps(r, separators=(",", ":")) + "\n").encode("utf-8"))
+        threading.Thread(target=wait_and_reply, args=(req_id, ev), daemon=True).start()
+    elif name == "trigger_midline_method_then_valid":
+        def run_trig_method(rid, a):
+            w_gate = a.get("wait_for_gate")
+            w_cnt = int(a.get("expected_waiters", 0))
+            if w_gate and w_cnt > 0:
+                with waiter_cond:
+                    waiter_cond.wait_for(lambda: gate_waiter_counts.get(w_gate, 0) >= w_cnt, timeout=10.0)
+            other_ids = a.get("other_wire_ids", [])
+            bad_notif = (
+                b'{"jsonrpc":"2.0","method":"notifications/message","params":{"pad":"'
+                + (b"M" * int(a["pad_len"]))
+                + b'"}}\n'
+            )
+            follow = b"".join(
+                (json.dumps({"jsonrpc": "2.0", "id": oid, "result": {"should_never_arrive": True}}, separators=(",", ":")) + "\n").encode("utf-8")
+                for oid in ([rid] + other_ids)
+            )
+            write_raw(bad_notif + follow)
+        threading.Thread(target=run_trig_method, args=(req_id, dict(args)), daemon=True).start()
+    elif name == "trigger_oversized_line_then_valid":
+        def run_trig_line(rid, a):
+            w_gate = a.get("wait_for_gate")
+            w_cnt = int(a.get("expected_waiters", 0))
+            if w_gate and w_cnt > 0:
+                with waiter_cond:
+                    waiter_cond.wait_for(lambda: gate_waiter_counts.get(w_gate, 0) >= w_cnt, timeout=10.0)
+            target = int(a["target_bytes"])
+            bad_line = build_tail_id_line(rid, target)
+            follow = (json.dumps({"jsonrpc": "2.0", "id": rid, "result": {"should_never_arrive": True}}, separators=(",", ":")) + "\n").encode("utf-8")
+            write_raw(bad_line + follow)
+        threading.Thread(target=run_trig_line, args=(req_id, dict(args)), daemon=True).start()
+    elif name == "complete_line_discards_then_valid":
+        for nlen in args.get("pass_notif_lens", []):
+            pre = b'{"jsonrpc":"2.0","method":"notifications/message","params":{"p":"'
+            suf = b'"}}\n'
+            write_raw(pre + (b"p" * (int(nlen) - len(pre) - len(suf))) + suf)
+        tail_m_total = int(args["tail_method_bytes"])
+        pre_m = b'{"jsonrpc":"2.0","params":{"pad":"'
+        suf_m = b'"},"method":"notifications/message"}\n'
+        pad_m = tail_m_total - len(pre_m) - len(suf_m)
+        write_raw(pre_m + (b"T" * pad_m) + suf_m)
+        write_raw(build_tail_id_line(999999, int(args["unmatched_bytes"])))
+        write_raw(build_tail_id_line(req_id, int(args["valid_bytes"])))
+    elif name == "gated_two_half_line":
+        half1 = int(args["half1_bytes"])
+        gate = args.get("gate", "half_gate")
+        ev = gate_events.setdefault(gate, threading.Event())
+        def run_halves(rid, h1, g_ev):
+            prefix = b'{"jsonrpc":"2.0","result":{"blob":"'
+            write_raw(prefix + (b"H" * (h1 - len(prefix))))
+            g_ev.wait(timeout=10.0)
+            suffix = b'"},"id":' + json.dumps(rid, separators=(",", ":")).encode("utf-8") + b"}\n"
+            write_raw((b"H" * 1024) + suffix)
+        threading.Thread(target=run_halves, args=(req_id, half1, ev), daemon=True).start()
+    elif name == "notif_budget_burst":
+        notif_len = int(args["notif_bytes"])
+        count = int(args["count"])
+        gate = args.get("gate", "burst")
+        ev = gate_events.setdefault(gate, threading.Event())
+        bev = burst_flushed_events.setdefault(gate, threading.Event())
+        def run_burst(rid, tok, nlen, cnt, g_ev, b_ev):
+            for idx in range(cnt):
+                if tok is not None:
+                    pre = ('{"jsonrpc":"2.0","method":"notifications/progress","params":{"progressToken":' + json.dumps(tok, separators=(",", ":")) + ',"i":' + str(idx) + ',"p":"').encode("utf-8")
+                    suf = b'"}}'
+                else:
+                    pre = ('{"jsonrpc":"2.0","method":"notifications/message","params":{"i":' + str(idx) + ',"p":"').encode("utf-8")
+                    suf = b'"}}'
+                body = pre + (b"N" * (nlen - len(pre) - len(suf))) + suf + b"\n"
+                write_raw(body)
+            b_ev.set()
+            g_ev.wait(timeout=10.0)
+            if args.get("post_gate_notif", False):
+                pre = ('{"jsonrpc":"2.0","method":"notifications/message","params":{"after":true,"p":"').encode("utf-8")
+                suf = b'"}}'
+                body = pre + (b"A" * (nlen - len(pre) - len(suf))) + suf + b"\n"
+                write_raw(body)
+            r = {"jsonrpc": "2.0", "id": rid, "result": {"burst_done": True}}
+            write_raw((json.dumps(r, separators=(",", ":")) + "\n").encode("utf-8"))
+        threading.Thread(target=run_burst, args=(req_id, ptok, notif_len, count, ev, bev), daemon=True).start()
+"##;
+    std::fs::write(&path, script).unwrap();
+    path
+}
+
+async fn wait_until<F: Fn() -> bool>(cond: F) {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    while !cond() {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "condition did not settle within 5s"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+}
+
+#[tokio::test]
+async fn stdio_large_tail_id_boundaries_and_multimodal_18mib_passthrough() {
+    let tmp = TempDir::new().unwrap();
+    let script = write_multimodal_stdio_mock_script(tmp.path());
+
+    let n_max = 4096usize;
+    let budget = ByteBudget::new(64 * 1024);
+    let stdio_small = Arc::new(
+        StdioUpstream::with_limits(
+            StdioUpstreamSettings {
+                command: python_executable().to_owned(),
+                args: vec!["-u".to_owned(), script.to_str().unwrap().to_owned()],
+                env: BTreeMap::new(),
+                cwd: Some(tmp.path().to_path_buf()),
+                max_sessions: 8,
+                session_idle_secs: 30,
+            },
+            Arc::clone(&budget),
+            StdioLimits {
+                max_stdout_line_bytes: n_max,
+                max_control_line_bytes: 512,
+                max_notif_queue_bytes: 16 * 1024,
+                ..StdioLimits::default()
+            },
+        )
+        .unwrap(),
+    );
+    let up_ref = Arc::clone(&stdio_small);
+    let (gw_addr, gw_cancel) = spawn_http1_harness(move |req: Request<Incoming>| {
+        let up = Arc::clone(&up_ref);
+        async move { up.handle_mcp(req, &make_token("grant-mm", 0)).await }
+    })
+    .await;
+
+    let client = make_client();
+    let init_resp = client
+        .request(
+            Request::builder()
+                .method(Method::POST)
+                .uri(format!("http://{gw_addr}/mcp"))
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(bytes_body(
+                    r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}"#,
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(init_resp.status(), StatusCode::OK);
+    let sid = init_resp
+        .headers()
+        .get("mcp-session-id")
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .to_owned();
+    let _ = init_resp.into_body().collect().await.unwrap();
+
+    // Exact N - 1 (4095) and N (4096) with "id" at tail pass over both JSON and SSE, preserving result subtree.
+    for (target, accept_hdr, client_id) in [
+        (n_max - 1, "application/json", "tail-json-n-minus-1"),
+        (n_max, "application/json", "tail-json-n"),
+        (n_max, "text/event-stream", "tail-sse-n"),
+    ] {
+        let resp = client
+            .request(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri(format!("http://{gw_addr}/mcp"))
+                    .header("mcp-session-id", &sid)
+                    .header(header::ACCEPT, accept_hdr)
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(bytes_body(
+                        json!({
+                            "jsonrpc": "2.0",
+                            "id": client_id,
+                            "method": "tools/call",
+                            "params": {
+                                "name": "exact_tail_id",
+                                "arguments": {"target_bytes": target}
+                            }
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let raw = resp.into_body().collect().await.unwrap().to_bytes();
+        let val: Value = if accept_hdr == "text/event-stream" {
+            let s = std::str::from_utf8(&raw).unwrap();
+            let line = s.trim().strip_prefix("data: ").unwrap();
+            serde_json::from_str(line).unwrap()
+        } else {
+            serde_json::from_slice(&raw).unwrap()
+        };
+        assert_eq!(val["id"], client_id);
+        assert_eq!(val["result"]["content"][0]["type"], "image");
+        assert!(val["result"]["_meta"]["explicit_null"].is_null());
+        assert_eq!(val["result"]["_meta"]["nested"]["method"], "GET");
+        assert_eq!(val["result"]["_meta"]["nested"]["arr"][0]["method"], 1);
+        assert_eq!(budget.used(), 0);
+    }
+
+    // Exact N + 1 (4097) is hard-rejected and terminates the session.
+    let n_plus_1 = client
+        .request(
+            Request::builder()
+                .method(Method::POST)
+                .uri(format!("http://{gw_addr}/mcp"))
+                .header("mcp-session-id", &sid)
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(bytes_body(
+                    json!({
+                        "jsonrpc": "2.0",
+                        "id": "tail-over",
+                        "method": "tools/call",
+                        "params": {
+                            "name": "exact_tail_id",
+                            "arguments": {"target_bytes": n_max + 1}
+                        }
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(n_plus_1.status(), StatusCode::BAD_GATEWAY);
+    let err_val: Value =
+        serde_json::from_slice(&n_plus_1.into_body().collect().await.unwrap().to_bytes()).unwrap();
+    assert_eq!(err_val["id"], "tail-over");
+    assert!(
+        err_val["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("4096 byte limit")
+    );
+    assert_eq!(budget.used(), 0);
+
+    // Part B: Real 18 MiB (> 16 MiB inbound cap) tool response passes through default StdioUpstream, while > 16 MiB inbound POST returns 413.
+    let stdio_default = Arc::new(
+        StdioUpstream::new(StdioUpstreamSettings {
+            command: python_executable().to_owned(),
+            args: vec!["-u".to_owned(), script.to_str().unwrap().to_owned()],
+            env: BTreeMap::new(),
+            cwd: Some(tmp.path().to_path_buf()),
+            max_sessions: 4,
+            session_idle_secs: 60,
+        })
+        .unwrap(),
+    );
+    let def_ref = Arc::clone(&stdio_default);
+    let (gw2_addr, gw2_cancel) = spawn_http1_harness(move |req: Request<Incoming>| {
+        let up = Arc::clone(&def_ref);
+        async move { up.handle_mcp(req, &make_token("grant-18m", 0)).await }
+    })
+    .await;
+
+    let inbound_too_big = client
+        .request(
+            Request::builder()
+                .method(Method::POST)
+                .uri(format!("http://{gw2_addr}/mcp"))
+                .header(header::CONTENT_TYPE, "application/json")
+                .header(header::CONTENT_LENGTH, (16 * 1024 * 1024 + 1).to_string())
+                .body(empty_body())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(inbound_too_big.status(), StatusCode::PAYLOAD_TOO_LARGE);
+
+    let big_target = 18 * 1024 * 1024usize;
+    let big_resp = client
+        .request(
+            Request::builder()
+                .method(Method::POST)
+                .uri(format!("http://{gw2_addr}/mcp"))
+                .header("MCP-Protocol-Version", "2026-07-28")
+                .header(header::ACCEPT, "application/json")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(bytes_body(
+                    json!({
+                        "jsonrpc": "2.0",
+                        "id": "mm-18mib",
+                        "method": "tools/call",
+                        "params": {
+                            "name": "exact_tail_id",
+                            "arguments": {"target_bytes": big_target}
+                        }
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(big_resp.status(), StatusCode::OK);
+    let big_bytes = big_resp.into_body().collect().await.unwrap().to_bytes();
+    assert!(big_bytes.len() > 17 * 1024 * 1024);
+    let big_val: Value = serde_json::from_slice(&big_bytes).unwrap();
+    assert_eq!(big_val["id"], "mm-18mib");
+    assert_eq!(big_val["result"]["content"][0]["mimeType"], "image/png");
+
+    stdio_default.shutdown().await;
+    stdio_small.shutdown().await;
+    gw2_cancel.cancel();
+    gw_cancel.cancel();
+}
+
+#[tokio::test]
+async fn stdio_midline_hard_reject_terminates_session_and_notifies_json_and_sse_waiters() {
+    let tmp = TempDir::new().unwrap();
+    let script = write_multimodal_stdio_mock_script(tmp.path());
+
+    for scenario in ["midline_method", "oversized_line", "budget_exhausted"] {
+        let budget = ByteBudget::new(2048);
+        let held_lease = if scenario == "budget_exhausted" {
+            Some(ByteBudget::try_acquire(&budget, 1800).unwrap())
+        } else {
+            None
+        };
+
+        let stdio_up = Arc::new(
+            StdioUpstream::with_limits(
+                StdioUpstreamSettings {
+                    command: python_executable().to_owned(),
+                    args: vec!["-u".to_owned(), script.to_str().unwrap().to_owned()],
+                    env: BTreeMap::new(),
+                    cwd: Some(tmp.path().to_path_buf()),
+                    max_sessions: 4,
+                    session_idle_secs: 30,
+                },
+                Arc::clone(&budget),
+                StdioLimits {
+                    max_stdout_line_bytes: 2048,
+                    max_control_line_bytes: 256,
+                    max_notif_queue_bytes: 8192,
+                    ..StdioLimits::default()
+                },
+            )
+            .unwrap(),
+        );
+        let up_ref = Arc::clone(&stdio_up);
+        let (gw_addr, gw_cancel) = spawn_http1_harness(move |req: Request<Incoming>| {
+            let up = Arc::clone(&up_ref);
+            async move { up.handle_mcp(req, &make_token("grant-hard", 0)).await }
+        })
+        .await;
+
+        let client = make_client();
+        let init_resp = client
+            .request(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri(format!("http://{gw_addr}/mcp"))
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(bytes_body(
+                        r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(init_resp.status(), StatusCode::OK);
+        let sid = init_resp
+            .headers()
+            .get("mcp-session-id")
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .to_owned();
+        let init_val: Value =
+            serde_json::from_slice(&init_resp.into_body().collect().await.unwrap().to_bytes())
+                .unwrap();
+        let child_pid = init_val["result"]["_meta"]["pid"].as_u64().unwrap() as u32;
+
+        // Spawn one SSE waiter and one JSON waiter waiting on a gate before triggering the mid-line reject.
+        let c_sse = client.clone();
+        let sid_sse = sid.clone();
+        let sse_waiter = tokio::spawn(async move {
+            let resp = c_sse
+                .request(
+                    Request::builder()
+                        .method(Method::POST)
+                        .uri(format!("http://{gw_addr}/mcp"))
+                        .header("mcp-session-id", &sid_sse)
+                        .header(header::ACCEPT, "text/event-stream")
+                        .header(header::CONTENT_TYPE, "application/json")
+                        .body(bytes_body(
+                            r#"{"jsonrpc":"2.0","id":"sse-waiter","method":"tools/call","params":{"name":"wait_gate","arguments":{"gate":"g1"}}}"#,
+                        ))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), StatusCode::OK);
+            let raw = resp.into_body().collect().await.unwrap().to_bytes();
+            String::from_utf8(raw.to_vec()).unwrap()
+        });
+
+        let c_json = client.clone();
+        let sid_json = sid.clone();
+        let json_waiter = tokio::spawn(async move {
+            let resp = c_json
+                .request(
+                    Request::builder()
+                        .method(Method::POST)
+                        .uri(format!("http://{gw_addr}/mcp"))
+                        .header("mcp-session-id", &sid_json)
+                        .header(header::ACCEPT, "application/json")
+                        .header(header::CONTENT_TYPE, "application/json")
+                        .body(bytes_body(
+                            r#"{"jsonrpc":"2.0","id":"json-waiter","method":"tools/call","params":{"name":"wait_gate","arguments":{"gate":"g1"}}}"#,
+                        ))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            let status = resp.status();
+            let val: Value =
+                serde_json::from_slice(&resp.into_body().collect().await.unwrap().to_bytes())
+                    .unwrap();
+            (status, val)
+        });
+
+        let trigger_body = match scenario {
+            "midline_method" => json!({
+                "jsonrpc": "2.0",
+                "id": "trigger-call",
+                "method": "tools/call",
+                "params": {
+                    "name": "trigger_midline_method_then_valid",
+                    "arguments": {
+                        "pad_len": 400,
+                        "other_wire_ids": [2, 3],
+                        "wait_for_gate": "g1",
+                        "expected_waiters": 2
+                    }
+                }
+            }),
+            "oversized_line" => json!({
+                "jsonrpc": "2.0",
+                "id": "trigger-call",
+                "method": "tools/call",
+                "params": {
+                    "name": "trigger_oversized_line_then_valid",
+                    "arguments": {
+                        "target_bytes": 2400,
+                        "wait_for_gate": "g1",
+                        "expected_waiters": 2
+                    }
+                }
+            }),
+            _ => json!({
+                "jsonrpc": "2.0",
+                "id": "trigger-call",
+                "method": "tools/call",
+                "params": {
+                    "name": "trigger_oversized_line_then_valid",
+                    "arguments": {
+                        "target_bytes": 700,
+                        "wait_for_gate": "g1",
+                        "expected_waiters": 2
+                    }
+                }
+            }),
+        };
+
+        let trig_resp = client
+            .request(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri(format!("http://{gw_addr}/mcp"))
+                    .header("mcp-session-id", &sid)
+                    .header(header::ACCEPT, "application/json")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(bytes_body(trigger_body.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let trig_status = trig_resp.status();
+        let trig_val: Value =
+            serde_json::from_slice(&trig_resp.into_body().collect().await.unwrap().to_bytes())
+                .unwrap();
+
+        let sse_text = tokio::time::timeout(Duration::from_secs(5), sse_waiter)
+            .await
+            .expect("SSE waiter must not hang")
+            .unwrap();
+        let (json_status, json_val) = tokio::time::timeout(Duration::from_secs(5), json_waiter)
+            .await
+            .expect("JSON waiter must not hang")
+            .unwrap();
+
+        let expected_substr = match scenario {
+            "midline_method" => {
+                assert_eq!(trig_status, StatusCode::BAD_GATEWAY);
+                assert_eq!(json_status, StatusCode::BAD_GATEWAY);
+                "256 byte limit"
+            }
+            "oversized_line" => {
+                assert_eq!(trig_status, StatusCode::BAD_GATEWAY);
+                assert_eq!(json_status, StatusCode::BAD_GATEWAY);
+                "2048 byte limit"
+            }
+            _ => {
+                assert_eq!(trig_status, StatusCode::SERVICE_UNAVAILABLE);
+                assert_eq!(json_status, StatusCode::SERVICE_UNAVAILABLE);
+                "byte budget"
+            }
+        };
+
+        assert_eq!(trig_val["id"], "trigger-call");
+        assert!(
+            trig_val["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains(expected_substr),
+            "scenario={scenario}, trig_val={trig_val}"
+        );
+
+        assert_eq!(json_val["id"], "json-waiter");
+        assert!(
+            json_val["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains(expected_substr),
+            "scenario={scenario}, json_val={json_val}"
+        );
+        assert!(json_val.get("result").is_none());
+
+        assert!(
+            !sse_text.contains("should_never_arrive"),
+            "residual bytes after hard reject must never be parsed: {sse_text}"
+        );
+        let sse_line = sse_text
+            .trim()
+            .strip_prefix("data: ")
+            .expect("SSE waiter must receive explicit JSON-RPC error event, not bare EOF");
+        let sse_val: Value = serde_json::from_str(sse_line).unwrap();
+        assert_eq!(sse_val["id"], "sse-waiter");
+        assert!(
+            sse_val["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains(expected_substr),
+            "scenario={scenario}, sse_val={sse_val}"
+        );
+
+        assert!(wait_process_gone(child_pid).await);
+
+        let after_resp = client
+            .request(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri(format!("http://{gw_addr}/mcp"))
+                    .header("mcp-session-id", &sid)
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(bytes_body(
+                        r#"{"jsonrpc":"2.0","id":99,"method":"tools/call","params":{"name":"small_echo"}}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(after_resp.status(), StatusCode::NOT_FOUND);
+
+        drop(held_lease);
+        assert_eq!(budget.used(), 0);
+        stdio_up.shutdown().await;
+        gw_cancel.cancel();
+    }
+}
+
+#[tokio::test]
+async fn stdio_complete_line_discard_notif_byte_budget_and_slow_receiver_backpressure() {
+    let tmp = TempDir::new().unwrap();
+    let script = write_multimodal_stdio_mock_script(tmp.path());
+
+    // Part A: Complete-line discard (> N_ctrl tail "method" and unmatched "id") preserves session.
+    {
+        let budget = ByteBudget::new(64 * 1024);
+        let stdio_up = Arc::new(
+            StdioUpstream::with_limits(
+                StdioUpstreamSettings {
+                    command: python_executable().to_owned(),
+                    args: vec!["-u".to_owned(), script.to_str().unwrap().to_owned()],
+                    env: BTreeMap::new(),
+                    cwd: Some(tmp.path().to_path_buf()),
+                    max_sessions: 4,
+                    session_idle_secs: 30,
+                },
+                Arc::clone(&budget),
+                StdioLimits {
+                    max_stdout_line_bytes: 2048,
+                    max_control_line_bytes: 256,
+                    max_notif_queue_bytes: 8192,
+                    ..StdioLimits::default()
+                },
+            )
+            .unwrap(),
+        );
+        let up_ref = Arc::clone(&stdio_up);
+        let (gw_addr, gw_cancel) = spawn_http1_harness(move |req: Request<Incoming>| {
+            let up = Arc::clone(&up_ref);
+            async move { up.handle_mcp(req, &make_token("grant-discard", 0)).await }
+        })
+        .await;
+
+        let client = make_client();
+        let init_resp = client
+            .request(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri(format!("http://{gw_addr}/mcp"))
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(bytes_body(
+                        r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let sid = init_resp
+            .headers()
+            .get("mcp-session-id")
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .to_owned();
+        let _ = init_resp.into_body().collect().await.unwrap();
+
+        let resp = client
+            .request(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri(format!("http://{gw_addr}/mcp"))
+                    .header("mcp-session-id", &sid)
+                    .header(header::ACCEPT, "text/event-stream")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(bytes_body(
+                        json!({
+                            "jsonrpc": "2.0",
+                            "id": "keep-alive-1",
+                            "method": "tools/call",
+                            "params": {
+                                "name": "complete_line_discards_then_valid",
+                                "arguments": {
+                                    "pass_notif_lens": [255, 256],
+                                    "tail_method_bytes": 450,
+                                    "unmatched_bytes": 700,
+                                    "valid_bytes": 900
+                                }
+                            }
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let raw = resp.into_body().collect().await.unwrap().to_bytes();
+        let text = String::from_utf8(raw.to_vec()).unwrap();
+        let events: Vec<Value> = text
+            .split("\n\n")
+            .filter(|b| !b.is_empty())
+            .map(|b| serde_json::from_str(b.strip_prefix("data: ").unwrap()).unwrap())
+            .collect();
+        // Exactly 2 valid notifications (255 B and 256 B) + 1 final response; 450 B tail-method & 700 B unmatched-id were discarded!
+        assert_eq!(events.len(), 3, "unexpected events: {events:?}");
+        assert_eq!(events[0]["method"], "notifications/message");
+        assert_eq!(events[1]["method"], "notifications/message");
+        assert_eq!(events[2]["id"], "keep-alive-1");
+        assert_eq!(budget.used(), 0);
+
+        // Session is still alive for subsequent calls!
+        let follow = client
+            .request(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri(format!("http://{gw_addr}/mcp"))
+                    .header("mcp-session-id", &sid)
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(bytes_body(
+                        r#"{"jsonrpc":"2.0","id":"after-discard","method":"tools/call","params":{"name":"small_echo","arguments":{"tag":"still-alive"}}}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(follow.status(), StatusCode::OK);
+        let follow_val: Value =
+            serde_json::from_slice(&follow.into_body().collect().await.unwrap().to_bytes())
+                .unwrap();
+        assert_eq!(follow_val["result"]["tag"], "still-alive");
+
+        stdio_up.shutdown().await;
+        gw_cancel.cancel();
+    }
+
+    // Part B: Per-session notification queue byte budget under slow SSE receiver (6.4 MiB flood capped at 4 KiB budget without losing final response).
+    {
+        let budget = ByteBudget::new(64 * 1024);
+        let stdio_up = Arc::new(
+            StdioUpstream::with_limits(
+                StdioUpstreamSettings {
+                    command: python_executable().to_owned(),
+                    args: vec!["-u".to_owned(), script.to_str().unwrap().to_owned()],
+                    env: BTreeMap::new(),
+                    cwd: Some(tmp.path().to_path_buf()),
+                    max_sessions: 4,
+                    session_idle_secs: 30,
+                },
+                Arc::clone(&budget),
+                StdioLimits {
+                    max_stdout_line_bytes: 8192,
+                    max_control_line_bytes: 1024,
+                    max_notif_queue_bytes: 4096,
+                    ..StdioLimits::default()
+                },
+            )
+            .unwrap(),
+        );
+        let up_ref = Arc::clone(&stdio_up);
+        let (gw_addr, gw_cancel) = spawn_http1_harness(move |req: Request<Incoming>| {
+            let up = Arc::clone(&up_ref);
+            async move { up.handle_mcp(req, &make_token("grant-nbudget", 0)).await }
+        })
+        .await;
+
+        let client = make_client();
+        let init_resp = client
+            .request(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri(format!("http://{gw_addr}/mcp"))
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(bytes_body(
+                        r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let sid = init_resp
+            .headers()
+            .get("mcp-session-id")
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .to_owned();
+        let _ = init_resp.into_body().collect().await.unwrap();
+
+        let mut sse_tcp = TcpStream::connect(gw_addr).await.unwrap();
+        let burst_req = json!({
+            "jsonrpc": "2.0",
+            "id": "sw-flood",
+            "method": "tools/call",
+            "params": {
+                "name": "notif_budget_burst",
+                "arguments": {
+                    "notif_bytes": 800,
+                    "count": 8000,
+                    "gate": "nb",
+                    "post_gate_notif": false
+                }
+            }
+        })
+        .to_string();
+        let raw_sse_http = format!(
+            "POST /mcp HTTP/1.1\r\nHost: {gw_addr}\r\nContent-Type: application/json\r\nAccept: text/event-stream\r\nmcp-session-id: {sid}\r\nConnection: close\r\nContent-Length: {}\r\n\r\n{burst_req}",
+            burst_req.len()
+        );
+        sse_tcp.write_all(raw_sse_http.as_bytes()).await.unwrap();
+
+        let gate_resp = client
+            .request(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri(format!("http://{gw_addr}/mcp"))
+                    .header("mcp-session-id", &sid)
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(bytes_body(
+                        r#"{"jsonrpc":"2.0","method":"notifications/gate_open","params":{"gate":"nb","wait_burst":true}}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(gate_resp.status(), StatusCode::ACCEPTED);
+
+        let mut flooded_out = Vec::new();
+        sse_tcp.read_to_end(&mut flooded_out).await.unwrap();
+        let flooded_str = String::from_utf8(flooded_out).unwrap();
+        assert!(
+            flooded_str.len() < 6_400_000,
+            "notification flood must drop excess events once TCP window + 4 KiB notif budget fill, got {} bytes",
+            flooded_str.len()
+        );
+        assert!(
+            flooded_str.contains("\"burst_done\":true"),
+            "final RPC response must still arrive intact after notification budget overflow"
+        );
+
+        stdio_up.shutdown().await;
+        gw_cancel.cancel();
+    }
+
+    // Part C: Slow receiver lease backpressure on StdioUpstream without starving control paths.
+    {
+        let cancel_dir = tmp.path().join("cancel_flags");
+        std::fs::create_dir_all(&cancel_dir).unwrap();
+        let mut slow_env = BTreeMap::new();
+        slow_env.insert(
+            "MOCK_CANCEL_DIR".to_owned(),
+            cancel_dir.to_str().unwrap().to_owned(),
+        );
+        let budget = ByteBudget::new(8 * 1024 * 1024);
+        let stdio_up = Arc::new(
+            StdioUpstream::with_limits(
+                StdioUpstreamSettings {
+                    command: python_executable().to_owned(),
+                    args: vec!["-u".to_owned(), script.to_str().unwrap().to_owned()],
+                    env: slow_env,
+                    cwd: Some(tmp.path().to_path_buf()),
+                    max_sessions: 8,
+                    session_idle_secs: 30,
+                },
+                Arc::clone(&budget),
+                StdioLimits {
+                    max_stdout_line_bytes: 7 * 1024 * 1024,
+                    max_control_line_bytes: 2048,
+                    max_notif_queue_bytes: 16 * 1024,
+                    ..StdioLimits::default()
+                },
+            )
+            .unwrap(),
+        );
+        let up_ref = Arc::clone(&stdio_up);
+        let (gw_addr, gw_cancel) = spawn_http1_harness(move |req: Request<Incoming>| {
+            let up = Arc::clone(&up_ref);
+            async move { up.handle_mcp(req, &make_token("grant-slow-real", 0)).await }
+        })
+        .await;
+
+        let client = make_client();
+        let mut sids = Vec::new();
+        for _ in 0..2 {
+            let r = client
+                .request(
+                    Request::builder()
+                        .method(Method::POST)
+                        .uri(format!("http://{gw_addr}/mcp"))
+                        .header(header::CONTENT_TYPE, "application/json")
+                        .body(bytes_body(
+                            r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}"#,
+                        ))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            let sid = r
+                .headers()
+                .get("mcp-session-id")
+                .unwrap()
+                .to_str()
+                .unwrap()
+                .to_owned();
+            let _ = r.into_body().collect().await.unwrap();
+            sids.push(sid);
+        }
+
+        let mut tcp = TcpStream::connect(gw_addr).await.unwrap();
+        let req_json = json!({
+            "jsonrpc": "2.0",
+            "id": "slow-a",
+            "method": "tools/call",
+            "params": {
+                "name": "exact_tail_id",
+                "arguments": {"target_bytes": 6 * 1024 * 1024}
+            }
+        })
+        .to_string();
+        let raw_http = format!(
+            "POST /mcp HTTP/1.1\r\nHost: {gw_addr}\r\nContent-Type: application/json\r\nAccept: application/json\r\nmcp-session-id: {}\r\nConnection: close\r\nContent-Length: {}\r\n\r\n{req_json}",
+            sids[0],
+            req_json.len()
+        );
+        tcp.write_all(raw_http.as_bytes()).await.unwrap();
+
+        let mut head_buf = [0u8; 1024];
+        let n_read = tcp.read(&mut head_buf).await.unwrap();
+        assert!(
+            std::str::from_utf8(&head_buf[..n_read])
+                .unwrap_or("")
+                .starts_with("HTTP/1.1 200")
+        );
+
+        // Lease transferred from `raw` to `LeasedReplyBody` without double-counting (used <= 8 MiB),
+        // and stays held (~6 MiB) while Slow Receiver A stalls reading TCP!
+        assert!(
+            budget.used() >= 5 * 1024 * 1024,
+            "slow receiver must keep response lease active, got used={}",
+            budget.used()
+        );
+
+        // Caller B on Session 2 requesting 4 MiB (6 MiB + 4 MiB > 8 MiB) fails non-blockingly with 503!
+        let over_resp = client
+            .request(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri(format!("http://{gw_addr}/mcp"))
+                    .header("mcp-session-id", &sids[1])
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(bytes_body(
+                        json!({
+                            "jsonrpc": "2.0",
+                            "id": "caller-b-over",
+                            "method": "tools/call",
+                            "params": {
+                                "name": "exact_tail_id",
+                                "arguments": {"target_bytes": 4 * 1024 * 1024}
+                            }
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(over_resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let over_val: Value =
+            serde_json::from_slice(&over_resp.into_body().collect().await.unwrap().to_bytes())
+                .unwrap();
+        assert!(
+            over_val["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("byte budget")
+        );
+
+        // Control path (new initialize + small <= 2 KiB tool call) is NOT starved while budget is held!
+        let ctrl_init = client
+            .request(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri(format!("http://{gw_addr}/mcp"))
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(bytes_body(
+                        r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(ctrl_init.status(), StatusCode::OK);
+        let ctrl_sid = ctrl_init
+            .headers()
+            .get("mcp-session-id")
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .to_owned();
+        let _ = ctrl_init.into_body().collect().await.unwrap();
+
+        let ctrl_call = client
+            .request(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri(format!("http://{gw_addr}/mcp"))
+                    .header("mcp-session-id", &ctrl_sid)
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(bytes_body(
+                        r#"{"jsonrpc":"2.0","id":"ctrl-ok","method":"tools/call","params":{"name":"small_echo","arguments":{"tag":"unstarved"}}}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(ctrl_call.status(), StatusCode::OK);
+
+        // Drain Slow Receiver A completely -> lease returns to 0!
+        let mut rest = Vec::new();
+        tcp.read_to_end(&mut rest).await.unwrap();
+        drop(tcp);
+        wait_until(|| budget.used() == 0).await;
+
+        // Subsequent 6 MiB call on `ctrl_sid` now succeeds!
+        let recovered = client
+            .request(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri(format!("http://{gw_addr}/mcp"))
+                    .header("mcp-session-id", &ctrl_sid)
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(bytes_body(
+                        json!({
+                            "jsonrpc": "2.0",
+                            "id": "after-drain",
+                            "method": "tools/call",
+                            "params": {
+                                "name": "exact_tail_id",
+                                "arguments": {"target_bytes": 6 * 1024 * 1024}
+                            }
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(recovered.status(), StatusCode::OK);
+        let _ = recovered.into_body().collect().await.unwrap();
+        assert_eq!(budget.used(), 0);
+
+        // Verify mid-stream TCP disconnect + mid-line request cancellation hold lease until memory actually frees.
+        let mut tcp_abort = TcpStream::connect(gw_addr).await.unwrap();
+        tcp_abort.write_all(raw_http.as_bytes()).await.unwrap();
+        let n_abort = tcp_abort.read(&mut head_buf).await.unwrap();
+        assert!(
+            std::str::from_utf8(&head_buf[..n_abort])
+                .unwrap_or("")
+                .starts_with("HTTP/1.1 200")
+        );
+        assert!(budget.used() >= 5 * 1024 * 1024);
+        drop(tcp_abort);
+        wait_until(|| budget.used() == 0).await;
+
+        let cancel_client = client.clone();
+        let cancel_sid = ctrl_sid.clone();
+        let cancel_task = tokio::spawn(async move {
+            let _ = cancel_client
+                .request(
+                    Request::builder()
+                        .method(Method::POST)
+                        .uri(format!("http://{gw_addr}/mcp"))
+                        .header("mcp-session-id", &cancel_sid)
+                        .header(header::CONTENT_TYPE, "application/json")
+                        .body(bytes_body(
+                            json!({
+                                "jsonrpc": "2.0",
+                                "id": "cancel-mid-line",
+                                "method": "tools/call",
+                                "params": {
+                                    "name": "gated_two_half_line",
+                                    "arguments": {
+                                        "half1_bytes": 32 * 1024,
+                                        "gate": "cancel_half"
+                                    }
+                                }
+                            })
+                            .to_string(),
+                        ))
+                        .unwrap(),
+                )
+                .await;
+        });
+
+        // Wait deterministically until background stdout reader acquires the 32 KiB half-line lease.
+        wait_until(|| budget.used() == 32 * 1024).await;
+
+        // Cancel caller and wait deterministically until child receives `notifications/cancelled` (wire_id = 4 on ctrl_sid: 1=init, 2=ctrl-ok, 3=after-drain, 4=cancel-mid-line).
+        cancel_task.abort();
+        let _ = cancel_task.await;
+        wait_until(|| {
+            std::fs::read_dir(&cancel_dir)
+                .unwrap()
+                .filter_map(Result::ok)
+                .any(|e| {
+                    e.file_name()
+                        .to_str()
+                        .is_some_and(|n| n.starts_with("cancelled_"))
+                })
+        })
+        .await;
+        assert_eq!(
+            budget.used(),
+            32 * 1024,
+            "cancelled caller must NOT release lease while background reader still buffers `raw`"
+        );
+
+        let open_half = client
+            .request(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri(format!("http://{gw_addr}/mcp"))
+                    .header("mcp-session-id", &ctrl_sid)
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(bytes_body(
+                        r#"{"jsonrpc":"2.0","method":"notifications/gate_open","params":{"gate":"cancel_half"}}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(open_half.status(), StatusCode::ACCEPTED);
+        wait_until(|| budget.used() == 0).await;
+
+        let still_ok = client
+            .request(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri(format!("http://{gw_addr}/mcp"))
+                    .header("mcp-session-id", &ctrl_sid)
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(bytes_body(
+                        r#"{"jsonrpc":"2.0","id":"post-cancel-ok","method":"tools/call","params":{"name":"small_echo","arguments":{"tag":"alive"}}}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(still_ok.status(), StatusCode::OK);
+
+        stdio_up.shutdown().await;
+        gw_cancel.cancel();
+    }
+}
+
+#[tokio::test]
+async fn stdio_unsolicited_large_output_sessionless_hard_rejects_and_tight_budget_inplace_id_rewrite()
+ {
+    let tmp = TempDir::new().unwrap();
+    let script = write_multimodal_stdio_mock_script(tmp.path());
+
+    // 1. UnexpectedLargeOutput (> max_control_line_bytes with NO active in-flight request) kills stateful session.
+    {
+        let budget = ByteBudget::new(64 * 1024);
+        let stdio_up = Arc::new(
+            StdioUpstream::with_limits(
+                StdioUpstreamSettings {
+                    command: python_executable().to_owned(),
+                    args: vec!["-u".to_owned(), script.to_str().unwrap().to_owned()],
+                    env: BTreeMap::new(),
+                    cwd: Some(tmp.path().to_path_buf()),
+                    max_sessions: 2,
+                    session_idle_secs: 30,
+                },
+                Arc::clone(&budget),
+                StdioLimits {
+                    max_stdout_line_bytes: 4096,
+                    max_control_line_bytes: 256,
+                    max_notif_queue_bytes: 4096,
+                    ..StdioLimits::default()
+                },
+            )
+            .unwrap(),
+        );
+        let up_ref = Arc::clone(&stdio_up);
+        let (gw_addr, gw_cancel) = spawn_http1_harness(move |req: Request<Incoming>| {
+            let up = Arc::clone(&up_ref);
+            async move { up.handle_mcp(req, &make_token("grant-unsol", 0)).await }
+        })
+        .await;
+
+        let client = make_client();
+        let init_resp = client
+            .request(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri(format!("http://{gw_addr}/mcp"))
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(bytes_body(
+                        r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let sid = init_resp
+            .headers()
+            .get("mcp-session-id")
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .to_owned();
+        let init_val: Value =
+            serde_json::from_slice(&init_resp.into_body().collect().await.unwrap().to_bytes())
+                .unwrap();
+        let child_pid = init_val["result"]["_meta"]["pid"].as_u64().unwrap() as u32;
+
+        // Trigger > 256 B stdout output via notification so `in_flight` has 0 active requests.
+        let notif_resp = client
+            .request(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri(format!("http://{gw_addr}/mcp"))
+                    .header("mcp-session-id", &sid)
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(bytes_body(
+                        r#"{"jsonrpc":"2.0","method":"notifications/spew_unsolicited_large","params":{"bytes":600}}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(notif_resp.status(), StatusCode::ACCEPTED);
+
+        assert!(wait_process_gone(child_pid).await);
+        assert_eq!(budget.used(), 0);
+
+        let dead_resp = client
+            .request(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri(format!("http://{gw_addr}/mcp"))
+                    .header("mcp-session-id", &sid)
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(bytes_body(
+                        r#"{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"small_echo"}}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(dead_resp.status(), StatusCode::NOT_FOUND);
+
+        // 2. Sessionless (`MCP-Protocol-Version: 2026-07-28`) propagates explicit hard-reject reasons to both JSON and SSE callers and reclaims slots.
+        for accept_hdr in ["application/json", "text/event-stream"] {
+            let sl_over = client
+                .request(
+                    Request::builder()
+                        .method(Method::POST)
+                        .uri(format!("http://{gw_addr}/mcp"))
+                        .header("MCP-Protocol-Version", "2026-07-28")
+                        .header(header::ACCEPT, accept_hdr)
+                        .header(header::CONTENT_TYPE, "application/json")
+                        .body(bytes_body(
+                            json!({
+                                "jsonrpc": "2.0",
+                                "id": "sl-over",
+                                "method": "tools/call",
+                                "params": {
+                                    "name": "trigger_oversized_line_then_valid",
+                                    "arguments": {"target_bytes": 5000}
+                                }
+                            })
+                            .to_string(),
+                        ))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+
+            if accept_hdr == "application/json" {
+                assert_eq!(sl_over.status(), StatusCode::BAD_GATEWAY);
+                let val: Value = serde_json::from_slice(
+                    &sl_over.into_body().collect().await.unwrap().to_bytes(),
+                )
+                .unwrap();
+                assert_eq!(val["id"], "sl-over");
+                assert!(
+                    val["error"]["message"]
+                        .as_str()
+                        .unwrap()
+                        .contains("4096 byte limit")
+                );
+            } else {
+                assert_eq!(sl_over.status(), StatusCode::OK);
+                let raw = sl_over.into_body().collect().await.unwrap().to_bytes();
+                let s = std::str::from_utf8(&raw).unwrap();
+                assert!(!s.contains("should_never_arrive"));
+                let val: Value =
+                    serde_json::from_str(s.trim().strip_prefix("data: ").unwrap()).unwrap();
+                assert_eq!(val["id"], "sl-over");
+                assert!(
+                    val["error"]["message"]
+                        .as_str()
+                        .unwrap()
+                        .contains("4096 byte limit")
+                );
+            }
+            assert_eq!(budget.used(), 0);
+        }
+
+        // Clean sessionless call still succeeds (proving slots were reclaimed).
+        let sl_ok = client
+            .request(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri(format!("http://{gw_addr}/mcp"))
+                    .header("MCP-Protocol-Version", "2026-07-28")
+                    .header(header::ACCEPT, "application/json")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(bytes_body(
+                        r#"{"jsonrpc":"2.0","id":"sl-clean","method":"tools/call","params":{"name":"small_echo","arguments":{"tag":"ok"}}}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(sl_ok.status(), StatusCode::OK);
+
+        stdio_up.shutdown().await;
+        gw_cancel.cancel();
+    }
+
+    // 3. Sessionless dead-session mapping when child spews > max_control_line_bytes right after `initialize` (`UnexpectedLargeOutput` preserved through `register_request` / `send_request_line`).
+    {
+        let mut spew_env = BTreeMap::new();
+        spew_env.insert("MOCK_SPEW_AFTER_INIT_BYTES".to_owned(), "600".to_owned());
+        let budget = ByteBudget::new(64 * 1024);
+        let stdio_up = Arc::new(
+            StdioUpstream::with_limits(
+                StdioUpstreamSettings {
+                    command: python_executable().to_owned(),
+                    args: vec!["-u".to_owned(), script.to_str().unwrap().to_owned()],
+                    env: spew_env,
+                    cwd: Some(tmp.path().to_path_buf()),
+                    max_sessions: 2,
+                    session_idle_secs: 30,
+                },
+                Arc::clone(&budget),
+                StdioLimits {
+                    max_stdout_line_bytes: 4096,
+                    max_control_line_bytes: 256,
+                    max_notif_queue_bytes: 4096,
+                    ..StdioLimits::default()
+                },
+            )
+            .unwrap(),
+        );
+        let up_ref = Arc::clone(&stdio_up);
+        let (gw_addr, gw_cancel) = spawn_http1_harness(move |req: Request<Incoming>| {
+            let up = Arc::clone(&up_ref);
+            async move { up.handle_mcp(req, &make_token("grant-spew", 0)).await }
+        })
+        .await;
+
+        let client = make_client();
+        let resp = client
+            .request(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri(format!("http://{gw_addr}/mcp"))
+                    .header("MCP-Protocol-Version", "2026-07-28")
+                    .header(header::ACCEPT, "application/json")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(bytes_body(
+                        r#"{"jsonrpc":"2.0","id":"sl-spew","method":"tools/call","params":{"name":"small_echo"}}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        // Must report 502 (never misclassified as 503 "too many concurrent requests in session").
+        assert_eq!(resp.status(), StatusCode::BAD_GATEWAY);
+        let val: Value =
+            serde_json::from_slice(&resp.into_body().collect().await.unwrap().to_bytes()).unwrap();
+        assert_eq!(val["id"], "sl-spew");
+        let err_msg = val["error"]["message"].as_str().unwrap();
+        assert!(
+            !err_msg.contains("too many concurrent"),
+            "dead session must not be misreported as concurrency limit: {err_msg}"
+        );
+
+        stdio_up.shutdown().await;
+        gw_cancel.cancel();
+    }
+
+    // 4. Tight process budget in-place `id` rewrite: 39,970 B line expanded by 31-byte client `id` to exact 40,000 B budget passes (1.0x buffer, zero 2x AST); 39,971 B -> 40,001 B fails with 503.
+    {
+        let tight_limit = 40_000usize;
+        let budget = ByteBudget::new(tight_limit);
+        let stdio_up = Arc::new(
+            StdioUpstream::with_limits(
+                StdioUpstreamSettings {
+                    command: python_executable().to_owned(),
+                    args: vec!["-u".to_owned(), script.to_str().unwrap().to_owned()],
+                    env: BTreeMap::new(),
+                    cwd: Some(tmp.path().to_path_buf()),
+                    max_sessions: 4,
+                    session_idle_secs: 30,
+                },
+                Arc::clone(&budget),
+                StdioLimits {
+                    max_stdout_line_bytes: 60_000,
+                    max_control_line_bytes: 512,
+                    max_notif_queue_bytes: 4096,
+                    ..StdioLimits::default()
+                },
+            )
+            .unwrap(),
+        );
+        let up_ref = Arc::clone(&stdio_up);
+        let (gw_addr, gw_cancel) = spawn_http1_harness(move |req: Request<Incoming>| {
+            let up = Arc::clone(&up_ref);
+            async move { up.handle_mcp(req, &make_token("grant-tight", 0)).await }
+        })
+        .await;
+
+        let client = make_client();
+        let init_resp = client
+            .request(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri(format!("http://{gw_addr}/mcp"))
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(bytes_body(
+                        r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let sid = init_resp
+            .headers()
+            .get("mcp-session-id")
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .to_owned();
+        let _ = init_resp.into_body().collect().await.unwrap();
+
+        // wire_id = 2 ("2" = 1 B) -> client_id = "long-client-id-expanded-by-30b" (serialized JSON = 32 B).
+        // Line 39,970 B (39,969 B without '\n') - 1 + 32 = 40,000 B == tight_limit!
+        let long_cid = "long-client-id-expanded-by-30b";
+        assert_eq!(serde_json::to_vec(&json!(long_cid)).unwrap().len(), 32);
+
+        let exact_fit = client
+            .request(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri(format!("http://{gw_addr}/mcp"))
+                    .header("mcp-session-id", &sid)
+                    .header(header::ACCEPT, "application/json")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(bytes_body(
+                        json!({
+                            "jsonrpc": "2.0",
+                            "id": long_cid,
+                            "method": "tools/call",
+                            "params": {
+                                "name": "exact_tail_id",
+                                "arguments": {"target_bytes": 39_970}
+                            }
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(exact_fit.status(), StatusCode::OK);
+        let exact_bytes = exact_fit.into_body().collect().await.unwrap().to_bytes();
+        assert_eq!(exact_bytes.len(), tight_limit);
+        let exact_val: Value = serde_json::from_slice(&exact_bytes).unwrap();
+        assert_eq!(exact_val["id"], long_cid);
+        assert!(exact_val["result"]["_meta"]["explicit_null"].is_null());
+        assert_eq!(budget.used(), 0);
+
+        // wire_id = 3 ("3" = 1 B): 39,971 B -> rewritten 40,001 B > 40,000 B -> rejected with 503 during in-place splice `try_reserve`, freeing `raw` & keeping session!
+        let plus_one = client
+            .request(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri(format!("http://{gw_addr}/mcp"))
+                    .header("mcp-session-id", &sid)
+                    .header(header::ACCEPT, "application/json")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(bytes_body(
+                        json!({
+                            "jsonrpc": "2.0",
+                            "id": long_cid,
+                            "method": "tools/call",
+                            "params": {
+                                "name": "exact_tail_id",
+                                "arguments": {"target_bytes": 39_971}
+                            }
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(plus_one.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let plus_val: Value =
+            serde_json::from_slice(&plus_one.into_body().collect().await.unwrap().to_bytes())
+                .unwrap();
+        assert_eq!(plus_val["id"], long_cid);
+        assert!(
+            plus_val["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("byte budget")
+        );
+        assert_eq!(budget.used(), 0);
+
+        stdio_up.shutdown().await;
+        gw_cancel.cancel();
+    }
+}
+
+#[tokio::test]
+async fn stdio_pressure_lru_ignores_stdout_noise_and_disconnect_cancel() {
+    let tmp = TempDir::new().unwrap();
+    let script = tmp.path().join("noisy_stdio_mock.py");
+    std::fs::write(
+        &script,
+        r#"import json, os, sys, threading, time
+
+write_lock = threading.Lock()
+stop_flag = False
+
+def write_line(obj):
+    line = json.dumps(obj, separators=(",", ":")) + "\n"
+    with write_lock:
+        try:
+            sys.stdout.write(line)
+            sys.stdout.flush()
+        except Exception:
+            pass
+
+def spam_notifications():
+    i = 0
+    while not stop_flag:
+        time.sleep(0.015)
+        if stop_flag:
+            break
+        i += 1
+        write_line({"jsonrpc": "2.0", "method": "notifications/message", "params": {"tick": i}})
+
+t = threading.Thread(target=spam_notifications, daemon=True)
+t.start()
+
+for raw in sys.stdin:
+    raw = raw.strip()
+    if not raw:
+        continue
+    msg = json.loads(raw)
+    method = msg.get("method")
+    req_id = msg.get("id")
+    params = msg.get("params") or {}
+    if method == "initialize":
+        write_line({
+            "jsonrpc": "2.0",
+            "id": req_id,
+            "result": {
+                "protocolVersion": "2025-03-26",
+                "capabilities": {},
+                "serverInfo": {"name": "noisy-mock", "version": "1.0", "pid": os.getpid()},
+            },
+        })
+    elif method == "notifications/cancelled":
+        cancel_marker = os.environ.get("CANCEL_MARKER_DIR")
+        if cancel_marker:
+            with open(os.path.join(cancel_marker, f"cancel_{os.getpid()}"), "w") as f:
+                f.write("1")
+    elif method == "tools/call":
+        name = params.get("name")
+        args = params.get("arguments") or {}
+        if name == "ping_fast":
+            write_line({"jsonrpc": "2.0", "id": req_id, "result": {"content": [{"type": "text", "text": "pong"}]}})
+        elif name == "hold_until_file":
+            ready_path = args["ready_path"]
+            release_path = args["release_path"]
+            with open(ready_path, "w") as f:
+                f.write("ready")
+            while not os.path.exists(release_path):
+                time.sleep(0.005)
+            write_line({"jsonrpc": "2.0", "id": req_id, "result": {"content": [{"type": "text", "text": "done"}]}})
+
+stop_flag = True
+"#,
+    )
+    .unwrap();
+
+    let cancel_dir = tmp.path().join("cancels");
+    std::fs::create_dir_all(&cancel_dir).unwrap();
+    let mut env = BTreeMap::new();
+    env.insert(
+        "CANCEL_MARKER_DIR".to_owned(),
+        cancel_dir.to_str().unwrap().to_owned(),
+    );
+
+    let stdio_up = Arc::new(
+        StdioUpstream::with_limits(
+            StdioUpstreamSettings {
+                command: python_executable().to_owned(),
+                args: vec!["-u".to_owned(), script.to_str().unwrap().to_owned()],
+                env,
+                cwd: Some(tmp.path().to_path_buf()),
+                max_sessions: 3,
+                session_idle_secs: 30,
+            },
+            ByteBudget::new(16 * 1024 * 1024),
+            StdioLimits {
+                pressure_idle: Duration::from_millis(80),
+                ..StdioLimits::default()
+            },
+        )
+        .unwrap(),
+    );
+    let up_ref = Arc::clone(&stdio_up);
+    let (gw_addr, gw_cancel) = spawn_http1_harness(move |req: Request<Incoming>| {
+        let up = Arc::clone(&up_ref);
+        async move { up.handle_mcp(req, &make_token("grant-a", 0)).await }
+    })
+    .await;
+
+    let client = make_client();
+    let init_one = |id: u64| {
+        let client = client.clone();
+        async move {
+            let resp = client
+                .request(
+                    Request::builder()
+                        .method(Method::POST)
+                        .uri(format!("http://{gw_addr}/mcp"))
+                        .header(header::CONTENT_TYPE, "application/json")
+                        .body(bytes_body(
+                            json!({"jsonrpc":"2.0","id":id,"method":"initialize","params":{}})
+                                .to_string(),
+                        ))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), StatusCode::OK);
+            let sid = resp
+                .headers()
+                .get("mcp-session-id")
+                .unwrap()
+                .to_str()
+                .unwrap()
+                .to_owned();
+            let body: Value =
+                serde_json::from_slice(&resp.into_body().collect().await.unwrap().to_bytes())
+                    .unwrap();
+            let pid = body["result"]["serverInfo"]["pid"].as_u64().unwrap() as u32;
+            (sid, pid)
+        }
+    };
+    let ping_one = |sid: String| {
+        let client = client.clone();
+        async move {
+            client
+                .request(
+                    Request::builder()
+                        .method(Method::POST)
+                        .uri(format!("http://{gw_addr}/mcp"))
+                        .header("mcp-session-id", sid)
+                        .header(header::CONTENT_TYPE, "application/json")
+                        .body(bytes_body(
+                            r#"{"jsonrpc":"2.0","id":9,"method":"tools/call","params":{"name":"ping_fast","arguments":{}}}"#,
+                        ))
+                        .unwrap(),
+                )
+                .await
+                .unwrap()
+        }
+    };
+
+    let (sid1, _pid1) = init_one(1).await;
+    let (sid2, pid2) = init_one(2).await;
+    let (sid3, pid3) = init_one(3).await;
+
+    // Refresh sid1 via real client call so client LRU order becomes sid2 (oldest) < sid3 < sid1.
+    tokio::time::sleep(Duration::from_millis(20)).await;
+    let p1 = ping_one(sid1.clone()).await;
+    assert_eq!(p1.status(), StatusCode::OK);
+    let _ = p1.into_body().collect().await.unwrap();
+
+    // Let >= 80 ms pass while all 3 children continuously emit stdout notifications every 15 ms.
+    tokio::time::sleep(Duration::from_millis(105)).await;
+
+    // 4th initialize must evict sid2 (exact client LRU) despite sid2's stdout noise.
+    let (sid4, _pid4) = init_one(4).await;
+    assert!(wait_process_gone(pid2).await);
+
+    let r2 = ping_one(sid2.clone()).await;
+    assert_eq!(r2.status(), StatusCode::NOT_FOUND);
+    let _ = r2.into_body().collect().await.unwrap();
+
+    for alive_sid in [&sid1, &sid3, &sid4] {
+        let r = ping_one((*alive_sid).clone()).await;
+        assert_eq!(r.status(), StatusCode::OK);
+        let _ = r.into_body().collect().await.unwrap();
+    }
+
+    // Verify client disconnect (RequestGuard::cancel) does NOT refresh last_client_active_ms:
+    // Start a hold call on sid3, let >= 95 ms pass after sid3's start touch, then abort TCP.
+    let ready3 = tmp.path().join("ready3");
+    let release3 = tmp.path().join("release3");
+    let raw_body = json!({
+        "jsonrpc": "2.0",
+        "id": 77,
+        "method": "tools/call",
+        "params": {
+            "name": "hold_until_file",
+            "arguments": {
+                "ready_path": ready3.to_str().unwrap(),
+                "release_path": release3.to_str().unwrap(),
+            }
+        }
+    })
+    .to_string();
+    let mut raw_conn = TcpStream::connect(gw_addr).await.unwrap();
+    let http_req = format!(
+        "POST /mcp HTTP/1.1\r\nHost: {gw_addr}\r\nMcp-Session-Id: {sid3}\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{raw_body}",
+        raw_body.len()
+    );
+    raw_conn.write_all(http_req.as_bytes()).await.unwrap();
+
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+    while !ready3.exists() {
+        assert!(tokio::time::Instant::now() < deadline);
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+
+    tokio::time::sleep(Duration::from_millis(95)).await;
+    // Refresh sid1 and sid4 right now (< 80 ms old) and drop sid3's TCP socket.
+    for fresh_sid in [&sid1, &sid4] {
+        let r = ping_one((*fresh_sid).clone()).await;
+        assert_eq!(r.status(), StatusCode::OK);
+        let _ = r.into_body().collect().await.unwrap();
+    }
+    drop(raw_conn);
+    std::fs::write(&release3, "go").unwrap();
+
+    let cancel_marker = cancel_dir.join(format!("cancel_{pid3}"));
+    let cancel_deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+    while !cancel_marker.exists() {
+        assert!(tokio::time::Instant::now() < cancel_deadline);
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+
+    // Immediately (well under 80 ms after disconnect!) initialize sid5: sid3 must be evicted.
+    let (_sid5, _pid5) = init_one(5).await;
+    assert!(wait_process_gone(pid3).await);
+    let r3 = ping_one(sid3).await;
+    assert_eq!(r3.status(), StatusCode::NOT_FOUND);
+    let _ = r3.into_body().collect().await.unwrap();
+
+    stdio_up.shutdown().await;
+    gw_cancel.cancel();
+}
+
+#[tokio::test]
+async fn stdio_pressure_admission_protects_recent_cross_grant_inflight_and_handshakes() {
+    let tmp = TempDir::new().unwrap();
+    let script = tmp.path().join("protected_stdio_mock.py");
+    std::fs::write(
+        &script,
+        r#"import json, os, sys, time
+
+for raw in sys.stdin:
+    raw = raw.strip()
+    if not raw:
+        continue
+    msg = json.loads(raw)
+    method = msg.get("method")
+    req_id = msg.get("id")
+    params = msg.get("params") or {}
+    if method == "initialize":
+        hold_dir = os.environ.get("HOLD_INIT_READY_DIR")
+        release_init = os.environ.get("HOLD_INIT_RELEASE_FILE")
+        if hold_dir and release_init:
+            with open(os.path.join(hold_dir, f"init_{os.getpid()}"), "w") as f:
+                f.write("1")
+            while not os.path.exists(release_init):
+                time.sleep(0.005)
+        sys.stdout.write(json.dumps({
+            "jsonrpc": "2.0",
+            "id": req_id,
+            "result": {
+                "protocolVersion": "2025-03-26",
+                "capabilities": {},
+                "serverInfo": {"name": "prot-mock", "version": "1.0"},
+            },
+        }) + "\n")
+        sys.stdout.flush()
+    elif method == "tools/call":
+        args = params.get("arguments") or {}
+        if params.get("name") == "hold":
+            with open(args["ready"], "w") as f:
+                f.write("1")
+            while not os.path.exists(args["release"]):
+                time.sleep(0.005)
+        sys.stdout.write(json.dumps({
+            "jsonrpc": "2.0",
+            "id": req_id,
+            "result": {"content": [{"type": "text", "text": "ok"}]},
+        }) + "\n")
+        sys.stdout.flush()
+"#,
+    )
+    .unwrap();
+
+    // Part A: recent (< pressure_idle), cross-grant, active_requests > 0, and re-initialize guard.
+    {
+        let stdio_up = Arc::new(
+            StdioUpstream::with_limits(
+                StdioUpstreamSettings {
+                    command: python_executable().to_owned(),
+                    args: vec!["-u".to_owned(), script.to_str().unwrap().to_owned()],
+                    env: BTreeMap::new(),
+                    cwd: Some(tmp.path().to_path_buf()),
+                    max_sessions: 2,
+                    session_idle_secs: 30,
+                },
+                ByteBudget::new(8 * 1024 * 1024),
+                StdioLimits {
+                    pressure_idle: Duration::from_millis(120),
+                    ..StdioLimits::default()
+                },
+            )
+            .unwrap(),
+        );
+        let up_ref = Arc::clone(&stdio_up);
+        let (gw_addr, gw_cancel) = spawn_http1_harness(move |req: Request<Incoming>| {
+            let up = Arc::clone(&up_ref);
+            async move {
+                let grant = req
+                    .headers()
+                    .get("x-test-grant")
+                    .and_then(|v| v.to_str().ok())
+                    .unwrap_or("grant-a")
+                    .to_owned();
+                up.handle_mcp(req, &make_token(&grant, 0)).await
+            }
+        })
+        .await;
+
+        let client = make_client();
+        let send_init = |grant: &str, id: u64| {
+            let client = client.clone();
+            let grant = grant.to_owned();
+            async move {
+                client
+                    .request(
+                        Request::builder()
+                            .method(Method::POST)
+                            .uri(format!("http://{gw_addr}/mcp"))
+                            .header("x-test-grant", grant)
+                            .header(header::CONTENT_TYPE, "application/json")
+                            .body(bytes_body(
+                                json!({"jsonrpc":"2.0","id":id,"method":"initialize","params":{}})
+                                    .to_string(),
+                            ))
+                            .unwrap(),
+                    )
+                    .await
+                    .unwrap()
+            }
+        };
+
+        let r1 = send_init("grant-a", 1).await;
+        assert_eq!(r1.status(), StatusCode::OK);
+        let sid1 = r1
+            .headers()
+            .get("mcp-session-id")
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .to_owned();
+        let _ = r1.into_body().collect().await.unwrap();
+
+        let r2 = send_init("grant-a", 2).await;
+        assert_eq!(r2.status(), StatusCode::OK);
+        let sid2 = r2
+            .headers()
+            .get("mcp-session-id")
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .to_owned();
+        let _ = r2.into_body().collect().await.unwrap();
+
+        // 1. Recent (< 120 ms) same-grant sessions must NOT be evicted -> 503.
+        let r_recent = send_init("grant-a", 3).await;
+        assert_eq!(r_recent.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let _ = r_recent.into_body().collect().await.unwrap();
+
+        // 2. Duplicate initialize on an established session returns 400 without corrupting active_requests.
+        let dup_init = client
+            .request(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri(format!("http://{gw_addr}/mcp"))
+                    .header("x-test-grant", "grant-a")
+                    .header("mcp-session-id", &sid1)
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(bytes_body(
+                        r#"{"jsonrpc":"2.0","id":99,"method":"initialize","params":{}}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(dup_init.status(), StatusCode::BAD_REQUEST);
+        let _ = dup_init.into_body().collect().await.unwrap();
+
+        // 3. After >= 120 ms, a DIFFERENT grant ("grant-b") still gets 503 and cannot evict grant-a's sessions.
+        tokio::time::sleep(Duration::from_millis(145)).await;
+        let r_other_grant = send_init("grant-b", 4).await;
+        assert_eq!(r_other_grant.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let _ = r_other_grant.into_body().collect().await.unwrap();
+
+        // 4. Start long calls on both sid1 and sid2; even after >= 120 ms, active_requests > 0 protects both -> 503.
+        let ready1 = tmp.path().join("hold_r1");
+        let rel1 = tmp.path().join("hold_rel1");
+        let ready2 = tmp.path().join("hold_r2");
+        let rel2 = tmp.path().join("hold_rel2");
+
+        let spawn_hold = |sid: String, ready: std::path::PathBuf, rel: std::path::PathBuf| {
+            let client = client.clone();
+            tokio::spawn(async move {
+                let resp = client
+                    .request(
+                        Request::builder()
+                            .method(Method::POST)
+                            .uri(format!("http://{gw_addr}/mcp"))
+                            .header("x-test-grant", "grant-a")
+                            .header("mcp-session-id", sid)
+                            .header(header::CONTENT_TYPE, "application/json")
+                            .body(bytes_body(
+                                json!({
+                                    "jsonrpc": "2.0",
+                                    "id": 10,
+                                    "method": "tools/call",
+                                    "params": {
+                                        "name": "hold",
+                                        "arguments": {
+                                            "ready": ready.to_str().unwrap(),
+                                            "release": rel.to_str().unwrap(),
+                                        }
+                                    }
+                                })
+                                .to_string(),
+                            ))
+                            .unwrap(),
+                    )
+                    .await
+                    .unwrap();
+                assert_eq!(resp.status(), StatusCode::OK);
+                let _ = resp.into_body().collect().await.unwrap();
+            })
+        };
+
+        let h1 = spawn_hold(sid1.clone(), ready1.clone(), rel1.clone());
+        let h2 = spawn_hold(sid2.clone(), ready2.clone(), rel2.clone());
+        let wait_deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+        while !ready1.exists() || !ready2.exists() {
+            assert!(tokio::time::Instant::now() < wait_deadline);
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+
+        tokio::time::sleep(Duration::from_millis(145)).await;
+        let r_busy = send_init("grant-a", 5).await;
+        assert_eq!(r_busy.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let _ = r_busy.into_body().collect().await.unwrap();
+
+        std::fs::write(&rel1, "1").unwrap();
+        std::fs::write(&rel2, "1").unwrap();
+        h1.await.unwrap();
+        h2.await.unwrap();
+
+        stdio_up.shutdown().await;
+        gw_cancel.cancel();
+    }
+
+    // Part B: in-handshake initialize sessions (reserved_slots) are naturally immune to pressure eviction.
+    {
+        let init_ready_dir = tmp.path().join("init_ready");
+        std::fs::create_dir_all(&init_ready_dir).unwrap();
+        let init_release = tmp.path().join("init_release");
+        let mut env = BTreeMap::new();
+        env.insert(
+            "HOLD_INIT_READY_DIR".to_owned(),
+            init_ready_dir.to_str().unwrap().to_owned(),
+        );
+        env.insert(
+            "HOLD_INIT_RELEASE_FILE".to_owned(),
+            init_release.to_str().unwrap().to_owned(),
+        );
+
+        let stdio_up = Arc::new(
+            StdioUpstream::with_limits(
+                StdioUpstreamSettings {
+                    command: python_executable().to_owned(),
+                    args: vec!["-u".to_owned(), script.to_str().unwrap().to_owned()],
+                    env,
+                    cwd: Some(tmp.path().to_path_buf()),
+                    max_sessions: 2,
+                    session_idle_secs: 30,
+                },
+                ByteBudget::new(8 * 1024 * 1024),
+                StdioLimits {
+                    pressure_idle: Duration::from_millis(60),
+                    ..StdioLimits::default()
+                },
+            )
+            .unwrap(),
+        );
+        let up_ref = Arc::clone(&stdio_up);
+        let (gw_addr, gw_cancel) = spawn_http1_harness(move |req: Request<Incoming>| {
+            let up = Arc::clone(&up_ref);
+            async move { up.handle_mcp(req, &make_token("grant-a", 0)).await }
+        })
+        .await;
+
+        let client = make_client();
+        let spawn_init = |id: u64| {
+            let client = client.clone();
+            tokio::spawn(async move {
+                client
+                    .request(
+                        Request::builder()
+                            .method(Method::POST)
+                            .uri(format!("http://{gw_addr}/mcp"))
+                            .header(header::CONTENT_TYPE, "application/json")
+                            .body(bytes_body(
+                                json!({"jsonrpc":"2.0","id":id,"method":"initialize","params":{}})
+                                    .to_string(),
+                            ))
+                            .unwrap(),
+                    )
+                    .await
+                    .unwrap()
+            })
+        };
+
+        let i1 = spawn_init(1);
+        let i2 = spawn_init(2);
+        let wait_deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+        while std::fs::read_dir(&init_ready_dir).unwrap().count() < 2 {
+            assert!(tokio::time::Instant::now() < wait_deadline);
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+
+        tokio::time::sleep(Duration::from_millis(85)).await;
+        let i3 = spawn_init(3).await.unwrap();
+        assert_eq!(i3.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let _ = i3.into_body().collect().await.unwrap();
+
+        std::fs::write(&init_release, "1").unwrap();
+        let r1 = i1.await.unwrap();
+        let r2 = i2.await.unwrap();
+        assert_eq!(r1.status(), StatusCode::OK);
+        assert_eq!(r2.status(), StatusCode::OK);
+        let _ = r1.into_body().collect().await.unwrap();
+        let _ = r2.into_body().collect().await.unwrap();
+
+        stdio_up.shutdown().await;
+        gw_cancel.cancel();
+    }
+}
+
+#[tokio::test]
+async fn stdio_concurrent_reap_and_burst_enforces_hard_max_sessions_cap() {
+    let tmp = TempDir::new().unwrap();
+    let active_dir = tmp.path().join("active_pids");
+    std::fs::create_dir_all(&active_dir).unwrap();
+    let peak_file = tmp.path().join("child_watermark.txt");
+    std::fs::write(&peak_file, "0 0").unwrap();
+    let pids_file = tmp.path().join("spawned_pids.txt");
+    std::fs::write(&pids_file, "").unwrap();
+    let lock_dir = tmp.path().join("watermark_lock");
+
+    let script = tmp.path().join("slow_reap_stdio_mock.py");
+    std::fs::write(
+        &script,
+        r#"import json, os, sys, time
+
+if os.name == "nt":
+    import msvcrt
+else:
+    import fcntl
+
+active_dir = os.environ["ACTIVE_DIR"]
+peak_file = os.environ["PEAK_FILE"]
+pids_file = os.environ["PIDS_FILE"]
+lock_dir = os.environ["LOCK_DIR"]
+_HELD_LOCK_FILE = None
+
+def acquire_spin_lock():
+    while True:
+        try:
+            os.mkdir(lock_dir)
+            return
+        except FileExistsError:
+            time.sleep(0.001)
+
+def lock_nonblocking(f):
+    if os.name == "nt":
+        f.seek(0)
+        msvcrt.locking(f.fileno(), msvcrt.LK_NBLCK, 1)
+    else:
+        fcntl.flock(f.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+
+def unlock_file(f):
+    if os.name == "nt":
+        f.seek(0)
+        msvcrt.locking(f.fileno(), msvcrt.LK_UNLCK, 1)
+    else:
+        fcntl.flock(f.fileno(), fcntl.LOCK_UN)
+
+def scan_live_and_update_peak(own_name):
+    live = 0
+    for name in os.listdir(active_dir):
+        if name == own_name:
+            live += 1
+            continue
+        p = os.path.join(active_dir, name)
+        try:
+            f = open(p, "r+b")
+        except OSError:
+            continue
+        try:
+            lock_nonblocking(f)
+        except OSError:
+            live += 1
+            f.close()
+            continue
+        try:
+            unlock_file(f)
+        except OSError:
+            pass
+        f.close()
+        try:
+            os.remove(p)
+        except OSError:
+            pass
+    with open(peak_file, "r") as pf:
+        _old_cur, old_peak = pf.read().strip().split()
+    peak = max(int(old_peak), live)
+    with open(peak_file, "w") as pf:
+        pf.write(f"{live} {peak}")
+    return live, peak
+
+if len(sys.argv) > 1 and sys.argv[1] == "--probe":
+    acquire_spin_lock()
+    try:
+        cur, peak = scan_live_and_update_peak(None)
+    finally:
+        os.rmdir(lock_dir)
+    sys.stdout.write(f"{cur} {peak}\n")
+    sys.exit(0)
+
+acquire_spin_lock()
+try:
+    own_name = f"{os.getpid()}_{time.time_ns()}.lock"
+    own_path = os.path.join(active_dir, own_name)
+    _HELD_LOCK_FILE = open(own_path, "w+b")
+    _HELD_LOCK_FILE.write(b"1")
+    _HELD_LOCK_FILE.flush()
+    lock_nonblocking(_HELD_LOCK_FILE)
+    with open(pids_file, "a") as pf:
+        pf.write(f"{os.getpid()}\n")
+    scan_live_and_update_peak(own_name)
+finally:
+    os.rmdir(lock_dir)
+
+need_force_kill = False
+for raw in sys.stdin:
+    raw = raw.strip()
+    if not raw:
+        continue
+    msg = json.loads(raw)
+    method = msg.get("method")
+    req_id = msg.get("id")
+    params = msg.get("params") or {}
+    if method == "initialize":
+        ready_marker = params.get("readyMarker")
+        if ready_marker:
+            need_force_kill = True
+            with open(ready_marker, "w") as f:
+                f.write("1")
+            # Block past STDIN_GRACE_WAIT so Unix SIGTERM or Windows JobObject/TerminateProcess reaps this child.
+            time.sleep(5.0)
+        sys.stdout.write(json.dumps({
+            "jsonrpc": "2.0",
+            "id": req_id,
+            "result": {
+                "protocolVersion": "2025-03-26",
+                "capabilities": {},
+                "serverInfo": {"name": "slow-reap", "version": "1.0"},
+            },
+        }) + "\n")
+        sys.stdout.flush()
+    elif method == "tools/call":
+        args = params.get("arguments") or {}
+        ready_marker = args.get("readyMarker")
+        if ready_marker:
+            need_force_kill = True
+            with open(ready_marker, "w") as f:
+                f.write("1")
+            time.sleep(5.0)
+        sys.stdout.write(json.dumps({
+            "jsonrpc": "2.0",
+            "id": req_id,
+            "result": {"content": [{"type": "text", "text": "ok"}]},
+        }) + "\n")
+        sys.stdout.flush()
+
+if need_force_kill:
+    time.sleep(5.0)
+else:
+    # Stay alive for 140 ms inside STDIN_GRACE_WAIT so async reaping overlaps with concurrent reconnects.
+    time.sleep(0.14)
+"#,
+    )
+    .unwrap();
+
+    let probe_watermark =
+        |a_dir: &Path, pk_file: &Path, p_file: &Path, lk_dir: &Path| -> (usize, usize) {
+            let out = std::process::Command::new(python_executable())
+                .args(["-u", script.to_str().unwrap(), "--probe"])
+                .env("ACTIVE_DIR", a_dir)
+                .env("PEAK_FILE", pk_file)
+                .env("PIDS_FILE", p_file)
+                .env("LOCK_DIR", lk_dir)
+                .output()
+                .unwrap();
+            assert!(out.status.success());
+            let nums: Vec<usize> = String::from_utf8_lossy(&out.stdout)
+                .split_whitespace()
+                .map(|v| v.parse().unwrap())
+                .collect();
+            (nums[0], nums[1])
+        };
+
+    let mut env = BTreeMap::new();
+    env.insert(
+        "ACTIVE_DIR".to_owned(),
+        active_dir.to_str().unwrap().to_owned(),
+    );
+    env.insert(
+        "PEAK_FILE".to_owned(),
+        peak_file.to_str().unwrap().to_owned(),
+    );
+    env.insert(
+        "PIDS_FILE".to_owned(),
+        pids_file.to_str().unwrap().to_owned(),
+    );
+    env.insert("LOCK_DIR".to_owned(), lock_dir.to_str().unwrap().to_owned());
+
+    let max_cap = 4usize;
+    let stdio_up = Arc::new(
+        StdioUpstream::with_limits(
+            StdioUpstreamSettings {
+                command: python_executable().to_owned(),
+                args: vec!["-u".to_owned(), script.to_str().unwrap().to_owned()],
+                env,
+                cwd: Some(tmp.path().to_path_buf()),
+                max_sessions: max_cap,
+                session_idle_secs: 30,
+            },
+            ByteBudget::new(16 * 1024 * 1024),
+            StdioLimits {
+                pressure_idle: Duration::from_millis(60),
+                ..StdioLimits::default()
+            },
+        )
+        .unwrap(),
+    );
+    let up_ref = Arc::clone(&stdio_up);
+    let (gw_addr, gw_cancel) = spawn_http1_harness(move |req: Request<Incoming>| {
+        let up = Arc::clone(&up_ref);
+        async move {
+            let grant = req
+                .headers()
+                .get("x-test-grant")
+                .and_then(|v| v.to_str().ok())
+                .unwrap_or("grant-burst")
+                .to_owned();
+            up.handle_mcp(req, &make_token(&grant, 0)).await
+        }
+    })
+    .await;
+
+    let client = make_client();
+    let mut initial_sids = Vec::new();
+    for i in 0..max_cap {
+        let resp = client
+            .request(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri(format!("http://{gw_addr}/mcp"))
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(bytes_body(
+                        json!({"jsonrpc":"2.0","id":i + 1,"method":"initialize","params":{}})
+                            .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        initial_sids.push(
+            resp.headers()
+                .get("mcp-session-id")
+                .unwrap()
+                .to_str()
+                .unwrap()
+                .to_owned(),
+        );
+        let _ = resp.into_body().collect().await.unwrap();
+    }
+
+    // Age all 4 initial sessions past pressure_idle (60 ms), then fire 8 concurrent initializes.
+    tokio::time::sleep(Duration::from_millis(85)).await;
+    let mut burst = tokio::task::JoinSet::new();
+    for i in 0..8usize {
+        let c = client.clone();
+        burst.spawn(async move {
+            let resp = c
+                .request(
+                    Request::builder()
+                        .method(Method::POST)
+                        .uri(format!("http://{gw_addr}/mcp"))
+                        .header(header::CONTENT_TYPE, "application/json")
+                        .body(bytes_body(
+                            json!({"jsonrpc":"2.0","id":100 + i,"method":"initialize","params":{}})
+                                .to_string(),
+                        ))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            let status = resp.status();
+            let sid = resp
+                .headers()
+                .get("mcp-session-id")
+                .and_then(|v| v.to_str().ok())
+                .map(str::to_owned);
+            let _ = resp.into_body().collect().await.unwrap();
+            (status, sid)
+        });
+    }
+
+    let mut new_sids = Vec::new();
+    let mut rejected = 0usize;
+    while let Some(res) = burst.join_next().await {
+        let (status, sid) = res.unwrap();
+        if status == StatusCode::OK {
+            new_sids.push(sid.unwrap());
+        } else {
+            assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+            rejected += 1;
+        }
+    }
+    assert_eq!(
+        new_sids.len(),
+        max_cap,
+        "each of the 4 idle victims must be claimed once without slot stealing"
+    );
+    assert_eq!(rejected, 4);
+
+    // Every initial victim must now return 404.
+    for old_sid in &initial_sids {
+        let r = client
+            .request(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri(format!("http://{gw_addr}/mcp"))
+                    .header("mcp-session-id", old_sid)
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(bytes_body(
+                        r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"x","arguments":{}}}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(r.status(), StatusCode::NOT_FOUND);
+        let _ = r.into_body().collect().await.unwrap();
+    }
+
+    // Refresh the 3 kept sessions (< 60 ms), start DELETE on new_sids[0] (140 ms reap), and fire 2 concurrent initializes.
+    for keep_sid in &new_sids[1..] {
+        let r = client
+            .request(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri(format!("http://{gw_addr}/mcp"))
+                    .header("mcp-session-id", keep_sid)
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(bytes_body(
+                        r#"{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"x","arguments":{}}}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(r.status(), StatusCode::OK);
+        let _ = r.into_body().collect().await.unwrap();
+    }
+
+    let c_del = client.clone();
+    let del_sid = new_sids[0].clone();
+    let del_task = tokio::spawn(async move {
+        let resp = c_del
+            .request(
+                Request::builder()
+                    .method(Method::DELETE)
+                    .uri(format!("http://{gw_addr}/mcp"))
+                    .header("mcp-session-id", del_sid)
+                    .body(empty_body())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let _ = resp.into_body().collect().await.unwrap();
+    });
+
+    // Wait until DELETE has removed del_sid from tbl.sessions (404) while its 140 ms reap is still in terminating_slots.
+    let del_deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+    loop {
+        let probe = client
+            .request(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri(format!("http://{gw_addr}/mcp"))
+                    .header("mcp-session-id", &new_sids[0])
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(bytes_body(
+                        r#"{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"x","arguments":{}}}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let st = probe.status();
+        let _ = probe.into_body().collect().await.unwrap();
+        if st == StatusCode::NOT_FOUND {
+            break;
+        }
+        assert!(tokio::time::Instant::now() < del_deadline);
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+
+    let mut race_inits = tokio::task::JoinSet::new();
+    for k in 0..2usize {
+        let c = client.clone();
+        race_inits.spawn(async move {
+            let resp = c
+                .request(
+                    Request::builder()
+                        .method(Method::POST)
+                        .uri(format!("http://{gw_addr}/mcp"))
+                        .header("x-test-grant", "grant-other")
+                        .header(header::CONTENT_TYPE, "application/json")
+                        .body(bytes_body(
+                            json!({"jsonrpc":"2.0","id":300 + k,"method":"initialize","params":{}})
+                                .to_string(),
+                        ))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            let st = resp.status();
+            let _ = resp.into_body().collect().await.unwrap();
+            st
+        });
+    }
+    let mut del_ok = 0usize;
+    let mut del_503 = 0usize;
+    while let Some(res) = race_inits.join_next().await {
+        match res.unwrap() {
+            StatusCode::OK => del_ok += 1,
+            StatusCode::SERVICE_UNAVAILABLE => del_503 += 1,
+            other => panic!("unexpected status: {other}"),
+        }
+    }
+    del_task.await.unwrap();
+    assert_eq!(del_ok, 1);
+    assert_eq!(del_503, 1);
+
+    let (cur_live, peak_live) = probe_watermark(&active_dir, &peak_file, &pids_file, &lock_dir);
+    assert_eq!(cur_live, max_cap);
+    assert!(
+        peak_live <= max_cap,
+        "peak simultaneous live child count {peak_live} exceeded max_sessions {max_cap}"
+    );
+
+    // Free 1 slot (leaving 3 live sessions in "grant-burst"/"grant-other"), then test mid-flight TCP disconnect
+    // during BOTH slow-exit initialize AND slow-exit sessionless non-SSE calls, followed by immediate reconnect bursts!
+    let free_one = client
+        .request(
+            Request::builder()
+                .method(Method::DELETE)
+                .uri(format!("http://{gw_addr}/mcp"))
+                .header("mcp-session-id", &new_sids[1])
+                .body(empty_body())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(free_one.status(), StatusCode::OK);
+    let _ = free_one.into_body().collect().await.unwrap();
+
+    // Case A: Mid-initialize TCP disconnect on a child that ignores stdin EOF (requires SIGTERM after STDIN_GRACE_WAIT).
+    let init_disc_marker = tmp.path().join("init_disc_ready");
+    let init_disc_body = json!({
+        "jsonrpc": "2.0",
+        "id": 501,
+        "method": "initialize",
+        "params": { "readyMarker": init_disc_marker.to_str().unwrap() }
+    })
+    .to_string();
+    let mut raw_init_conn = TcpStream::connect(gw_addr).await.unwrap();
+    let raw_init_http = format!(
+        "POST /mcp HTTP/1.1\r\nHost: {gw_addr}\r\nX-Test-Grant: grant-other\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{init_disc_body}",
+        init_disc_body.len()
+    );
+    raw_init_conn
+        .write_all(raw_init_http.as_bytes())
+        .await
+        .unwrap();
+    let marker_deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+    while !init_disc_marker.exists() {
+        assert!(tokio::time::Instant::now() < marker_deadline);
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    // Abruptly disconnect client TCP while child is blocked inside initialize (and ignores stdin EOF!).
+    drop(raw_init_conn);
+    tokio::time::sleep(Duration::from_millis(15)).await;
+
+    // Fire 2 concurrent reconnects during the 200 ms STDIN_GRACE_WAIT + SIGTERM window:
+    // into_terminating() keeps peak_live <= 4 while waking 1 waiter after reaping finishes (the 2nd gets 503).
+    let mut init_abort_race = tokio::task::JoinSet::new();
+    for k in 0..2usize {
+        let c = client.clone();
+        init_abort_race.spawn(async move {
+            let resp = c
+                .request(
+                    Request::builder()
+                        .method(Method::POST)
+                        .uri(format!("http://{gw_addr}/mcp"))
+                        .header("x-test-grant", "grant-third")
+                        .header(header::CONTENT_TYPE, "application/json")
+                        .body(bytes_body(
+                            json!({"jsonrpc":"2.0","id":502 + k,"method":"initialize","params":{}})
+                                .to_string(),
+                        ))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            let st = resp.status();
+            let sid = resp
+                .headers()
+                .get("mcp-session-id")
+                .and_then(|v| v.to_str().ok())
+                .map(str::to_owned);
+            let _ = resp.into_body().collect().await.unwrap();
+            (st, sid)
+        });
+    }
+    let mut abort_reclaimed_sid = None;
+    let mut abort_rejected = 0usize;
+    while let Some(res) = init_abort_race.join_next().await {
+        let (st, sid) = res.unwrap();
+        if st == StatusCode::OK {
+            abort_reclaimed_sid = sid;
+        } else {
+            assert_eq!(st, StatusCode::SERVICE_UNAVAILABLE);
+            abort_rejected += 1;
+        }
+    }
+    let abort_reclaimed_sid =
+        abort_reclaimed_sid.expect("one reconnect must wake and claim the reaped handshake slot");
+    assert_eq!(abort_rejected, 1);
+
+    // Free that reclaimed 4th slot again so cur_live returns to 3 before Case B.
+    let free_reclaimed = client
+        .request(
+            Request::builder()
+                .method(Method::DELETE)
+                .uri(format!("http://{gw_addr}/mcp"))
+                .header("x-test-grant", "grant-third")
+                .header("mcp-session-id", abort_reclaimed_sid)
+                .body(empty_body())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(free_reclaimed.status(), StatusCode::OK);
+    let _ = free_reclaimed.into_body().collect().await.unwrap();
+
+    // Case B: Mid-sessionless (non-SSE) TCP disconnect on a child that ignores stdin EOF, followed by immediate reconnects.
+    let sl_disc_marker = tmp.path().join("sessionless_disc_ready");
+    let sl_disc_body = json!({
+        "jsonrpc": "2.0",
+        "id": 601,
+        "method": "tools/call",
+        "params": {
+            "name": "slow_tool",
+            "arguments": { "readyMarker": sl_disc_marker.to_str().unwrap() }
+        }
+    })
+    .to_string();
+    let mut raw_sl_conn = TcpStream::connect(gw_addr).await.unwrap();
+    let raw_sl_http = format!(
+        "POST /mcp HTTP/1.1\r\nHost: {gw_addr}\r\nX-Test-Grant: grant-other\r\nMCP-Protocol-Version: 2026-07-28\r\nAccept: application/json\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{sl_disc_body}",
+        sl_disc_body.len()
+    );
+    raw_sl_conn.write_all(raw_sl_http.as_bytes()).await.unwrap();
+    let sl_deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+    while !sl_disc_marker.exists() {
+        assert!(tokio::time::Instant::now() < sl_deadline);
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    drop(raw_sl_conn);
+    tokio::time::sleep(Duration::from_millis(15)).await;
+
+    let mut sl_abort_race = tokio::task::JoinSet::new();
+    for k in 0..2usize {
+        let c = client.clone();
+        sl_abort_race.spawn(async move {
+            let resp = c
+                .request(
+                    Request::builder()
+                        .method(Method::POST)
+                        .uri(format!("http://{gw_addr}/mcp"))
+                        .header("x-test-grant", "grant-third")
+                        .header(header::CONTENT_TYPE, "application/json")
+                        .body(bytes_body(
+                            json!({"jsonrpc":"2.0","id":602 + k,"method":"initialize","params":{}})
+                                .to_string(),
+                        ))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            let st = resp.status();
+            let _ = resp.into_body().collect().await.unwrap();
+            st
+        });
+    }
+    let mut sl_ok = 0usize;
+    let mut sl_503 = 0usize;
+    while let Some(res) = sl_abort_race.join_next().await {
+        match res.unwrap() {
+            StatusCode::OK => sl_ok += 1,
+            StatusCode::SERVICE_UNAVAILABLE => sl_503 += 1,
+            other => panic!("unexpected status: {other}"),
+        }
+    }
+    assert_eq!(sl_ok, 1);
+    assert_eq!(sl_503, 1);
+
+    stdio_up.shutdown().await;
+    gw_cancel.cancel();
+
+    let (final_cur, final_peak) = probe_watermark(&active_dir, &peak_file, &pids_file, &lock_dir);
+    assert_eq!(final_cur, 0);
+    assert_eq!(final_peak, max_cap);
+    for pid_line in std::fs::read_to_string(&pids_file).unwrap().lines() {
+        if let Ok(pid) = pid_line.trim().parse::<u32>() {
+            assert!(
+                !process_exists(pid),
+                "spawned child pid {pid} still alive after shutdown"
+            );
+        }
+    }
+
+    // Case C: Under max_sessions = 1, back-to-back serial SSE sessionless calls (Accept: application/json, text/event-stream)
+    // wait on terminating_slots (140 ms reap) and BOTH succeed with 200 OK while keeping peak_live == 1.
+    let sse_active_dir = tmp.path().join("sse_active_pids");
+    std::fs::create_dir_all(&sse_active_dir).unwrap();
+    let sse_peak_file = tmp.path().join("sse_serial_watermark.txt");
+    std::fs::write(&sse_peak_file, "0 0").unwrap();
+    let sse_pids_file = tmp.path().join("sse_spawned_pids.txt");
+    std::fs::write(&sse_pids_file, "").unwrap();
+    let sse_lock = tmp.path().join("sse_serial_lock");
+    let mut sse_env = BTreeMap::new();
+    sse_env.insert(
+        "ACTIVE_DIR".to_owned(),
+        sse_active_dir.to_str().unwrap().to_owned(),
+    );
+    sse_env.insert(
+        "PEAK_FILE".to_owned(),
+        sse_peak_file.to_str().unwrap().to_owned(),
+    );
+    sse_env.insert(
+        "PIDS_FILE".to_owned(),
+        sse_pids_file.to_str().unwrap().to_owned(),
+    );
+    sse_env.insert("LOCK_DIR".to_owned(), sse_lock.to_str().unwrap().to_owned());
+
+    let sse_up = Arc::new(
+        StdioUpstream::with_limits(
+            StdioUpstreamSettings {
+                command: python_executable().to_owned(),
+                args: vec!["-u".to_owned(), script.to_str().unwrap().to_owned()],
+                env: sse_env,
+                cwd: Some(tmp.path().to_path_buf()),
+                max_sessions: 1,
+                session_idle_secs: 30,
+            },
+            ByteBudget::new(8 * 1024 * 1024),
+            StdioLimits::default(),
+        )
+        .unwrap(),
+    );
+    let sse_ref = Arc::clone(&sse_up);
+    let (sse_gw_addr, sse_gw_cancel) = spawn_http1_harness(move |req: Request<Incoming>| {
+        let up = Arc::clone(&sse_ref);
+        async move { up.handle_mcp(req, &make_token("grant-sse-serial", 0)).await }
+    })
+    .await;
+
+    for call_id in [701u64, 702u64] {
+        let resp = client
+            .request(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri(format!("http://{sse_gw_addr}/mcp"))
+                    .header("mcp-protocol-version", "2026-07-28")
+                    .header(header::ACCEPT, "application/json, text/event-stream")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(bytes_body(
+                        json!({
+                            "jsonrpc": "2.0",
+                            "id": call_id,
+                            "method": "tools/call",
+                            "params": { "name": "fast_sse", "arguments": {} }
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::OK,
+            "serial SSE sessionless call {call_id} must wait for prior ephemeral reap instead of returning 503"
+        );
+        assert_eq!(
+            resp.headers()
+                .get(header::CONTENT_TYPE)
+                .and_then(|v| v.to_str().ok()),
+            Some("text/event-stream")
+        );
+        let body_text = String::from_utf8(
+            resp.into_body()
+                .collect()
+                .await
+                .unwrap()
+                .to_bytes()
+                .to_vec(),
+        )
+        .unwrap();
+        assert!(body_text.contains(&format!("\"id\":{call_id}")));
+    }
+
+    sse_up.shutdown().await;
+    sse_gw_cancel.cancel();
+
+    let (sse_cur, sse_peak) =
+        probe_watermark(&sse_active_dir, &sse_peak_file, &sse_pids_file, &sse_lock);
+    assert_eq!(sse_cur, 0);
+    assert_eq!(sse_peak, 1);
+    for pid_line in std::fs::read_to_string(&sse_pids_file).unwrap().lines() {
+        if let Ok(pid) = pid_line.trim().parse::<u32>() {
+            assert!(
+                !process_exists(pid),
+                "SSE sessionless child pid {pid} still alive after shutdown"
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn http_session_eviction_protects_inflight_post_closes_idle_get_and_cleans_overflow() {
+    type StreamTx = tokio::sync::mpsc::Sender<Result<Frame<Bytes>, std::io::Error>>;
+
+    let next_sid = Arc::new(AtomicUsize::new(0));
+    let deleted_sids: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+    let delete_notify = Arc::new(tokio::sync::Notify::new());
+    let held_post_streams: Arc<Mutex<Vec<(String, StreamTx)>>> = Arc::new(Mutex::new(Vec::new()));
+    let held_post_notify = Arc::new(tokio::sync::Notify::new());
+    let held_get_streams: Arc<Mutex<Vec<(String, StreamTx)>>> = Arc::new(Mutex::new(Vec::new()));
+
+    let next_sid_up = Arc::clone(&next_sid);
+    let deleted_up = Arc::clone(&deleted_sids);
+    let delete_notify_up = Arc::clone(&delete_notify);
+    let held_post_up = Arc::clone(&held_post_streams);
+    let held_post_notify_up = Arc::clone(&held_post_notify);
+    let held_get_up = Arc::clone(&held_get_streams);
+
+    let (up_addr, up_cancel) = spawn_http1_harness(move |req: Request<Incoming>| {
+        let next_sid = Arc::clone(&next_sid_up);
+        let deleted = Arc::clone(&deleted_up);
+        let delete_notify = Arc::clone(&delete_notify_up);
+        let held_post = Arc::clone(&held_post_up);
+        let held_post_notify = Arc::clone(&held_post_notify_up);
+        let held_get = Arc::clone(&held_get_up);
+        async move {
+            let method = req.method().clone();
+            let req_sid = req
+                .headers()
+                .get("mcp-session-id")
+                .and_then(|v| v.to_str().ok())
+                .map(str::to_owned);
+            let mode = req
+                .headers()
+                .get("x-test-mode")
+                .and_then(|v| v.to_str().ok())
+                .unwrap_or("")
+                .to_owned();
+            let body_bytes = req.into_body().collect().await.unwrap().to_bytes();
+
+            if method == Method::DELETE {
+                if let Some(sid) = req_sid {
+                    deleted.lock().unwrap().push(sid);
+                    delete_notify.notify_waiters();
+                }
+                return Response::builder()
+                    .status(StatusCode::OK)
+                    .body(empty_body())
+                    .unwrap();
+            }
+
+            if method == Method::GET {
+                let sid = req_sid.unwrap_or_default();
+                let (tx, body) = channel_body(8);
+                let _ = tx
+                    .send(Ok(Frame::data(Bytes::from_static(
+                        b"data: {\"jsonrpc\":\"2.0\",\"method\":\"notifications/message\"}\n\n",
+                    ))))
+                    .await;
+                held_get.lock().unwrap().push((sid.clone(), tx));
+                return Response::builder()
+                    .status(StatusCode::OK)
+                    .header(header::CONTENT_TYPE, "text/event-stream")
+                    .header("mcp-session-id", sid)
+                    .body(body)
+                    .unwrap();
+            }
+
+            let val: Value = serde_json::from_slice(&body_bytes).unwrap_or_else(|_| json!({}));
+            if val.get("method").and_then(Value::as_str) == Some("initialize") {
+                let idx = next_sid.fetch_add(1, Ordering::Relaxed);
+                let sid = format!("sid-{idx}");
+                return Response::builder()
+                    .status(StatusCode::OK)
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .header("mcp-session-id", sid)
+                    .body(bytes_body(
+                        r#"{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":"2025-03-26","capabilities":{}}}"#,
+                    ))
+                    .unwrap();
+            }
+
+            let sid = req_sid.unwrap_or_default();
+            if mode == "hold_post" {
+                let (tx, body) = channel_body(8);
+                let _ = tx
+                    .send(Ok(Frame::data(Bytes::from_static(
+                        b"data: {\"jsonrpc\":\"2.0\",\"method\":\"notifications/progress\"}\n\n",
+                    ))))
+                    .await;
+                held_post.lock().unwrap().push((sid.clone(), tx));
+                held_post_notify.notify_waiters();
+                return Response::builder()
+                    .status(StatusCode::OK)
+                    .header(header::CONTENT_TYPE, "text/event-stream")
+                    .header("mcp-session-id", sid)
+                    .body(body)
+                    .unwrap();
+            }
+
+            Response::builder()
+                .status(StatusCode::OK)
+                .header(header::CONTENT_TYPE, "application/json")
+                .header("mcp-session-id", sid)
+                .body(bytes_body(r#"{"jsonrpc":"2.0","id":2,"result":{"ok":true}}"#))
+                .unwrap()
+        }
+    })
+    .await;
+
+    let settings = HttpUpstreamSettings {
+        url: Url::parse(&format!("http://{up_addr}/mcp")).unwrap(),
+        origin_base: Url::parse(&format!("http://{up_addr}")).unwrap(),
+        public_is_https: false,
+        bearer_tokens: Vec::new(),
+        passthrough_prefixes: Vec::new(),
+        request_timeout_secs: 30,
+    };
+    let http_up = Arc::new(HttpUpstream::new(settings).unwrap());
+    let up_ref = Arc::clone(&http_up);
+    let (gw_addr, gw_cancel) = spawn_http1_harness(move |req: Request<Incoming>| {
+        let up = Arc::clone(&up_ref);
+        async move { up.handle_mcp(req, &make_token("grant-http", 0)).await }
+    })
+    .await;
+
+    let client = make_client();
+
+    // 1. Fill all 32 per-grant session slots: sid-0 .. sid-31.
+    let mut sids = Vec::new();
+    for _ in 0..32 {
+        let resp = client
+            .request(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri(format!("http://{gw_addr}/mcp"))
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(bytes_body(
+                        r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let sid = resp
+            .headers()
+            .get("mcp-session-id")
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .to_owned();
+        let _ = resp.into_body().collect().await.unwrap();
+        sids.push(sid);
+    }
+    assert_eq!(sids[0], "sid-0");
+    assert_eq!(sids[1], "sid-1");
+    assert_eq!(sids[31], "sid-31");
+
+    // 2. Start an in-flight streaming POST on sid-0 (oldest session) and read its first SSE frame.
+    let mut sid0_post_resp = client
+        .request(
+            Request::builder()
+                .method(Method::POST)
+                .uri(format!("http://{gw_addr}/mcp"))
+                .header("mcp-session-id", "sid-0")
+                .header("x-test-mode", "hold_post")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(bytes_body(
+                    r#"{"jsonrpc":"2.0","id":10,"method":"tools/call","params":{"name":"long"}}"#,
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(sid0_post_resp.status(), StatusCode::OK);
+    let first_post_frame = sid0_post_resp.body_mut().frame().await.unwrap().unwrap();
+    assert!(!first_post_frame.into_data().unwrap().is_empty());
+
+    // 3. Open an idle background GET SSE listener stream on sid-1 (active_post_streams == 0).
+    let mut sid1_get_resp = client
+        .request(
+            Request::builder()
+                .method(Method::GET)
+                .uri(format!("http://{gw_addr}/mcp"))
+                .header("mcp-session-id", "sid-1")
+                .header(header::ACCEPT, "text/event-stream")
+                .body(empty_body())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(sid1_get_resp.status(), StatusCode::OK);
+    let first_get_frame = sid1_get_resp.body_mut().frame().await.unwrap().unwrap();
+    assert!(!first_get_frame.into_data().unwrap().is_empty());
+
+    // 4. Send a completed POST on sid-2 echoing Mcp-Session-Id: sid-2 (verifying deduplicated bind_session).
+    let echo_resp = client
+        .request(
+            Request::builder()
+                .method(Method::POST)
+                .uri(format!("http://{gw_addr}/mcp"))
+                .header("mcp-session-id", "sid-2")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(bytes_body(
+                    r#"{"jsonrpc":"2.0","id":11,"method":"tools/call","params":{"name":"fast"}}"#,
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(echo_resp.status(), StatusCode::OK);
+    let _ = echo_resp.into_body().collect().await.unwrap();
+
+    // 5. Create 33rd session (sid-32): must skip sid-0 (active POST) and evict sid-1 (idle GET)!
+    let del_wait = delete_notify.notified();
+    tokio::pin!(del_wait);
+    del_wait.as_mut().enable();
+
+    let resp32 = client
+        .request(
+            Request::builder()
+                .method(Method::POST)
+                .uri(format!("http://{gw_addr}/mcp"))
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(bytes_body(
+                    r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}"#,
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp32.status(), StatusCode::OK);
+    let sid32 = resp32
+        .headers()
+        .get("mcp-session-id")
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .to_owned();
+    assert_eq!(sid32, "sid-32");
+    let _ = resp32.into_body().collect().await.unwrap();
+
+    tokio::time::timeout(Duration::from_secs(3), &mut del_wait)
+        .await
+        .expect("evicted sid-1 DELETE must arrive");
+    assert_eq!(deleted_sids.lock().unwrap().as_slice(), &["sid-1"]);
+
+    // sid-1's open GET SSE stream must terminate promptly via per-session CancellationToken.
+    let get_end = tokio::time::timeout(Duration::from_secs(2), sid1_get_resp.body_mut().frame())
+        .await
+        .expect("evicted session GET SSE stream must not hang");
+    assert!(
+        get_end.is_none() || get_end.unwrap().is_err(),
+        "expected closed/aborted GET stream on evicted sid-1"
+    );
+
+    // sid-1 is now 404, whereas sid-0's in-flight POST stream continues uninterrupted!
+    let sid1_after = client
+        .request(
+            Request::builder()
+                .method(Method::POST)
+                .uri(format!("http://{gw_addr}/mcp"))
+                .header("mcp-session-id", "sid-1")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(bytes_body(
+                    r#"{"jsonrpc":"2.0","id":12,"method":"tools/call","params":{"name":"fast"}}"#,
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(sid1_after.status(), StatusCode::NOT_FOUND);
+    let _ = sid1_after.into_body().collect().await.unwrap();
+
+    // 6. Now open active POST streams on the remaining 31 bound sessions (sid-2 .. sid-32) so ALL 32 have active_post_streams == 1.
+    let mut active_post_resps = vec![sid0_post_resp];
+    for idx in 2..=32 {
+        let sid = format!("sid-{idx}");
+        let mut r = client
+            .request(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri(format!("http://{gw_addr}/mcp"))
+                    .header("mcp-session-id", sid)
+                    .header("x-test-mode", "hold_post")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(bytes_body(
+                        r#"{"jsonrpc":"2.0","id":20,"method":"tools/call","params":{"name":"long"}}"#,
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(r.status(), StatusCode::OK);
+        let f = r.body_mut().frame().await.unwrap().unwrap();
+        assert!(!f.into_data().unwrap().is_empty());
+        active_post_resps.push(r);
+    }
+    assert_eq!(active_post_resps.len(), 32);
+
+    // 7. 34th initialize (upstream mints sid-33) while all 32 slots have active POSTs -> 503 + upstream DELETE sid-33!
+    let overflow_del_wait = delete_notify.notified();
+    tokio::pin!(overflow_del_wait);
+    overflow_del_wait.as_mut().enable();
+
+    let resp33 = client
+        .request(
+            Request::builder()
+                .method(Method::POST)
+                .uri(format!("http://{gw_addr}/mcp"))
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(bytes_body(
+                    r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}"#,
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp33.status(), StatusCode::SERVICE_UNAVAILABLE);
+    let _ = resp33.into_body().collect().await.unwrap();
+
+    tokio::time::timeout(Duration::from_secs(3), &mut overflow_del_wait)
+        .await
+        .expect("excess sid-33 must receive upstream DELETE cleanup");
+    assert_eq!(
+        deleted_sids.lock().unwrap().as_slice(),
+        &["sid-1", "sid-33"]
+    );
+
+    // Finish all 32 in-flight POST streams cleanly and verify sid-0 still works afterwards.
+    let senders: Vec<(String, StreamTx)> = std::mem::take(&mut *held_post_streams.lock().unwrap());
+    assert_eq!(senders.len(), 32);
+    for (_, tx) in senders {
+        let _ = tx
+            .send(Ok(Frame::data(Bytes::from_static(
+                b"data: {\"jsonrpc\":\"2.0\",\"id\":20,\"result\":{\"done\":true}}\n\n",
+            ))))
+            .await;
+        drop(tx);
+    }
+    for resp in active_post_resps {
+        let tail = resp.into_body().collect().await.unwrap().to_bytes();
+        assert!(
+            std::str::from_utf8(&tail)
+                .unwrap()
+                .contains("\"done\":true")
+        );
+    }
+
+    let sid0_check = client
+        .request(
+            Request::builder()
+                .method(Method::POST)
+                .uri(format!("http://{gw_addr}/mcp"))
+                .header("mcp-session-id", "sid-0")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(bytes_body(
+                    r#"{"jsonrpc":"2.0","id":99,"method":"tools/call","params":{"name":"fast"}}"#,
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(sid0_check.status(), StatusCode::OK);
+    let _ = sid0_check.into_body().collect().await.unwrap();
+
+    held_get_streams.lock().unwrap().clear();
+    http_up.shutdown().await;
     gw_cancel.cancel();
     up_cancel.cancel();
 }
