@@ -1,0 +1,204 @@
+name: release
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref }}
+
+env:
+  CARGO_TERM_COLOR: always
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+
+jobs:
+  check:
+    name: verify version and source
+    runs-on: ubuntu-24.04
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+      commit: ${{ steps.version.outputs.commit }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - id: version
+        run: |
+          version="$(python3 -c "import tomllib; print(tomllib.load(open('Cargo.toml', 'rb'))['package']['version'])")"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "commit=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+          if [[ "$GITHUB_REF" == refs/tags/v* ]]; then
+            test "$GITHUB_REF_NAME" = "v$version"
+            git merge-base --is-ancestor HEAD origin/main
+          fi
+
+  ci:
+    needs: check
+    if: github.event_name == 'push'
+    uses: ./.github/workflows/ci.yml
+
+  build:
+    name: archive (${{ matrix.platform }})
+    needs: check
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { platform: macos-amd64, runner: macos-15-intel, target: x86_64-apple-darwin }
+          - { platform: macos-arm64, runner: macos-15, target: aarch64-apple-darwin }
+          - { platform: windows-amd64, runner: windows-latest, target: x86_64-pc-windows-msvc }
+          - { platform: windows-arm64, runner: windows-11-arm, target: aarch64-pc-windows-msvc }
+    defaults:
+      run:
+        shell: bash
+    env:
+      VERSION: ${{ needs.check.outputs.version }}
+      PLATFORM: ${{ matrix.platform }}
+      BIN: target/${{ matrix.target }}/release/oauth2-mcp-gateway${{ startsWith(matrix.platform, 'windows-') && '.exe' || '' }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - name: build
+        run: cargo build --release --locked --target ${{ matrix.target }}
+      - name: package and smoke test
+        run: python scripts/ci/package-release.py "$BIN" "$VERSION" "$PLATFORM"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: release-${{ matrix.platform }}
+          path: dist/oauth2-mcp-gateway-*
+          if-no-files-found: error
+
+  linux:
+    name: archive (linux-${{ matrix.arch }})
+    needs: check
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { arch: amd64, runner: ubuntu-24.04 }
+          - { arch: arm64, runner: ubuntu-24.04-arm }
+    env:
+      VERSION: ${{ needs.check.outputs.version }}
+      PLATFORM: linux-${{ matrix.arch }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: native musl build, package and smoke test
+        run: |
+          docker run --rm --init -v "$GITHUB_WORKSPACE:/workspace" -w /workspace \
+            -e VERSION -e PLATFORM -e CARGO_BUILD_JOBS=2 \
+            rust:1.92.0-alpine3.23 sh -ec '
+              apk add --no-cache build-base python3 ca-certificates
+              cargo build --release --locked
+              python3 scripts/ci/package-release.py target/release/oauth2-mcp-gateway "$VERSION" "$PLATFORM"
+            '
+      - uses: actions/upload-artifact@v4
+        with:
+          name: release-linux-${{ matrix.arch }}
+          path: dist/oauth2-mcp-gateway-*.tar.gz
+          if-no-files-found: error
+
+  freebsd:
+    name: archive (freebsd-amd64)
+    needs: check
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    env:
+      VERSION: ${{ needs.check.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: native build, package and smoke test
+        uses: vmactions/freebsd-vm@c46abacb49f09938ca4e1702d15d836285d694cc # v1.5.9
+        with:
+          release: "15.1"
+          arch: x86_64
+          mem: 6144
+          cpu: 4
+          envs: VERSION
+          prepare: pkg install -y rust python3 ca_root_nss
+          run: |
+            set -eu
+            export CARGO_TARGET_DIR=/tmp/oauth2-mcp-gateway-release-target
+            export CARGO_BUILD_JOBS=2
+            cargo build --release --locked
+            python3 scripts/ci/package-release.py "$CARGO_TARGET_DIR/release/oauth2-mcp-gateway" "$VERSION" freebsd-amd64
+            touch dist/freebsd-smoke-passed
+      - name: require guest smoke result
+        run: test -f dist/freebsd-smoke-passed
+      - uses: actions/upload-artifact@v4
+        with:
+          name: release-freebsd-amd64
+          path: dist/oauth2-mcp-gateway-*.tar.gz
+          if-no-files-found: error
+
+  bundle:
+    name: verify release bundle
+    needs: [check, build, linux, freebsd]
+    runs-on: ubuntu-24.04
+    env:
+      VERSION: ${{ needs.check.outputs.version }}
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          pattern: release-*
+          merge-multiple: true
+      - name: require seven archives and record checksums
+        working-directory: dist
+        run: |
+          set -euo pipefail
+          expected=()
+          for platform in linux-amd64 linux-arm64 macos-amd64 macos-arm64 windows-amd64 windows-arm64 freebsd-amd64; do
+            ext=tar.gz
+            if [[ "$platform" == windows-* ]]; then ext=zip; fi
+            expected+=("oauth2-mcp-gateway-$VERSION-$platform.$ext")
+          done
+          diff <(printf '%s\n' "${expected[@]}" | sort) <(printf '%s\n' * | sort)
+          sha256sum "${expected[@]}" > SHA256SUMS
+      - uses: actions/upload-artifact@v4
+        with:
+          name: verified-bundle
+          path: dist/*
+          if-no-files-found: error
+
+  release:
+    name: create draft release
+    needs: [check, ci, bundle]
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: verified-bundle
+          path: dist
+      - name: create draft
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ needs.check.outputs.version }}
+          COMMIT: ${{ needs.check.outputs.commit }}
+        run: |
+          live="$(gh api "repos/$GITHUB_REPOSITORY/commits/$GITHUB_REF" --jq .sha)"
+          test "$live" = "$COMMIT"
+          gh release create "$GITHUB_REF_NAME" dist/* --repo "$GITHUB_REPOSITORY" \
+            --draft --verify-tag --generate-notes --title "oauth2-mcp-gateway $VERSION"
