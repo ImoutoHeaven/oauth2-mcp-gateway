@@ -3117,14 +3117,6 @@ fn dispatch_large_response_line(
         top_id.start..top_id.end,
         entry.error_buffer.bytes.iter().copied(),
     );
-    if outcome.raw.capacity().saturating_sub(outcome.raw.len()) > 1024 * 1024 {
-        outcome.raw.shrink_to_fit();
-        outcome
-            .lease
-            .as_mut()
-            .expect("line lease")
-            .shrink_to(outcome.raw.capacity());
-    }
     let _ = entry.resp_tx.send(RespDelivery::Ok {
         json_bytes: outcome.raw,
         lease: outcome.lease,
@@ -4677,15 +4669,10 @@ with open(sys.argv[1], "w", encoding="utf-8") as log:
         let id = json!("long-client-id-expanded-by-30b");
         assert_eq!(json_encoded_len(&id).unwrap(), 32);
         for final_len in [AVAILABLE, AVAILABLE + 1] {
-            let budget = ByteBudget::new(AVAILABLE + 4096);
+            let budget = ByteBudget::new(2 * AVAILABLE + 4096);
             let (notif_tx, _notif_rx) = mpsc::unbounded_channel();
             let (resp_tx, mut resp_rx) = oneshot::channel();
             let entry = InFlightEntry::new(2, &id, None, notif_tx, resp_tx, &budget).unwrap();
-            // The retained ID and error workspace share this pool. Leave exactly
-            // AVAILABLE for the response without assuming their implementation size.
-            let occupied = budget
-                .try_acquire(budget.limit() - budget.used() - AVAILABLE)
-                .unwrap();
             let in_flight = Mutex::new(vec![entry]);
             let line_len = final_len - 30; // Drop LF, then replace one digit with 32 bytes.
             let mut lease = budget.try_acquire(0).unwrap();
@@ -4696,6 +4683,11 @@ with open(sys.argv[1], "w", encoding="utf-8") as log:
             raw.extend_from_slice(prefix);
             raw.resize(line_len - suffix.len(), b'x');
             raw.extend_from_slice(suffix);
+            // The original response, retained ID, and error workspace remain charged.
+            // Leave exactly AVAILABLE more bytes for the replacement allocation.
+            let occupied = budget
+                .try_acquire(budget.limit() - budget.used() - AVAILABLE)
+                .unwrap();
             let outcome = ReadLineOutcome {
                 len: raw.len(),
                 raw,
@@ -4954,8 +4946,85 @@ with open(sys.argv[1], "w", encoding="utf-8") as log:
     }
 
     #[tokio::test]
+    async fn stdout_line_growth_requires_old_and_new_capacity() {
+        const FIRST: &[u8] = br#"{"jsonrpc":"2.0","id":1,"#;
+        const LAST: &[u8] = b"\"result\":{}}\n";
+        let peak = FIRST.len() * 2 + LAST.len();
+        for limit in [peak - 1, peak, peak + 1] {
+            let budget = ByteBudget::new(limit);
+            let limits = StdioLimits {
+                max_control_line_bytes: 128,
+                max_stdout_line_bytes: 256,
+                ..StdioLimits::default()
+            };
+            let in_flight = Mutex::new(Vec::new());
+            let (mut write, read) = tokio::io::duplex(128);
+            write.write_all(FIRST).await.unwrap();
+            let mut reader = BufReader::with_capacity(128, read);
+            let mut reading = Box::pin(read_stdout_line(&mut reader, &in_flight, &budget, limits));
+            assert!(
+                reading
+                    .as_mut()
+                    .poll(&mut Context::from_waker(Waker::noop()))
+                    .is_pending()
+            );
+            assert_eq!(budget.used(), FIRST.len());
+            write.write_all(LAST).await.unwrap();
+            drop(write);
+            let result = reading.await;
+            if limit < peak {
+                assert!(matches!(
+                    result,
+                    Err(ReadStdoutErr::Hard(HardRejectError::BudgetExhausted))
+                ));
+            } else {
+                let outcome = result.unwrap();
+                assert_eq!(outcome.raw, [FIRST, LAST].concat());
+                assert_eq!(budget.used(), outcome.raw.capacity());
+                drop(outcome);
+            }
+            assert_eq!(budget.used(), 0);
+        }
+    }
+
+    #[test]
+    fn large_response_keeps_spare_capacity_leased_without_shrinking() {
+        let capacity = MAX_CONTROL_LINE_BYTES + 512;
+        let budget = ByteBudget::new(capacity + 4096);
+        let session = request_test_session(&budget);
+        let (wire_id, mut guard, _notifications, mut response) =
+            session.register_request(&json!("client"), None).unwrap();
+        assert_eq!(wire_id, 1);
+        let line = b"{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{}}\n";
+        let mut outcome = ReadLineOutcome::empty(&budget);
+        outcome.reserve(capacity, capacity).unwrap();
+        outcome.raw.extend_from_slice(line);
+        let original = outcome.raw.as_ptr();
+        let mut scanner = TopLevelJsonScanner::new();
+        scanner.feed(line);
+        dispatch_large_response_line(outcome.finish(&scanner), &session.in_flight);
+        guard.mark_completed();
+        let RespDelivery::Ok { json_bytes, lease } = response.try_recv().unwrap() else {
+            panic!("the response must keep its original allocation");
+        };
+        assert_eq!(json_bytes.as_ptr(), original);
+        assert_eq!(json_bytes.capacity(), capacity);
+        assert_eq!(
+            serde_json::from_slice::<Value>(&json_bytes).unwrap()["id"],
+            "client"
+        );
+        assert_eq!(budget.used(), capacity);
+        let frame = leased_bytes(json_bytes, lease);
+        let retained = frame.clone();
+        drop(frame);
+        assert_eq!(budget.used(), capacity);
+        drop(retained);
+        assert_eq!(budget.used(), 0);
+    }
+
+    #[tokio::test]
     async fn stdio_large_line_keeps_allocated_capacity_leased() {
-        let budget = ByteBudget::new(140 * 1024);
+        let budget = ByteBudget::new(260 * 1024);
         let limits = StdioLimits {
             max_stdout_line_bytes: 512 * 1024,
             max_control_line_bytes: 1024,
@@ -4996,7 +5065,7 @@ with open(sys.argv[1], "w", encoding="utf-8") as log:
 
     #[tokio::test]
     async fn read_stdout_line_inplace_rewrite_and_raw_shrink_across_all_exits() {
-        let budget = ByteBudget::new(140 * 1024);
+        let budget = ByteBudget::new(192 * 1024);
         let limits = StdioLimits {
             max_stdout_line_bytes: 512 * 1024,
             max_control_line_bytes: 1024,
@@ -5021,7 +5090,7 @@ with open(sys.argv[1], "w", encoding="utf-8") as log:
             resp_rx
         };
 
-        // 1. Valid 120 KiB response under tight 140 KiB budget (would fail if 2x AST coexisted) splices `id` in place and resets `raw` to 0 capacity.
+        // 1. The 192 KiB pool covers 64 + 128 KiB growth, but not a second 120 KiB AST.
         let rx1 = push_waiter(1, json!("client-long-id-rewrite-0001"));
         let big_str = "A".repeat(120 * 1024);
         let valid_line =

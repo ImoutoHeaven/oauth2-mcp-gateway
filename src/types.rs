@@ -124,30 +124,46 @@ impl ByteLease {
         if needed > max_capacity {
             return false;
         }
-        let target = if needed <= buffer.capacity() {
-            buffer.capacity()
+        let old_capacity = buffer.capacity();
+        if needed <= old_capacity {
+            return self.try_reserve(old_capacity);
+        }
+        let preferred = old_capacity.saturating_mul(2).max(needed).min(max_capacity);
+        let available = self
+            .budget
+            .limit()
+            .saturating_sub(self.budget.used())
+            .saturating_add(self.held);
+        let target = if old_capacity
+            .checked_add(preferred)
+            .is_some_and(|peak| peak <= available)
+        {
+            preferred
         } else {
-            let preferred = buffer
-                .capacity()
-                .saturating_mul(2)
-                .max(needed)
-                .min(max_capacity);
-            let available = self
-                .budget
-                .limit()
-                .saturating_sub(self.budget.used())
-                .saturating_add(self.held);
-            if preferred <= available {
-                preferred
-            } else {
-                needed
-            }
+            needed
         };
-        if !self.try_reserve(target) {
+        let Some(peak) = old_capacity.checked_add(target) else {
+            return false;
+        };
+        let previous_held = self.held;
+        if !self.try_reserve(peak.max(previous_held)) {
             return false;
         }
-        buffer.reserve_exact(target.saturating_sub(buffer.len()));
-        debug_assert!(buffer.capacity() <= self.held);
+        // Keep both allocations charged until the copied-from buffer has been freed.
+        let mut replacement = Vec::new();
+        let allocated = replacement.try_reserve_exact(target).is_ok()
+            && replacement.capacity() <= max_capacity
+            && old_capacity
+                .checked_add(replacement.capacity())
+                .is_some_and(|actual_peak| self.try_reserve(actual_peak.max(previous_held)));
+        if !allocated {
+            drop(replacement);
+            self.shrink_to(previous_held);
+            return false;
+        }
+        replacement.extend_from_slice(buffer);
+        drop(std::mem::replace(buffer, replacement));
+        self.shrink_to(buffer.capacity());
         true
     }
 }
@@ -452,6 +468,75 @@ pub fn hex_nibble(b: u8) -> Option<u8> {
 mod tests {
     use super::*;
 
+    #[test]
+    fn reserve_vec_charges_replacement_peak_and_uses_required_capacity_when_tight() {
+        for limit in [16, 17, 18, 23, 24, 25] {
+            let budget = ByteBudget::new(limit);
+            let mut buffer = b"abcdefgh".to_vec();
+            let mut lease = budget.try_acquire(buffer.capacity()).unwrap();
+            let before = buffer.as_ptr();
+            let grown = lease.reserve_vec(&mut buffer, 9, 32);
+            assert_eq!(grown, limit >= 17, "8 old + 9 required at pool {limit}");
+            assert_eq!(buffer, b"abcdefgh");
+            if grown {
+                assert_eq!(buffer.capacity(), if limit < 24 { 9 } else { 16 });
+                assert_eq!(budget.used(), buffer.capacity());
+                let occupied = budget.try_acquire(limit - budget.used()).unwrap();
+                let current = buffer.as_ptr();
+                assert!(lease.reserve_vec(&mut buffer, 9, 32));
+                assert_eq!(buffer.as_ptr(), current);
+                drop(occupied);
+            } else {
+                assert_eq!(buffer.as_ptr(), before);
+                assert_eq!(buffer.capacity(), 8);
+                assert_eq!(lease.held(), 8);
+                assert_eq!(budget.used(), 8);
+            }
+            drop(buffer);
+            drop(lease);
+            assert_eq!(budget.used(), 0);
+        }
+    }
+
+    #[test]
+    fn reserve_vec_preserves_prepaid_leases_and_failed_allocations() {
+        let budget = ByteBudget::new(8);
+        let mut lease = budget.try_acquire(8).unwrap();
+        let mut buffer = Vec::new();
+        assert!(lease.reserve_vec(&mut buffer, 8, 8));
+        assert_eq!(buffer.capacity(), 8);
+        assert_eq!(budget.used(), 8, "first allocation uses the prepaid lease");
+        let pointer = buffer.as_ptr();
+        assert!(lease.reserve_vec(&mut buffer, 4, 8));
+        assert_eq!(buffer.as_ptr(), pointer);
+        assert!(!lease.reserve_vec(&mut buffer, 9, 8));
+        assert_eq!(lease.held(), 8);
+        drop(buffer);
+        drop(lease);
+        assert_eq!(budget.used(), 0);
+
+        // Vec rejects capacities above isize::MAX without allocating; the larger case also overflows C + T.
+        for needed in [(isize::MAX as usize) + 1, usize::MAX] {
+            let budget = ByteBudget::new(usize::MAX);
+            let mut buffer = b"abcdefgh".to_vec();
+            let mut lease = budget.try_acquire(11).unwrap();
+            let pointer = buffer.as_ptr();
+            assert!(!lease.reserve_vec(&mut buffer, needed, usize::MAX));
+            assert_eq!(buffer, b"abcdefgh");
+            assert_eq!(buffer.as_ptr(), pointer);
+            assert_eq!(buffer.capacity(), 8);
+            assert_eq!(
+                lease.held(),
+                11,
+                "failure restores the entire previous lease"
+            );
+            assert_eq!(budget.used(), 11);
+            drop(buffer);
+            drop(lease);
+            assert_eq!(budget.used(), 0);
+        }
+    }
+
     struct RequestChunks {
         chunks: std::collections::VecDeque<Bytes>,
         pending: bool,
@@ -480,6 +565,24 @@ mod tests {
                 .map(|bytes| Bytes::from_static(bytes))
                 .collect(),
             pending,
+        }
+    }
+
+    #[tokio::test]
+    async fn request_body_growth_requires_old_and_new_capacity() {
+        for limit in [9, 10, 11] {
+            let budget = ByteBudget::new(limit);
+            let result =
+                read_bounded_body(request_chunks(&[b"abcd", b"ef"], false), &budget, 6).await;
+            if limit < 10 {
+                assert!(matches!(result, Err(ReadBodyError::Overloaded)));
+            } else {
+                let bytes = result.unwrap();
+                assert_eq!(bytes, b"abcdef".as_slice());
+                assert_eq!(budget.used(), 6);
+                drop(bytes);
+            }
+            assert_eq!(budget.used(), 0);
         }
     }
 

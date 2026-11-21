@@ -5311,9 +5311,9 @@ async fn stdio_request_and_rewrite_buffers_share_the_process_budget() {
     let script = write_multimodal_stdio_mock_script(tmp.path());
 
     let response_len = 40_000usize;
-    // Ingress values, retained IDs, and the correlated error workspace share this pool.
-    // The unit test isolates the exact 40,000/40,001-byte rewrite allowance.
-    let budget = ByteBudget::new(response_len + 4096);
+    // The pool includes concurrent ingress/ID/error buffers and old + replacement responses.
+    // The unit test isolates the exact 40,000/40,001-byte replacement allowance.
+    let budget = ByteBudget::new(2 * response_len + 4096);
     let stdio_up = Arc::new(
         StdioUpstream::with_limits(
             StdioUpstreamSettings {

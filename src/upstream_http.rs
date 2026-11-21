@@ -1577,8 +1577,43 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn http_priming_growth_requires_old_and_new_capacity() {
+        for limit in [9, 10, 11] {
+            let budget = ByteBudget::new(limit);
+            let (tx, rx) = tokio::sync::mpsc::channel(2);
+            let mut filter =
+                SsePrimingFilterBody::new(futures_channel_body(rx), Arc::clone(&budget), 16);
+            let mut cx = Context::from_waker(std::task::Waker::noop());
+            tx.send(Ok(Frame::data(Bytes::from_static(b":abc"))))
+                .await
+                .unwrap();
+            assert!(Pin::new(&mut filter).poll_frame(&mut cx).is_pending());
+            assert_eq!(budget.used(), 4);
+            tx.send(Ok(Frame::data(Bytes::from_static(b"de"))))
+                .await
+                .unwrap();
+            let result = Pin::new(&mut filter).poll_frame(&mut cx);
+            if limit < 10 {
+                let Poll::Ready(Some(Err(error))) = result else {
+                    panic!("growth needs the 4 + 6 byte peak");
+                };
+                assert!(error.to_string().contains("byte budget"));
+                assert_eq!(budget.used(), 0);
+            } else {
+                assert!(result.is_pending());
+                assert_eq!(filter.buf, b":abcde");
+                assert_eq!(filter.buf.capacity(), 6);
+                assert_eq!(budget.used(), 6);
+            }
+            drop(filter);
+            drop(tx);
+            assert_eq!(budget.used(), 0);
+        }
+    }
+
+    #[tokio::test]
     async fn http_priming_keeps_allocated_capacity_leased() {
-        let budget = ByteBudget::new(300);
+        let budget = ByteBudget::new(390); // 130 old + 260 replacement bytes.
         let (tx, rx) = tokio::sync::mpsc::channel(4);
         let mut filter =
             SsePrimingFilterBody::new(futures_channel_body(rx), Arc::clone(&budget), 300);
@@ -1656,9 +1691,9 @@ mod tests {
         assert_eq!(collected, expected);
         assert_eq!(budget.used(), 0);
 
-        // Exact N-1 / N pass and N+1 non-blocking reject on process ByteBudget, releasing held bytes.
+        // Completing 63/64-byte blocks peaks at 125/127 bytes; growing 64 to 65 needs 129.
         let tight_limit = 64usize;
-        let tight_budget = ByteBudget::new(tight_limit);
+        let tight_budget = ByteBudget::new(2 * tight_limit);
         for len in [tight_limit - 1, tight_limit] {
             let mut priming = vec![b':'];
             priming.extend(std::iter::repeat_n(b'm', len - 3));
@@ -1684,7 +1719,7 @@ mod tests {
         assert!(Pin::new(&mut f_over).poll_frame(&mut cx).is_pending());
         assert_eq!(tight_budget.used(), tight_limit);
 
-        // Appending 1 more byte (N + 1) must fail non-blockingly and release all `tight_limit` held bytes.
+        // The 64 + 65 byte peak must fail and release the original 64-byte buffer.
         tx.send(Ok(Frame::data(Bytes::from_static(b"z"))))
             .await
             .unwrap();
