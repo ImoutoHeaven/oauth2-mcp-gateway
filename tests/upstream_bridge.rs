@@ -4761,7 +4761,9 @@ async fn stdio_complete_line_discard_notif_byte_budget_and_slow_receiver_backpre
             "MOCK_CANCEL_DIR".to_owned(),
             cancel_dir.to_str().unwrap().to_owned(),
         );
-        let budget = ByteBudget::new(8 * 1024 * 1024);
+        // One 6 MiB reply needs up to 4 + 7 MiB during buffer replacement.
+        // A retained reply plus another reply's growth peak cannot fit together.
+        let budget = ByteBudget::new(12 * 1024 * 1024);
         let stdio_up = Arc::new(
             StdioUpstream::with_limits(
                 StdioUpstreamSettings {
@@ -4842,15 +4844,15 @@ async fn stdio_complete_line_discard_notif_byte_budget_and_slow_receiver_backpre
                 .starts_with("HTTP/1.1 200")
         );
 
-        // Lease transferred from `raw` to `LeasedReplyBody` without double-counting (used <= 8 MiB),
-        // and stays held (~6 MiB) while Slow Receiver A stalls reading TCP!
+        // The body's retained capacity stays charged while receiver A pauses reading.
+        // Moving the raw allocation into the body does not duplicate its charge.
         assert!(
             budget.used() >= 5 * 1024 * 1024,
             "slow receiver must keep response lease active, got used={}",
             budget.used()
         );
 
-        // Caller B on Session 2 requesting 4 MiB (6 MiB + 4 MiB > 8 MiB) fails non-blockingly with 503!
+        // Caller B fits alone, but its growth peak cannot coexist with A's retained capacity.
         let over_resp = client
             .request(
                 Request::builder()
@@ -4865,7 +4867,7 @@ async fn stdio_complete_line_discard_notif_byte_budget_and_slow_receiver_backpre
                             "method": "tools/call",
                             "params": {
                                 "name": "exact_tail_id",
-                                "arguments": {"target_bytes": 4 * 1024 * 1024}
+                                "arguments": {"target_bytes": 6 * 1024 * 1024}
                             }
                         })
                         .to_string(),
