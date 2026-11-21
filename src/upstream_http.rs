@@ -1,15 +1,16 @@
 use crate::config::HttpUpstreamSettings;
 use crate::crypto::constant_time_eq_str;
 use crate::types::{
-    ByteBudget, ByteLease, HttpReply, ReplyBody, VerifiedToken, bytes_body, empty_body, hex_nibble,
-    method_not_allowed,
+    ByteBudget, ByteLease, HttpReply, ReadBodyError, ReplyBody, VerifiedToken, bytes_body,
+    empty_body, hex_nibble, leased_bytes, method_not_allowed, read_bounded_body,
+    request_overloaded_reply,
 };
-use bytes::{Bytes, BytesMut};
+use bytes::Bytes;
 use http::{
     HeaderMap, HeaderName, HeaderValue, Method, Request, Response, StatusCode, Uri, header,
 };
 use http_body::{Body, Frame, SizeHint};
-use http_body_util::{BodyExt, LengthLimitError, Limited};
+use http_body_util::BodyExt;
 use hyper::body::Incoming;
 use hyper_rustls::HttpsConnector;
 use hyper_util::client::legacy::{Client, ResponseFuture, connect::HttpConnector};
@@ -654,13 +655,14 @@ impl HttpUpstream {
             }
             res = tokio::time::timeout(
                 MCP_BODY_READ_TIMEOUT,
-                Limited::new(incoming, MAX_MCP_BODY_BYTES).collect(),
+                read_bounded_body(incoming, &self.budget, MAX_MCP_BODY_BYTES),
             ) => match res {
-                Ok(Ok(collected)) => collected.to_bytes(),
-                Ok(Err(err)) if err.is::<LengthLimitError>() => {
+                Ok(Ok(bytes)) => bytes,
+                Ok(Err(ReadBodyError::TooLarge)) => {
                     return close_empty_reply(StatusCode::PAYLOAD_TOO_LARGE);
                 }
-                Ok(Err(_)) => return close_empty_reply(StatusCode::BAD_REQUEST),
+                Ok(Err(ReadBodyError::Overloaded)) => return request_overloaded_reply(),
+                Ok(Err(ReadBodyError::Invalid)) => return close_empty_reply(StatusCode::BAD_REQUEST),
                 Err(_) => return close_empty_reply(StatusCode::REQUEST_TIMEOUT),
             },
         };
@@ -1270,8 +1272,9 @@ fn empty_status_reply(status: StatusCode) -> HttpReply {
 
 struct SsePrimingFilterBody<B> {
     inner: B,
-    buf: BytesMut,
+    buf: Vec<u8>,
     lease: Option<ByteLease>,
+    flushing: Bytes,
     budget: Arc<ByteBudget>,
     max_priming_bytes: usize,
     scan_pos: usize,
@@ -1285,8 +1288,9 @@ impl<B> SsePrimingFilterBody<B> {
     fn new(inner: B, budget: Arc<ByteBudget>, max_priming_bytes: usize) -> Self {
         Self {
             inner,
-            buf: BytesMut::new(),
+            buf: Vec::new(),
             lease: None,
+            flushing: Bytes::new(),
             budget,
             max_priming_bytes,
             scan_pos: 0,
@@ -1298,30 +1302,22 @@ impl<B> SsePrimingFilterBody<B> {
     }
 
     fn reserve_buf_lease(&mut self, target_len: usize) -> bool {
-        match self.lease.as_mut() {
-            Some(lease) => lease.try_reserve(target_len),
-            None => match ByteBudget::try_acquire(&self.budget, target_len) {
-                Some(lease) => {
-                    self.lease = Some(lease);
-                    true
-                }
-                None => false,
-            },
-        }
+        self.lease
+            .get_or_insert_with(|| self.budget.try_acquire(0).expect("empty byte lease"))
+            .reserve_vec(&mut self.buf, target_len, self.max_priming_bytes)
     }
 
     fn sync_buf_lease(&mut self) {
         if self.buf.is_empty() {
-            self.buf = BytesMut::new();
+            self.buf = Vec::new();
             self.lease = None;
-        } else if let Some(ref mut lease) = self.lease {
-            lease.shrink_to(self.buf.len());
         }
     }
 
     fn clear_buffers(&mut self) {
-        self.buf = BytesMut::new();
+        self.buf = Vec::new();
         self.lease = None;
+        self.flushing = Bytes::new();
         self.pending_frame = None;
     }
 }
@@ -1342,9 +1338,14 @@ where
         loop {
             if !this.filtering {
                 if !this.buf.is_empty() {
-                    let take = this.buf.len().min(PRIMING_FLUSH_CHUNK_BYTES);
-                    let out = this.buf.split_to(take).freeze();
-                    this.sync_buf_lease();
+                    this.flushing = leased_bytes(std::mem::take(&mut this.buf), this.lease.take());
+                }
+                if !this.flushing.is_empty() {
+                    let take = this.flushing.len().min(PRIMING_FLUSH_CHUNK_BYTES);
+                    let out = this.flushing.split_to(take);
+                    if this.flushing.is_empty() {
+                        this.flushing = Bytes::new();
+                    }
                     return Poll::Ready(Some(Ok(Frame::data(out))));
                 }
                 if let Some(frame) = this.pending_frame.take() {
@@ -1475,7 +1476,7 @@ fn next_priming_step_len(chunk: &[u8], room: usize) -> usize {
 }
 
 fn scan_priming_buffer(
-    buf: &mut BytesMut,
+    buf: &mut Vec<u8>,
     scan_pos: &mut usize,
     line_start: &mut usize,
     filtering: &mut bool,
@@ -1509,7 +1510,7 @@ fn scan_priming_buffer(
 
         let line = &buf[*line_start..line_end];
         if line.is_empty() {
-            let _ = buf.split_to(after_eol);
+            buf.drain(..after_eol);
             *scan_pos = 0;
             *line_start = 0;
             continue;
@@ -1538,7 +1539,7 @@ mod tests {
 
     #[tokio::test]
     async fn sse_priming_filter_handles_bare_cr_bare_data_and_large_comments_linearly() {
-        let mut buf = BytesMut::new();
+        let mut buf = Vec::new();
         let mut scan_pos = 0usize;
         let mut line_start = 0usize;
         let mut filtering = true;
@@ -1573,6 +1574,41 @@ mod tests {
         );
         assert!(!filtering);
         assert_eq!(&buf[..], b"id: ev-cr\rdata\r\r");
+    }
+
+    #[tokio::test]
+    async fn http_priming_keeps_allocated_capacity_leased() {
+        let budget = ByteBudget::new(300);
+        let (tx, rx) = tokio::sync::mpsc::channel(4);
+        let mut filter =
+            SsePrimingFilterBody::new(futures_channel_body(rx), Arc::clone(&budget), 300);
+        let waker = std::task::Waker::noop();
+        let mut cx = Context::from_waker(waker);
+        tx.send(Ok(Frame::data(Bytes::from(format!(
+            ":{}",
+            "a".repeat(129)
+        )))))
+        .await
+        .unwrap();
+        assert!(Pin::new(&mut filter).poll_frame(&mut cx).is_pending());
+        tx.send(Ok(Frame::data(Bytes::from(vec![b'b'; 100]))))
+            .await
+            .unwrap();
+        assert!(Pin::new(&mut filter).poll_frame(&mut cx).is_pending());
+        assert_eq!(budget.used(), filter.buf.capacity());
+        tx.send(Ok(Frame::data(Bytes::from_static(b"\ndata: 1\n\n"))))
+            .await
+            .unwrap();
+        drop(tx);
+        let mut frames = Vec::new();
+        while let Some(frame) = BodyExt::frame(&mut filter).await {
+            frames.push(frame.unwrap());
+        }
+        assert!(budget.used() > 0);
+        drop(filter);
+        assert!(budget.used() > 0);
+        drop(frames);
+        assert_eq!(budget.used(), 0);
     }
 
     #[tokio::test]

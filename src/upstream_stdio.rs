@@ -1,8 +1,9 @@
 use crate::config::StdioUpstreamSettings;
 use crate::crypto::{constant_time_eq_str, random_token_b64};
 use crate::types::{
-    ByteBudget, ByteLease, HttpReply, LeasedFrameCursor, VerifiedToken, bytes_body, empty_body,
-    hex_nibble, leased_body, method_not_allowed,
+    ByteBudget, ByteLease, HttpReply, JsonEncodeError, LeasedFrameCursor, ReadBodyError,
+    VerifiedToken, bytes_body, empty_body, encode_json_leased, hex_nibble, json_encoded_len,
+    leased_body, leased_bytes, method_not_allowed, read_bounded_body, request_overloaded_reply,
 };
 use crate::upstream_http::{
     ContentLengthCheck, MAX_MCP_BODY_BYTES, check_content_length_limit, close_empty_reply,
@@ -10,7 +11,7 @@ use crate::upstream_http::{
 use bytes::Bytes;
 use http::{HeaderMap, HeaderName, Method, Request, Response, StatusCode, header};
 use http_body::{Body, Frame, SizeHint};
-use http_body_util::{BodyExt, LengthLimitError, Limited};
+use http_body_util::BodyExt;
 use hyper::body::Incoming;
 use serde_json::{Value, json};
 use std::collections::HashMap;
@@ -22,7 +23,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, Weak};
 use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncBufReadExt, AsyncWrite, AsyncWriteExt, BufReader};
 use tokio::process::{Child, Command};
 use tokio::sync::mpsc::error::TrySendError;
 use tokio::sync::{mpsc, oneshot};
@@ -31,6 +32,7 @@ use tokio_util::sync::CancellationToken;
 
 const BODY_READ_TIMEOUT: Duration = Duration::from_secs(30);
 const INIT_TIMEOUT: Duration = Duration::from_secs(30);
+const STDIN_WRITE_TIMEOUT: Duration = Duration::from_secs(30);
 const STDIN_GRACE_WAIT: Duration = Duration::from_millis(200);
 #[cfg(unix)]
 const SIGTERM_WAIT: Duration = Duration::from_secs(2);
@@ -40,7 +42,6 @@ pub const MAX_STDOUT_LINE_BYTES: usize = 512 * 1024 * 1024;
 pub const MAX_CONTROL_LINE_BYTES: usize = 1024 * 1024;
 pub const MAX_NOTIF_QUEUE_BYTES: usize = 4 * 1024 * 1024;
 pub const DEFAULT_PRESSURE_IDLE: Duration = Duration::from_secs(600);
-const RAW_RETAIN_CAP_BYTES: usize = 64 * 1024;
 const MAX_GRANT_EPOCHS: usize = 4096;
 
 #[derive(Clone, Copy, Debug)]
@@ -112,6 +113,10 @@ struct StdioInner {
     table: Mutex<SessionTable>,
     slot_notify: tokio::sync::Notify,
     bg_terminations: Mutex<Vec<(String, JoinHandle<()>)>>,
+    #[cfg(all(windows, test))]
+    spawn_hook: Mutex<Option<WindowsSpawnHook>>,
+    #[cfg(all(windows, test))]
+    failed_spawn_reap_gate: Mutex<Option<(oneshot::Sender<()>, oneshot::Receiver<()>)>>,
 }
 
 struct SessionTable {
@@ -120,6 +125,7 @@ struct SessionTable {
     grant_epochs: HashMap<String, (u64, u64)>,
     epoch_seq: u64,
     reserved_slots: usize,
+    pending_spawns: usize,
     terminating_slots: usize,
     shutting_down: bool,
 }
@@ -160,6 +166,31 @@ impl SessionTable {
 struct QueuedNotif {
     line: String,
     _lease: ByteLease,
+    _process_lease: Option<ByteLease>,
+}
+
+impl QueuedNotif {
+    fn into_sse(self, budget: &Arc<ByteBudget>) -> Result<Bytes, SendLineErr> {
+        let mut lease = match self._process_lease {
+            Some(lease) => lease,
+            None => budget
+                .try_acquire(self.line.capacity())
+                .ok_or(SendLineErr::Overloaded)?,
+        };
+        let mut bytes = self.line.into_bytes();
+        let len = bytes.len();
+        let needed = len.checked_add(8).ok_or(SendLineErr::Overloaded)?;
+        let capacity = bytes.capacity().max(needed);
+        if !lease.reserve_vec(&mut bytes, needed, capacity) {
+            return Err(SendLineErr::Overloaded);
+        }
+        bytes.resize(needed, 0);
+        bytes.copy_within(..len, 6);
+        bytes[..6].copy_from_slice(b"data: ");
+        bytes[6 + len..].copy_from_slice(b"\n\n");
+        // The queue lease ends here; the same allocation's process lease follows the frame.
+        Ok(leased_bytes(bytes, Some(lease)))
+    }
 }
 
 enum RespDelivery {
@@ -171,13 +202,142 @@ enum RespDelivery {
         status: StatusCode,
         message: String,
         json_bytes: Vec<u8>,
+        lease: Option<ByteLease>,
     },
 }
 
-#[derive(Clone, Copy)]
+/// Payload strings and object keys, excluding Value/container metadata.
+fn json_text_capacity(value: &Value) -> usize {
+    match value {
+        Value::String(text) => text.capacity(),
+        Value::Array(values) => values.iter().fold(0usize, |sum, value| {
+            sum.saturating_add(json_text_capacity(value))
+        }),
+        Value::Object(values) => values.iter().fold(0usize, |sum, (key, value)| {
+            sum.saturating_add(key.capacity())
+                .saturating_add(json_text_capacity(value))
+        }),
+        _ => 0,
+    }
+}
+
+struct LeasedJson {
+    value: Value,
+    _lease: ByteLease,
+}
+
+impl LeasedJson {
+    fn parse(bytes: &[u8], budget: &Arc<ByteBudget>) -> Result<Self, JsonEncodeError> {
+        // Value text fits in R; escaped-string scratch has at most a 2R growth allowance.
+        // The caller separately owns and charges the raw body throughout parsing.
+        let mut lease = budget
+            .try_acquire(bytes.len().saturating_mul(3))
+            .ok_or(JsonEncodeError::Overloaded)?;
+        let value = serde_json::from_slice(bytes).map_err(|_| JsonEncodeError::Invalid)?;
+        let text_bytes = json_text_capacity(&value);
+        debug_assert!(text_bytes <= lease.held());
+        lease.shrink_to(text_bytes);
+        Ok(Self {
+            value,
+            _lease: lease,
+        })
+    }
+
+    fn copy(value: &Value, budget: &Arc<ByteBudget>, extra: usize) -> Result<Self, SendLineErr> {
+        let lease = budget
+            .try_acquire(json_text_capacity(value).saturating_add(extra))
+            .ok_or(SendLineErr::Overloaded)?;
+        Ok(Self {
+            value: value.clone(),
+            _lease: lease,
+        })
+    }
+
+    fn finish_rewrite(&mut self) {
+        let text_bytes = json_text_capacity(&self.value);
+        debug_assert!(text_bytes <= self._lease.held());
+        self._lease.shrink_to(text_bytes);
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
 enum SendLineErr {
     Closed,
     Full,
+    Overloaded,
+}
+
+#[derive(serde::Serialize)]
+struct RpcErrorPayload<'a> {
+    jsonrpc: &'static str,
+    id: &'a Value,
+    error: RpcErrorData<'a>,
+}
+
+#[derive(serde::Serialize)]
+struct RpcErrorData<'a> {
+    code: i64,
+    message: &'a str,
+}
+
+fn rpc_error_payload<'a>(id: &'a Value, code: i64, message: &'a str) -> RpcErrorPayload<'a> {
+    RpcErrorPayload {
+        jsonrpc: "2.0",
+        id,
+        error: RpcErrorData { code, message },
+    }
+}
+
+// All HardRejectError messages, including a usize limit, fit with JSON keys in 256 bytes.
+const ERROR_REPLY_OVERHEAD: usize = 256;
+struct ErrorBuffer {
+    bytes: Vec<u8>,
+    lease: ByteLease,
+}
+
+impl ErrorBuffer {
+    fn new(id: &Value, budget: &Arc<ByteBudget>) -> Result<Self, SendLineErr> {
+        let len = json_encoded_len(id)
+            .map_err(|_| SendLineErr::Closed)?
+            .checked_add(ERROR_REPLY_OVERHEAD)
+            .ok_or(SendLineErr::Overloaded)?;
+        let mut owned = Self {
+            bytes: Vec::new(),
+            lease: budget.try_acquire(len).ok_or(SendLineErr::Overloaded)?,
+        };
+        if !owned.lease.reserve_vec(&mut owned.bytes, len, len) {
+            return Err(SendLineErr::Overloaded);
+        }
+        Ok(owned)
+    }
+
+    fn finish(mut self, id: &Value, message: &str) -> (Vec<u8>, ByteLease) {
+        self.bytes.clear();
+        let payload = rpc_error_payload(id, -32000, message);
+        // Fixed-capacity writing cannot grow on a future error-message change.
+        struct Writer<'a>(&'a mut Vec<u8>);
+        impl io::Write for Writer<'_> {
+            fn write(&mut self, data: &[u8]) -> io::Result<usize> {
+                if data.len() > self.0.capacity().saturating_sub(self.0.len()) {
+                    return Err(io::Error::other("error reply exceeds reserved buffer"));
+                }
+                self.0.extend_from_slice(data);
+                Ok(data.len())
+            }
+            fn flush(&mut self) -> io::Result<()> {
+                Ok(())
+            }
+        }
+        if serde_json::to_writer(Writer(&mut self.bytes), &payload).is_err() {
+            self.bytes.clear();
+            serde_json::to_writer(
+                Writer(&mut self.bytes),
+                &rpc_error_payload(id, -32000, "process active byte budget exceeded"),
+            )
+            .expect("fixed overload reply fits reserved buffer");
+        }
+        (self.bytes, self.lease)
+    }
 }
 
 struct InFlightEntry {
@@ -186,7 +346,54 @@ struct InFlightEntry {
     client_progress_token: Option<Value>,
     notif_tx: mpsc::UnboundedSender<QueuedNotif>,
     resp_tx: oneshot::Sender<RespDelivery>,
+    error_buffer: ErrorBuffer,
+    _lease: ByteLease,
 }
+
+impl InFlightEntry {
+    fn new(
+        wire_id: u64,
+        client_id: &Value,
+        client_progress_token: Option<&Value>,
+        notif_tx: mpsc::UnboundedSender<QueuedNotif>,
+        resp_tx: oneshot::Sender<RespDelivery>,
+        budget: &Arc<ByteBudget>,
+    ) -> Result<Self, SendLineErr> {
+        let bytes = json_text_capacity(client_id)
+            .saturating_add(client_progress_token.map_or(0, json_text_capacity));
+        let lease = budget.try_acquire(bytes).ok_or(SendLineErr::Overloaded)?;
+        let error_buffer = ErrorBuffer::new(client_id, budget)?;
+        let mut owned = Self {
+            wire_id,
+            client_id: client_id.clone(),
+            client_progress_token: client_progress_token.cloned(),
+            notif_tx,
+            resp_tx,
+            error_buffer,
+            _lease: lease,
+        };
+        owned._lease.shrink_to(
+            json_text_capacity(&owned.client_id).saturating_add(
+                owned
+                    .client_progress_token
+                    .as_ref()
+                    .map_or(0, json_text_capacity),
+            ),
+        );
+        Ok(owned)
+    }
+}
+
+#[cfg(all(windows, test))]
+#[derive(Clone, Copy, PartialEq)]
+enum WindowsSpawnStage {
+    BeforeAssign,
+    BeforeResume,
+}
+
+#[cfg(all(windows, test))]
+type WindowsSpawnHook =
+    Box<dyn Fn(WindowsSpawnStage, &WindowsJobObject, &Child) -> Result<(), String> + Send + Sync>;
 
 #[cfg(windows)]
 struct WindowsJobObject(windows_sys::Win32::Foundation::HANDLE);
@@ -255,6 +462,74 @@ impl WindowsJobObject {
 }
 
 #[cfg(windows)]
+fn with_owned_child_threads(
+    pid: u32,
+    mut visit: impl FnMut(windows_sys::Win32::Foundation::HANDLE) -> io::Result<()>,
+) -> io::Result<()> {
+    use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
+    use windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE;
+    use windows_sys::Win32::System::Diagnostics::ToolHelp::{
+        CreateToolhelp32Snapshot, TH32CS_SNAPTHREAD, THREADENTRY32, Thread32First, Thread32Next,
+    };
+    use windows_sys::Win32::System::Threading::{
+        GetProcessIdOfThread, OpenThread, THREAD_QUERY_LIMITED_INFORMATION, THREAD_SUSPEND_RESUME,
+    };
+
+    // The suspended primary thread has not run user code. Snapshot handles stay owned here.
+    let raw = unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0) };
+    if raw == INVALID_HANDLE_VALUE {
+        return Err(io::Error::last_os_error());
+    }
+    let snapshot = unsafe { OwnedHandle::from_raw_handle(raw) };
+    let mut entry = THREADENTRY32 {
+        dwSize: std::mem::size_of::<THREADENTRY32>() as u32,
+        ..Default::default()
+    };
+    let mut found = false;
+    let mut more = unsafe { Thread32First(snapshot.as_raw_handle(), &mut entry) } != 0;
+    while more {
+        if entry.th32OwnerProcessID == pid {
+            let raw = unsafe {
+                OpenThread(
+                    THREAD_SUSPEND_RESUME | THREAD_QUERY_LIMITED_INFORMATION,
+                    0,
+                    entry.th32ThreadID,
+                )
+            };
+            if raw.is_null() {
+                return Err(io::Error::last_os_error());
+            }
+            let thread = unsafe { OwnedHandle::from_raw_handle(raw) };
+            // A thread ID from a snapshot may have been reused; check its live owner.
+            if unsafe { GetProcessIdOfThread(thread.as_raw_handle()) } != pid {
+                return Err(io::Error::other("upstream child thread ownership changed"));
+            }
+            visit(thread.as_raw_handle())?;
+            found = true;
+        }
+        more = unsafe { Thread32Next(snapshot.as_raw_handle(), &mut entry) } != 0;
+    }
+    if !found {
+        return Err(io::Error::other(
+            "cannot find the suspended upstream child thread",
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(windows)]
+fn resume_windows_child(child: &Child) -> Result<(), String> {
+    let pid = child.id().ok_or("child process ID unavailable")?;
+    with_owned_child_threads(pid, |thread| {
+        if unsafe { windows_sys::Win32::System::Threading::ResumeThread(thread) } == u32::MAX {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(())
+    })
+    .map_err(|e| format!("failed to resume upstream process: {e}"))
+}
+
+#[cfg(windows)]
 impl Drop for WindowsJobObject {
     fn drop(&mut self) {
         if !self.0.is_null() {
@@ -266,12 +541,19 @@ impl Drop for WindowsJobObject {
     }
 }
 
+#[derive(Debug)]
+struct StdinLine {
+    bytes: Bytes,
+    flushed: Option<oneshot::Sender<()>>,
+}
+
 struct StdioSession {
     uid: u64,
     grant_id: String,
     weak_inner: Weak<StdioInner>,
+    budget: Arc<ByteBudget>,
     writer_cancel: CancellationToken,
-    stdin_tx: Arc<Mutex<Option<mpsc::Sender<Vec<u8>>>>>,
+    stdin_tx: Arc<Mutex<Option<mpsc::Sender<StdinLine>>>>,
     in_flight: Arc<Mutex<Vec<InFlightEntry>>>,
     terminal_error: Arc<Mutex<Option<(StatusCode, String)>>>,
     next_wire_id: AtomicU64,
@@ -306,11 +588,16 @@ impl StdioUpstream {
                 grant_epochs: HashMap::new(),
                 epoch_seq: 0,
                 reserved_slots: 0,
+                pending_spawns: 0,
                 terminating_slots: 0,
                 shutting_down: false,
             }),
             slot_notify: tokio::sync::Notify::new(),
             bg_terminations: Mutex::new(Vec::new()),
+            #[cfg(all(windows, test))]
+            spawn_hook: Mutex::new(None),
+            #[cfg(all(windows, test))]
+            failed_spawn_reap_gate: Mutex::new(None),
         });
         let reaper_cancel = CancellationToken::new();
 
@@ -385,19 +672,34 @@ impl StdioUpstream {
 
     pub async fn shutdown(&self) {
         self.reaper_cancel.cancel();
+        self.inner
+            .table
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .shutting_down = true;
         self.inner.slot_notify.notify_waiters();
         loop {
-            let (live, removed_count): (Vec<Arc<StdioSession>>, usize) = {
+            // Register before inspecting counters so a concurrent spawn/reap cannot lose the wakeup.
+            let released = self.inner.slot_notify.notified();
+            tokio::pin!(released);
+            released.as_mut().enable();
+            let (live, removed_count, pending): (Vec<Arc<StdioSession>>, usize, usize) = {
                 let mut tbl = self.inner.table.lock().unwrap_or_else(|p| p.into_inner());
-                tbl.shutting_down = true;
                 let count = tbl.sessions.len();
                 tbl.sessions.clear();
                 tbl.terminating_slots += count;
-                (tbl.live_sessions.clone(), count)
+                (
+                    tbl.live_sessions.clone(),
+                    count,
+                    tbl.pending_spawns + tbl.terminating_slots,
+                )
             };
-            self.inner.slot_notify.notify_waiters();
             let bg_handles = drain_bg_terminations(&self.inner, None);
             if live.is_empty() && bg_handles.is_empty() && removed_count == 0 {
+                if pending != 0 {
+                    released.await;
+                    continue;
+                }
                 break;
             }
             let term_guard = TerminatingSlotsGuard::new(Arc::clone(&self.inner), removed_count);
@@ -456,8 +758,9 @@ impl StdioUpstream {
         let (parts, incoming) = req.into_parts();
         if has_multiple_headers(&parts.headers, "mcp-session-id") {
             return jsonrpc_error_reply(
+                &self.inner.budget,
                 StatusCode::BAD_REQUEST,
-                Value::Null,
+                &Value::Null,
                 -32600,
                 "duplicate Mcp-Session-Id header",
             );
@@ -467,8 +770,9 @@ impl StdioUpstream {
                 Some(sid) => Some(sid.to_owned()),
                 None => {
                     return jsonrpc_error_reply(
+                        &self.inner.budget,
                         StatusCode::BAD_REQUEST,
-                        Value::Null,
+                        &Value::Null,
                         -32600,
                         "invalid Mcp-Session-Id header",
                     );
@@ -480,33 +784,40 @@ impl StdioUpstream {
 
         let body_bytes = match tokio::time::timeout(
             BODY_READ_TIMEOUT,
-            Limited::new(incoming, MAX_MCP_BODY_BYTES).collect(),
+            read_bounded_body(incoming, &self.inner.budget, MAX_MCP_BODY_BYTES),
         )
         .await
         {
-            Ok(Ok(collected)) => collected.to_bytes(),
-            Ok(Err(err)) if err.is::<LengthLimitError>() => {
+            Ok(Ok(bytes)) => bytes,
+            Ok(Err(ReadBodyError::TooLarge)) => {
                 return close_empty_reply(StatusCode::PAYLOAD_TOO_LARGE);
             }
-            Ok(Err(_)) => return close_empty_reply(StatusCode::BAD_REQUEST),
+            Ok(Err(ReadBodyError::Overloaded)) => return request_overloaded_reply(),
+            Ok(Err(ReadBodyError::Invalid)) => return close_empty_reply(StatusCode::BAD_REQUEST),
             Err(_) => return close_empty_reply(StatusCode::REQUEST_TIMEOUT),
         };
 
-        let payload: Value = match serde_json::from_slice(&body_bytes) {
-            Ok(val) => val,
-            Err(_) => {
+        let parsed = LeasedJson::parse(&body_bytes, &self.inner.budget);
+        drop(body_bytes);
+        let payload_owner = match parsed {
+            Ok(payload) => payload,
+            Err(JsonEncodeError::Overloaded) => return request_overloaded_reply(),
+            Err(JsonEncodeError::Invalid) => {
                 return jsonrpc_error_reply(
+                    &self.inner.budget,
                     StatusCode::BAD_REQUEST,
-                    Value::Null,
+                    &Value::Null,
                     -32700,
                     "invalid JSON payload",
                 );
             }
         };
+        let payload = &payload_owner.value;
         let Some(obj) = payload.as_object() else {
             return jsonrpc_error_reply(
+                &self.inner.budget,
                 StatusCode::BAD_REQUEST,
-                Value::Null,
+                &Value::Null,
                 -32600,
                 "JSON-RPC message must be an object",
             );
@@ -515,11 +826,11 @@ impl StdioUpstream {
         let fallback_err_id = obj
             .get("id")
             .filter(|v| v.is_string() || v.is_number())
-            .cloned()
-            .unwrap_or(Value::Null);
+            .unwrap_or(&Value::Null);
 
         if obj.get("jsonrpc").and_then(Value::as_str) != Some("2.0") {
             return jsonrpc_error_reply(
+                &self.inner.budget,
                 StatusCode::BAD_REQUEST,
                 fallback_err_id,
                 -32600,
@@ -530,6 +841,7 @@ impl StdioUpstream {
         let (method, req_id) = if let Some(raw_method) = obj.get("method") {
             let Some(m) = raw_method.as_str().filter(|m| !m.is_empty()) else {
                 return jsonrpc_error_reply(
+                    &self.inner.budget,
                     StatusCode::BAD_REQUEST,
                     fallback_err_id,
                     -32600,
@@ -538,11 +850,12 @@ impl StdioUpstream {
             };
             let req_id = match obj.get("id") {
                 None => None,
-                Some(id) if id.is_string() || id.is_number() => Some(id.clone()),
+                Some(id) if id.is_string() || id.is_number() => Some(id),
                 Some(_) => {
                     return jsonrpc_error_reply(
+                        &self.inner.budget,
                         StatusCode::BAD_REQUEST,
-                        Value::Null,
+                        &Value::Null,
                         -32600,
                         "invalid JSON-RPC id",
                     );
@@ -552,6 +865,7 @@ impl StdioUpstream {
         } else {
             if !obj.contains_key("result") && !obj.contains_key("error") {
                 return jsonrpc_error_reply(
+                    &self.inner.budget,
                     StatusCode::BAD_REQUEST,
                     fallback_err_id,
                     -32600,
@@ -562,8 +876,9 @@ impl StdioUpstream {
                 && !(id.is_string() || id.is_number() || id.is_null())
             {
                 return jsonrpc_error_reply(
+                    &self.inner.budget,
                     StatusCode::BAD_REQUEST,
-                    Value::Null,
+                    &Value::Null,
                     -32600,
                     "invalid JSON-RPC id",
                 );
@@ -573,25 +888,26 @@ impl StdioUpstream {
 
         if let Some(sid) = session_id_hdr {
             return self
-                .handle_in_session(&sid, &parts.headers, token, &payload, method, req_id)
+                .handle_in_session(&sid, &parts.headers, token, payload, method, req_id)
                 .await;
         }
 
         if method == Some("initialize") {
             return self
-                .handle_initialize(&parts.headers, token, &payload, req_id)
+                .handle_initialize(&parts.headers, token, payload, req_id)
                 .await;
         }
 
         if let Some(proto_ver) = detect_sessionless_version(&parts.headers, obj) {
             return self
-                .handle_sessionless(&parts.headers, token, &proto_ver, &payload, method, req_id)
+                .handle_sessionless(&parts.headers, token, &proto_ver, payload, method, req_id)
                 .await;
         }
 
         jsonrpc_error_reply(
+            &self.inner.budget,
             StatusCode::BAD_REQUEST,
-            req_id.unwrap_or(Value::Null),
+            req_id.unwrap_or(&Value::Null),
             -32600,
             "missing Mcp-Session-Id header",
         )
@@ -602,12 +918,13 @@ impl StdioUpstream {
         headers: &HeaderMap,
         token: &VerifiedToken,
         payload: &Value,
-        req_id: Option<Value>,
+        req_id: Option<&Value>,
     ) -> HttpReply {
         let Some(id) = req_id else {
             return jsonrpc_error_reply(
+                &self.inner.budget,
                 StatusCode::BAD_REQUEST,
-                Value::Null,
+                &Value::Null,
                 -32600,
                 "initialize request requires an id",
             );
@@ -620,6 +937,7 @@ impl StdioUpstream {
 
         let Some(reservation) = acquire_slot(&self.inner, &token.grant_id).await else {
             return jsonrpc_error_reply(
+                &self.inner.budget,
                 StatusCode::SERVICE_UNAVAILABLE,
                 id,
                 -32000,
@@ -637,25 +955,35 @@ impl StdioUpstream {
         {
             Ok(pair) => pair,
             Err(err) => {
-                return jsonrpc_error_reply(StatusCode::BAD_GATEWAY, id, -32000, &err);
+                return jsonrpc_error_reply(
+                    &self.inner.budget,
+                    StatusCode::BAD_GATEWAY,
+                    id,
+                    -32000,
+                    &err,
+                );
             }
         };
 
-        let Some((wire_id, mut guard, notif_rx, resp_rx)) =
-            session.register_request(id.clone(), extract_progress_token(payload))
-        else {
-            let (status, msg) = session
-                .map_register_failure("upstream child exited before responding to initialize");
-            ephemeral.terminate_now().await;
-            return jsonrpc_error_reply(status, id, -32000, &msg);
-        };
+        let (wire_id, mut guard, notif_rx, resp_rx) =
+            match session.register_request(id, extract_progress_token(payload)) {
+                Ok(registered) => registered,
+                Err(err) => {
+                    let (status, msg) = session.map_register_failure(
+                        err,
+                        "upstream child exited before responding to initialize",
+                    );
+                    ephemeral.terminate_now().await;
+                    return jsonrpc_error_reply(&self.inner.budget, status, id, -32000, &msg);
+                }
+            };
         drop(notif_rx);
         if let Err(err) = session.send_request_line(payload, wire_id) {
             guard.disarm();
             let (status, msg) =
                 session.map_send_failure(err, "upstream child closed stdin during initialize");
             ephemeral.terminate_now().await;
-            return jsonrpc_error_reply(status, id, -32000, &msg);
+            return jsonrpc_error_reply(&self.inner.budget, status, id, -32000, &msg);
         }
 
         let (init_bytes, init_lease) = match tokio::time::timeout(INIT_TIMEOUT, resp_rx).await {
@@ -664,11 +992,15 @@ impl StdioUpstream {
                 (json_bytes, lease)
             }
             Ok(Ok(RespDelivery::HardError {
-                status, message, ..
+                status,
+                message: _message,
+                json_bytes,
+                lease,
             })) => {
                 guard.disarm();
+                let reply = jsonrpc_error_bytes_reply(status, json_bytes, lease);
                 ephemeral.terminate_now().await;
-                return jsonrpc_error_reply(status, id, -32000, &message);
+                return reply;
             }
             Ok(Err(_)) => {
                 guard.disarm();
@@ -676,12 +1008,13 @@ impl StdioUpstream {
                     "upstream child exited before responding to initialize",
                 );
                 ephemeral.terminate_now().await;
-                return jsonrpc_error_reply(status, id, -32000, &msg);
+                return jsonrpc_error_reply(&self.inner.budget, status, id, -32000, &msg);
             }
             Err(_) => {
                 guard.disarm();
                 ephemeral.terminate_now().await;
                 return jsonrpc_error_reply(
+                    &self.inner.budget,
                     StatusCode::GATEWAY_TIMEOUT,
                     id,
                     -32000,
@@ -693,14 +1026,16 @@ impl StdioUpstream {
         match classify_init_response(&init_bytes) {
             InitOutcome::Ok => {}
             InitOutcome::RpcError => {
+                let reply = single_rpc_reply(headers, None, init_bytes, init_lease);
                 ephemeral.terminate_now().await;
-                return single_rpc_reply(headers, None, init_bytes, init_lease);
+                return reply;
             }
             InitOutcome::Malformed => {
                 drop(init_bytes);
                 drop(init_lease);
                 ephemeral.terminate_now().await;
                 return jsonrpc_error_reply(
+                    &self.inner.budget,
                     StatusCode::BAD_GATEWAY,
                     id,
                     -32000,
@@ -715,7 +1050,13 @@ impl StdioUpstream {
                 drop(init_bytes);
                 drop(init_lease);
                 ephemeral.terminate_now().await;
-                return jsonrpc_error_reply(StatusCode::INTERNAL_SERVER_ERROR, id, -32603, &err);
+                return jsonrpc_error_reply(
+                    &self.inner.budget,
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    id,
+                    -32603,
+                    &err,
+                );
             }
         };
 
@@ -739,6 +1080,7 @@ impl StdioUpstream {
             drop(init_lease);
             ephemeral.terminate_now().await;
             return jsonrpc_error_reply(
+                &self.inner.budget,
                 StatusCode::SERVICE_UNAVAILABLE,
                 id,
                 -32000,
@@ -756,7 +1098,7 @@ impl StdioUpstream {
         token: &VerifiedToken,
         payload: &Value,
         method: Option<&str>,
-        req_id: Option<Value>,
+        req_id: Option<&Value>,
     ) -> HttpReply {
         enum InSessionLookup {
             NotFound,
@@ -780,10 +1122,11 @@ impl StdioUpstream {
             }
         };
 
-        let err_id = req_id.clone().unwrap_or(Value::Null);
+        let err_id = req_id.unwrap_or(&Value::Null);
         let (session, claim) = match lookup {
             InSessionLookup::NotFound => {
                 return jsonrpc_error_reply(
+                    &self.inner.budget,
                     StatusCode::NOT_FOUND,
                     err_id,
                     -32001,
@@ -792,6 +1135,7 @@ impl StdioUpstream {
             }
             InSessionLookup::AlreadyInitialized => {
                 return jsonrpc_error_reply(
+                    &self.inner.budget,
                     StatusCode::BAD_REQUEST,
                     err_id,
                     -32600,
@@ -803,13 +1147,15 @@ impl StdioUpstream {
 
         let is_request = method.is_some() && req_id.is_some();
         if !is_request {
-            let rewritten = if method == Some("notifications/cancelled") {
-                session.rewrite_cancel_notification(payload)
+            let send_res = if method == Some("notifications/cancelled") {
+                session
+                    .rewrite_cancel_notification(payload)
+                    .and_then(|rewritten| {
+                        rewritten.map_or(Ok(()), |value| session.send_json_line(&value.value))
+                    })
             } else {
-                None
+                session.send_json_line(payload)
             };
-            let outbound = rewritten.as_ref().unwrap_or(payload);
-            let send_res = session.send_json_line(outbound);
             if send_res.is_ok() {
                 session.touch_client();
             }
@@ -819,7 +1165,7 @@ impl StdioUpstream {
                 if matches!(err, SendLineErr::Closed) || !session.alive.load(Ordering::Acquire) {
                     remove_and_terminate(&self.inner, session_id, &session).await;
                 }
-                return jsonrpc_error_reply(status, Value::Null, -32000, &msg);
+                return jsonrpc_error_reply(&self.inner.budget, status, &Value::Null, -32000, &msg);
             }
             return Response::builder()
                 .status(StatusCode::ACCEPTED)
@@ -831,22 +1177,25 @@ impl StdioUpstream {
         }
 
         let id = req_id.unwrap();
-        let Some((wire_id, mut guard, notif_rx, resp_rx)) =
-            session.register_request_with_claim(claim, id.clone(), extract_progress_token(payload))
-        else {
-            let (status, msg) = session.map_register_failure("upstream child closed stdin");
-            if !session.alive.load(Ordering::Acquire) {
-                remove_and_terminate(&self.inner, session_id, &session).await;
-            }
-            return jsonrpc_error_reply(status, id, -32000, &msg);
-        };
+        let (wire_id, mut guard, notif_rx, resp_rx) =
+            match session.register_request_with_claim(claim, id, extract_progress_token(payload)) {
+                Ok(registered) => registered,
+                Err(err) => {
+                    let (status, msg) =
+                        session.map_register_failure(err, "upstream child closed stdin");
+                    if !session.alive.load(Ordering::Acquire) {
+                        remove_and_terminate(&self.inner, session_id, &session).await;
+                    }
+                    return jsonrpc_error_reply(&self.inner.budget, status, id, -32000, &msg);
+                }
+            };
         if let Err(err) = session.send_request_line(payload, wire_id) {
             guard.disarm();
             let (status, msg) = session.map_send_failure(err, "upstream child closed stdin");
             if matches!(err, SendLineErr::Closed) || !session.alive.load(Ordering::Acquire) {
                 remove_and_terminate(&self.inner, session_id, &session).await;
             }
-            return jsonrpc_error_reply(status, id, -32000, &msg);
+            return jsonrpc_error_reply(&self.inner.budget, status, id, -32000, &msg);
         }
 
         let call_timeout = Duration::from_secs(self.inner.settings.session_idle_secs);
@@ -872,13 +1221,17 @@ impl StdioUpstream {
                 single_rpc_reply(headers, Some(session_id), json_bytes, lease)
             }
             Ok(Ok(RespDelivery::HardError {
-                status, message, ..
+                status,
+                message: _message,
+                json_bytes,
+                lease,
             })) => {
                 guard.disarm();
+                let reply = jsonrpc_error_bytes_reply(status, json_bytes, lease);
                 if !session.alive.load(Ordering::Acquire) {
                     remove_and_terminate(&self.inner, session_id, &session).await;
                 }
-                jsonrpc_error_reply(status, id, -32000, &message)
+                reply
             }
             Ok(Err(_)) => {
                 guard.disarm();
@@ -887,11 +1240,12 @@ impl StdioUpstream {
                 if !session.alive.load(Ordering::Acquire) {
                     remove_and_terminate(&self.inner, session_id, &session).await;
                 }
-                jsonrpc_error_reply(status, id, -32000, &msg)
+                jsonrpc_error_reply(&self.inner.budget, status, id, -32000, &msg)
             }
             Err(_) => {
                 guard.cancel("request timed out");
                 jsonrpc_error_reply(
+                    &self.inner.budget,
                     StatusCode::GATEWAY_TIMEOUT,
                     id,
                     -32000,
@@ -908,9 +1262,9 @@ impl StdioUpstream {
         protocol_version: &str,
         payload: &Value,
         method: Option<&str>,
-        req_id: Option<Value>,
+        req_id: Option<&Value>,
     ) -> HttpReply {
-        let err_id = req_id.clone().unwrap_or(Value::Null);
+        let err_id = req_id.unwrap_or(&Value::Null);
         let start_epoch = {
             let tbl = self.inner.table.lock().unwrap_or_else(|p| p.into_inner());
             tbl.grant_epoch(&token.grant_id)
@@ -918,6 +1272,7 @@ impl StdioUpstream {
 
         let Some(reservation) = acquire_slot(&self.inner, &token.grant_id).await else {
             return jsonrpc_error_reply(
+                &self.inner.budget,
                 StatusCode::SERVICE_UNAVAILABLE,
                 err_id,
                 -32000,
@@ -935,7 +1290,13 @@ impl StdioUpstream {
         {
             Ok(pair) => pair,
             Err(err) => {
-                return jsonrpc_error_reply(StatusCode::BAD_GATEWAY, err_id, -32000, &err);
+                return jsonrpc_error_reply(
+                    &self.inner.budget,
+                    StatusCode::BAD_GATEWAY,
+                    err_id,
+                    -32000,
+                    &err,
+                );
             }
         };
 
@@ -953,21 +1314,23 @@ impl StdioUpstream {
             }
         });
 
-        let Some((init_wire_id, mut init_guard, init_notif_rx, init_resp_rx)) =
-            session.register_request(json!(0), None)
-        else {
-            let (status, msg) =
-                session.map_register_failure("ephemeral child exited during initialize");
-            ephemeral.terminate_now().await;
-            return jsonrpc_error_reply(status, err_id, -32000, &msg);
-        };
+        let (init_wire_id, mut init_guard, init_notif_rx, init_resp_rx) =
+            match session.register_request(err_id, None) {
+                Ok(registered) => registered,
+                Err(err) => {
+                    let (status, msg) = session
+                        .map_register_failure(err, "ephemeral child exited during initialize");
+                    ephemeral.terminate_now().await;
+                    return jsonrpc_error_reply(&self.inner.budget, status, err_id, -32000, &msg);
+                }
+            };
         drop(init_notif_rx);
         if let Err(err) = session.send_request_line(&synth_init, init_wire_id) {
             init_guard.disarm();
             let (status, msg) =
                 session.map_send_failure(err, "ephemeral child closed stdin during initialize");
             ephemeral.terminate_now().await;
-            return jsonrpc_error_reply(status, err_id, -32000, &msg);
+            return jsonrpc_error_reply(&self.inner.budget, status, err_id, -32000, &msg);
         }
 
         let (init_bytes, init_lease) = match tokio::time::timeout(INIT_TIMEOUT, init_resp_rx).await
@@ -977,23 +1340,28 @@ impl StdioUpstream {
                 (json_bytes, lease)
             }
             Ok(Ok(RespDelivery::HardError {
-                status, message, ..
+                status,
+                message: _message,
+                json_bytes,
+                lease,
             })) => {
                 init_guard.disarm();
+                let reply = jsonrpc_error_bytes_reply(status, json_bytes, lease);
                 ephemeral.terminate_now().await;
-                return jsonrpc_error_reply(status, err_id, -32000, &message);
+                return reply;
             }
             Ok(Err(_)) => {
                 init_guard.disarm();
                 let (status, msg) =
                     session.map_dead_session_error("ephemeral child exited during initialize");
                 ephemeral.terminate_now().await;
-                return jsonrpc_error_reply(status, err_id, -32000, &msg);
+                return jsonrpc_error_reply(&self.inner.budget, status, err_id, -32000, &msg);
             }
             Err(_) => {
                 init_guard.disarm();
                 ephemeral.terminate_now().await;
                 return jsonrpc_error_reply(
+                    &self.inner.budget,
                     StatusCode::GATEWAY_TIMEOUT,
                     err_id,
                     -32000,
@@ -1008,6 +1376,7 @@ impl StdioUpstream {
         if !init_ok {
             ephemeral.terminate_now().await;
             return jsonrpc_error_reply(
+                &self.inner.budget,
                 StatusCode::BAD_GATEWAY,
                 err_id,
                 -32000,
@@ -1022,39 +1391,32 @@ impl StdioUpstream {
         if let Err(err) = session.send_json_line(&initialized_note) {
             let (status, msg) = session.map_send_failure(err, "ephemeral child closed stdin");
             ephemeral.terminate_now().await;
-            return jsonrpc_error_reply(status, err_id, -32000, &msg);
+            return jsonrpc_error_reply(&self.inner.budget, status, err_id, -32000, &msg);
         }
 
         let is_request = method.is_some() && req_id.is_some();
         if !is_request {
-            let send_res = session.send_json_line(payload);
-            if let Err(err) = send_res {
-                let (status, msg) = session.map_send_failure(err, "ephemeral child closed stdin");
-                ephemeral.terminate_now().await;
-                return jsonrpc_error_reply(status, Value::Null, -32000, &msg);
-            }
-            ephemeral.terminate_now().await;
-            return Response::builder()
-                .status(StatusCode::ACCEPTED)
-                .header(HeaderName::from_static("x-accel-buffering"), "no")
-                .header(header::CACHE_CONTROL, "no-store")
-                .body(empty_body())
-                .expect("valid 202 reply");
+            return session
+                .send_sessionless_notification(payload, ephemeral, STDIN_WRITE_TIMEOUT)
+                .await;
         }
 
         let id = req_id.unwrap();
-        let Some((wire_id, mut guard, notif_rx, resp_rx)) =
-            session.register_request(id.clone(), extract_progress_token(payload))
-        else {
-            let (status, msg) = session.map_register_failure("ephemeral child closed stdin");
-            ephemeral.terminate_now().await;
-            return jsonrpc_error_reply(status, id, -32000, &msg);
-        };
+        let (wire_id, mut guard, notif_rx, resp_rx) =
+            match session.register_request(id, extract_progress_token(payload)) {
+                Ok(registered) => registered,
+                Err(err) => {
+                    let (status, msg) =
+                        session.map_register_failure(err, "ephemeral child closed stdin");
+                    ephemeral.terminate_now().await;
+                    return jsonrpc_error_reply(&self.inner.budget, status, id, -32000, &msg);
+                }
+            };
         if let Err(err) = session.send_request_line(payload, wire_id) {
             guard.disarm();
             let (status, msg) = session.map_send_failure(err, "ephemeral child closed stdin");
             ephemeral.terminate_now().await;
-            return jsonrpc_error_reply(status, id, -32000, &msg);
+            return jsonrpc_error_reply(&self.inner.budget, status, id, -32000, &msg);
         }
 
         let call_timeout = Duration::from_secs(self.inner.settings.session_idle_secs);
@@ -1081,23 +1443,28 @@ impl StdioUpstream {
         let (resp_bytes, resp_lease) = match tokio::time::timeout(call_timeout, resp_rx).await {
             Ok(Ok(RespDelivery::Ok { json_bytes, lease })) => (json_bytes, lease),
             Ok(Ok(RespDelivery::HardError {
-                status, message, ..
+                status,
+                message: _message,
+                json_bytes,
+                lease,
             })) => {
                 guard.disarm();
+                let reply = jsonrpc_error_bytes_reply(status, json_bytes, lease);
                 ephemeral.terminate_now().await;
-                return jsonrpc_error_reply(status, id, -32000, &message);
+                return reply;
             }
             Ok(Err(_)) => {
                 guard.disarm();
                 let (status, msg) =
                     session.map_dead_session_error("ephemeral child exited before responding");
                 ephemeral.terminate_now().await;
-                return jsonrpc_error_reply(status, id, -32000, &msg);
+                return jsonrpc_error_reply(&self.inner.budget, status, id, -32000, &msg);
             }
             Err(_) => {
                 guard.cancel("request timed out");
                 ephemeral.terminate_now().await;
                 return jsonrpc_error_reply(
+                    &self.inner.budget,
                     StatusCode::GATEWAY_TIMEOUT,
                     id,
                     -32000,
@@ -1107,9 +1474,9 @@ impl StdioUpstream {
         };
 
         guard.mark_completed();
+        let reply = single_rpc_reply(headers, None, resp_bytes, resp_lease);
         ephemeral.terminate_now().await;
-
-        single_rpc_reply(headers, None, resp_bytes, resp_lease)
+        reply
     }
 }
 
@@ -1119,6 +1486,7 @@ impl Drop for StdioUpstream {
     }
 }
 
+#[derive(Debug, PartialEq, Eq)]
 enum InitOutcome {
     Ok,
     RpcError,
@@ -1126,19 +1494,61 @@ enum InitOutcome {
 }
 
 fn classify_init_response(raw_line: &[u8]) -> InitOutcome {
-    let Ok(val) = serde_json::from_slice::<Value>(raw_line) else {
-        return InitOutcome::Malformed;
-    };
-    let Some(obj) = val.as_object() else {
-        return InitOutcome::Malformed;
-    };
-    if obj.contains_key("result") && !obj.contains_key("error") {
-        InitOutcome::Ok
-    } else if obj.get("error").is_some_and(Value::is_object) && !obj.contains_key("result") {
-        InitOutcome::RpcError
-    } else {
-        InitOutcome::Malformed
+    use serde::de::{IgnoredAny, MapAccess, Visitor};
+
+    #[derive(serde::Deserialize)]
+    #[serde(field_identifier, rename_all = "lowercase")]
+    enum Field {
+        Result,
+        Error,
+        #[serde(other)]
+        Other,
     }
+
+    struct InitVisitor;
+    impl<'de> Visitor<'de> for InitVisitor {
+        type Value = InitOutcome;
+
+        fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            formatter.write_str("an initialize response object")
+        }
+
+        fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> Result<Self::Value, A::Error> {
+            let mut has_result = false;
+            let mut error_is_object = None;
+            while let Some(key) = map.next_key::<&'de serde_json::value::RawValue>()? {
+                // Six ASCII letters need at most 38 bytes as a quoted Unicode-escaped key.
+                let field = if key.get().len() <= 38 {
+                    serde_json::from_str::<Field>(key.get()).map_err(serde::de::Error::custom)?
+                } else {
+                    Field::Other
+                };
+                match field {
+                    Field::Result => {
+                        map.next_value::<IgnoredAny>()?;
+                        has_result = true;
+                    }
+                    Field::Error => {
+                        let value: &'de serde_json::value::RawValue = map.next_value()?;
+                        error_is_object = Some(value.get().starts_with('{'));
+                    }
+                    Field::Other => {
+                        map.next_value::<IgnoredAny>()?;
+                    }
+                }
+            }
+            Ok(match (has_result, error_is_object) {
+                (true, None) => InitOutcome::Ok,
+                (false, Some(true)) => InitOutcome::RpcError,
+                _ => InitOutcome::Malformed,
+            })
+        }
+    }
+
+    let mut deserializer = serde_json::Deserializer::from_slice(raw_line);
+    serde::Deserializer::deserialize_map(&mut deserializer, InitVisitor)
+        .and_then(|outcome| deserializer.end().map(|()| outcome))
+        .unwrap_or(InitOutcome::Malformed)
 }
 
 fn drain_bg_terminations(inner: &StdioInner, only_grant: Option<&str>) -> Vec<JoinHandle<()>> {
@@ -1197,6 +1607,42 @@ fn spawn_reap_task(
         bg.push((grant_tag, jh));
     }
     Ok(rx)
+}
+
+#[cfg(windows)]
+async fn reap_failed_windows_spawn(
+    inner: &Arc<StdioInner>,
+    grant_id: &str,
+    mut child: Child,
+    job: WindowsJobObject,
+    reservation: SlotReservation,
+) {
+    let term_guard = reservation.into_terminating();
+    #[cfg(test)]
+    let gate = inner.failed_spawn_reap_gate.lock().unwrap().take();
+    let (done, waited) = oneshot::channel();
+    let jh = tokio::spawn(async move {
+        // Own the child, job, and slot through wait even if the spawning request is cancelled.
+        drop(job);
+        let _ = child.start_kill();
+        #[cfg(test)]
+        if let Some((entered, resume)) = gate {
+            let _ = entered.send(());
+            let _ = resume.await;
+        }
+        let _ = child.wait().await;
+        drop(term_guard);
+        let _ = done.send(());
+    });
+    {
+        let mut bg = inner
+            .bg_terminations
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        bg.retain(|(_, h)| !h.is_finished());
+        bg.push((grant_id.to_owned(), jh));
+    }
+    let _ = waited.await;
 }
 
 struct EphemeralGuard {
@@ -1265,18 +1711,23 @@ impl Drop for EphemeralGuard {
 
 struct SlotReservation {
     inner: Arc<StdioInner>,
+    registered: bool,
     committed: bool,
 }
 
 impl SlotReservation {
-    fn new(inner: &Arc<StdioInner>) -> Self {
+    fn new(inner: &Arc<StdioInner>, tbl: &mut SessionTable) -> Self {
+        tbl.reserved_slots += 1;
+        tbl.pending_spawns += 1;
         Self {
             inner: Arc::clone(inner),
+            registered: false,
             committed: false,
         }
     }
 
     fn commit(mut self, tbl: &mut SessionTable) {
+        debug_assert!(self.registered);
         tbl.reserved_slots = tbl.reserved_slots.saturating_sub(1);
         self.committed = true;
     }
@@ -1286,6 +1737,9 @@ impl SlotReservation {
         {
             let mut tbl = self.inner.table.lock().unwrap_or_else(|p| p.into_inner());
             tbl.reserved_slots = tbl.reserved_slots.saturating_sub(1);
+            if !self.registered {
+                tbl.pending_spawns = tbl.pending_spawns.saturating_sub(1);
+            }
             tbl.terminating_slots += 1;
         }
         TerminatingSlotsGuard::new(Arc::clone(&self.inner), 1)
@@ -1298,6 +1752,9 @@ impl Drop for SlotReservation {
             {
                 let mut tbl = self.inner.table.lock().unwrap_or_else(|p| p.into_inner());
                 tbl.reserved_slots = tbl.reserved_slots.saturating_sub(1);
+                if !self.registered {
+                    tbl.pending_spawns = tbl.pending_spawns.saturating_sub(1);
+                }
             }
             self.inner.slot_notify.notify_waiters();
         }
@@ -1378,8 +1835,7 @@ async fn acquire_slot(inner: &Arc<StdioInner>, grant_id: &str) -> Option<SlotRes
             if tbl.shutting_down {
                 Plan::Full
             } else if tbl.used_slots() < inner.settings.max_sessions {
-                tbl.reserved_slots += 1;
-                Plan::Immediate(SlotReservation::new(inner))
+                Plan::Immediate(SlotReservation::new(inner, &mut tbl))
             } else {
                 let now_ms = elapsed_ms(inner.epoch);
                 let idle_limit_ms = inner.settings.session_idle_secs.saturating_mul(1000);
@@ -1394,12 +1850,11 @@ async fn acquire_slot(inner: &Arc<StdioInner>, grant_id: &str) -> Option<SlotRes
                         .into_iter()
                         .filter_map(|id| tbl.sessions.remove(&id))
                         .collect();
-                    tbl.reserved_slots += 1;
                     let extra = victims.len().saturating_sub(1);
                     tbl.terminating_slots += extra;
                     Plan::Reap {
                         victims,
-                        reservation: SlotReservation::new(inner),
+                        reservation: SlotReservation::new(inner, &mut tbl),
                         extra_terminating: extra,
                     }
                 } else {
@@ -1431,10 +1886,9 @@ async fn acquire_slot(inner: &Arc<StdioInner>, grant_id: &str) -> Option<SlotRes
                     if let Some(sid) = victim_sid
                         && let Some(victim) = tbl.sessions.remove(&sid)
                     {
-                        tbl.reserved_slots += 1;
                         Plan::Reap {
                             victims: vec![victim],
-                            reservation: SlotReservation::new(inner),
+                            reservation: SlotReservation::new(inner, &mut tbl),
                             extra_terminating: 0,
                         }
                     } else if tbl.terminating_slots > 0 {
@@ -1537,12 +1991,40 @@ async fn terminate_all(sessions: Vec<Arc<StdioSession>>) {
     while set.join_next().await.is_some() {}
 }
 
+async fn write_stdin_lines(
+    mut stdin: impl AsyncWrite + Unpin,
+    mut stdin_rx: mpsc::Receiver<StdinLine>,
+    writer_cancel: CancellationToken,
+    writer_alive: Arc<AtomicBool>,
+) {
+    while let Some(StdinLine { bytes, flushed }) = tokio::select! {
+        _ = writer_cancel.cancelled() => None,
+        msg = stdin_rx.recv() => msg,
+    } {
+        let write_ok = tokio::select! {
+            _ = writer_cancel.cancelled() => false,
+            res = async {
+                stdin.write_all(&bytes).await.is_ok() && stdin.flush().await.is_ok()
+            } => res,
+        };
+        drop(bytes);
+        if !write_ok {
+            writer_alive.store(false, Ordering::Release);
+            break;
+        }
+        // A FIFO receipt covers this line and every earlier initialized/control line.
+        if let Some(flushed) = flushed {
+            let _ = flushed.send(());
+        }
+    }
+}
+
 impl StdioSession {
     async fn spawn(
         inner: &Arc<StdioInner>,
         grant_id: String,
         expected_grant_epoch: u64,
-        reservation: SlotReservation,
+        mut reservation: SlotReservation,
     ) -> Result<(Arc<Self>, EphemeralGuard), String> {
         #[cfg(windows)]
         let job = WindowsJobObject::create()?;
@@ -1574,29 +2056,55 @@ impl StdioSession {
             });
         }
 
+        #[cfg(windows)]
+        cmd.creation_flags(windows_sys::Win32::System::Threading::CREATE_SUSPENDED);
+
         let mut child = cmd
             .spawn()
             .map_err(|e| format!("failed to spawn upstream process: {e}"))?;
 
         #[cfg(windows)]
-        if let Err(err) = job.assign(&child) {
-            let _ = child.kill().await;
-            let _ = child.wait().await;
-            return Err(err);
+        {
+            let started = (|| {
+                #[cfg(test)]
+                if let Some(hook) = inner.spawn_hook.lock().unwrap().as_ref() {
+                    hook(WindowsSpawnStage::BeforeAssign, &job, &child)?;
+                }
+                job.assign(&child)?;
+                #[cfg(test)]
+                if let Some(hook) = inner.spawn_hook.lock().unwrap().as_ref() {
+                    hook(WindowsSpawnStage::BeforeResume, &job, &child)?;
+                }
+                resume_windows_child(&child)
+            })();
+            if let Err(err) = started {
+                reap_failed_windows_spawn(inner, &grant_id, child, job, reservation).await;
+                return Err(err);
+            }
         }
 
-        let Some(mut stdin) = child.stdin.take() else {
-            let _ = child.kill().await;
-            let _ = child.wait().await;
+        let Some(stdin) = child.stdin.take() else {
+            #[cfg(windows)]
+            reap_failed_windows_spawn(inner, &grant_id, child, job, reservation).await;
+            #[cfg(not(windows))]
+            {
+                let _ = child.kill().await;
+                let _ = child.wait().await;
+            }
             return Err("failed to capture child stdin".to_owned());
         };
         let Some(stdout) = child.stdout.take() else {
-            let _ = child.kill().await;
-            let _ = child.wait().await;
+            #[cfg(windows)]
+            reap_failed_windows_spawn(inner, &grant_id, child, job, reservation).await;
+            #[cfg(not(windows))]
+            {
+                let _ = child.kill().await;
+                let _ = child.wait().await;
+            }
             return Err("failed to capture child stdout".to_owned());
         };
 
-        let (stdin_tx, mut stdin_rx) = mpsc::channel::<Vec<u8>>(STDIN_CHANNEL_CAPACITY);
+        let (stdin_tx, stdin_rx) = mpsc::channel::<StdinLine>(STDIN_CHANNEL_CAPACITY);
         let stdin_tx_arc = Arc::new(Mutex::new(Some(stdin_tx)));
         let writer_cancel = CancellationToken::new();
         let alive = Arc::new(AtomicBool::new(true));
@@ -1612,6 +2120,7 @@ impl StdioSession {
             uid,
             grant_id,
             weak_inner: Arc::downgrade(inner),
+            budget: Arc::clone(&inner.budget),
             writer_cancel: writer_cancel.clone(),
             stdin_tx: Arc::clone(&stdin_tx_arc),
             in_flight: Arc::clone(&in_flight),
@@ -1633,6 +2142,8 @@ impl StdioSession {
                 true
             } else {
                 tbl.live_sessions.push(Arc::clone(&session));
+                tbl.pending_spawns = tbl.pending_spawns.saturating_sub(1);
+                reservation.registered = true;
                 false
             }
         };
@@ -1645,25 +2156,12 @@ impl StdioSession {
         }
         let ephemeral = EphemeralGuard::new(Arc::clone(&session), reservation);
 
-        let writer_alive = Arc::clone(&alive);
-        tokio::spawn(async move {
-            while let Some(buf) = tokio::select! {
-                _ = writer_cancel.cancelled() => None,
-                msg = stdin_rx.recv() => msg,
-            } {
-                let write_ok = tokio::select! {
-                    _ = writer_cancel.cancelled() => false,
-                    res = async {
-                        stdin.write_all(&buf).await.is_ok() && stdin.flush().await.is_ok()
-                    } => res,
-                };
-                if !write_ok {
-                    writer_alive.store(false, Ordering::Release);
-                    break;
-                }
-            }
-            drop(stdin);
-        });
+        tokio::spawn(write_stdin_lines(
+            stdin,
+            stdin_rx,
+            writer_cancel,
+            Arc::clone(&alive),
+        ));
 
         let reader_inner = Arc::downgrade(inner);
         let reader_session = Arc::downgrade(&session);
@@ -1672,59 +2170,47 @@ impl StdioSession {
         let reader_limits = inner.limits;
         tokio::spawn(async move {
             let mut lines = BufReader::new(stdout);
-            let mut raw = Vec::new();
             let mut had_hard_err = false;
             loop {
-                match read_stdout_line(
-                    &mut lines,
-                    &mut raw,
-                    &in_flight,
-                    &reader_budget,
-                    reader_limits,
-                )
-                .await
-                {
+                let result =
+                    read_stdout_line(&mut lines, &in_flight, &reader_budget, reader_limits).await;
+                let result = match result {
                     Ok(outcome) => {
                         if outcome.len == 0 {
-                            release_raw_buf(&mut raw);
-                            drop(outcome.lease);
                             break;
                         }
                         if outcome.len > reader_limits.max_control_line_bytes {
-                            dispatch_large_response_line(&mut raw, outcome, &in_flight);
+                            dispatch_large_response_line(outcome, &in_flight);
                             continue;
                         }
-                        let Ok(text) = std::str::from_utf8(&raw) else {
-                            release_raw_buf(&mut raw);
-                            drop(outcome.lease);
-                            continue;
-                        };
-                        let trimmed = text.trim_end_matches(['\r', '\n']);
-                        if trimmed.trim().is_empty() {
-                            release_raw_buf(&mut raw);
-                            drop(outcome.lease);
+                        if outcome.raw.iter().all(u8::is_ascii_whitespace) {
                             continue;
                         }
-                        let parsed = serde_json::from_str::<Value>(trimmed);
-                        release_raw_buf(&mut raw);
-                        drop(outcome.lease);
-                        if let Ok(val) = parsed {
-                            dispatch_stdout_message(
+                        let parsed = LeasedJson::parse(&outcome.raw, &reader_budget);
+                        drop(outcome);
+                        match parsed {
+                            Ok(mut parsed) => dispatch_stdout_message(
                                 &in_flight,
                                 &reader_stdin,
                                 &alive,
                                 &notif_budget,
-                                val,
-                            );
+                                &reader_budget,
+                                std::mem::take(&mut parsed.value),
+                            )
+                            .map_err(ReadStdoutErr::Hard),
+                            Err(JsonEncodeError::Invalid) => continue,
+                            Err(JsonEncodeError::Overloaded) => {
+                                Err(ReadStdoutErr::Hard(HardRejectError::BudgetExhausted))
+                            }
                         }
                     }
-                    Err(ReadStdoutErr::Io) => {
-                        release_raw_buf(&mut raw);
-                        break;
-                    }
+                    Err(error) => Err(error),
+                };
+                match result {
+                    Ok(()) => {}
+                    Err(ReadStdoutErr::Io) => break,
                     Err(ReadStdoutErr::Hard(hard_err)) => {
                         had_hard_err = true;
-                        release_raw_buf(&mut raw);
                         fail_session_waiters(&alive, &terminal_error, &in_flight, hard_err);
                         break;
                     }
@@ -1769,8 +2255,9 @@ impl StdioSession {
     }
 
     fn send_request_line(&self, payload: &Value, wire_id: u64) -> Result<(), SendLineErr> {
-        let mut rewritten = payload.clone();
-        if let Some(obj) = rewritten.as_object_mut() {
+        // New wire progress tokens and keys need at most 64 additional text bytes.
+        let mut rewritten = LeasedJson::copy(payload, &self.budget, 64)?;
+        if let Some(obj) = rewritten.value.as_object_mut() {
             obj.insert("id".to_owned(), Value::from(wire_id));
             if let Some(meta) = obj
                 .get_mut("params")
@@ -1785,20 +2272,88 @@ impl StdioSession {
                 );
             }
         }
-        self.send_json_line(&rewritten)
+        rewritten.finish_rewrite();
+        self.send_json_line(&rewritten.value)
     }
 
     fn send_json_line(&self, value: &Value) -> Result<(), SendLineErr> {
+        self.send_json_line_with_receipt(value, None)
+    }
+
+    fn send_json_line_with_receipt(
+        &self,
+        value: &Value,
+        flushed: Option<oneshot::Sender<()>>,
+    ) -> Result<(), SendLineErr> {
         if !self.alive.load(Ordering::Acquire) {
             return Err(SendLineErr::Closed);
         }
-        let mut line = serde_json::to_vec(value).map_err(|_| SendLineErr::Closed)?;
-        line.push(b'\n');
-        self.send_raw_line(line)
+        let (line, lease) =
+            encode_json_leased(value, b"\n", &self.budget).map_err(|err| match err {
+                JsonEncodeError::Overloaded => SendLineErr::Overloaded,
+                JsonEncodeError::Invalid => SendLineErr::Closed,
+            })?;
+        self.send_raw_line(StdinLine {
+            bytes: leased_bytes(line, Some(lease)),
+            flushed,
+        })
     }
 
-    fn rewrite_cancel_notification(&self, payload: &Value) -> Option<Value> {
-        let client_req_id = payload.get("params")?.get("requestId")?;
+    async fn send_sessionless_notification(
+        &self,
+        payload: &Value,
+        mut ephemeral: EphemeralGuard,
+        write_timeout: Duration,
+    ) -> HttpReply {
+        let (flushed, receipt) = oneshot::channel();
+        if let Err(err) = self.send_json_line_with_receipt(payload, Some(flushed)) {
+            let (status, msg) = self.map_send_failure(err, "ephemeral child closed stdin");
+            ephemeral.terminate_now().await;
+            return jsonrpc_error_reply(&self.budget, status, &Value::Null, -32000, &msg);
+        }
+        let failure = match tokio::time::timeout(write_timeout, receipt).await {
+            Ok(Ok(())) => None,
+            Ok(Err(_)) => Some((
+                StatusCode::BAD_GATEWAY,
+                "ephemeral child stdin write failed",
+            )),
+            Err(_) => Some((
+                StatusCode::GATEWAY_TIMEOUT,
+                "ephemeral notification write timed out",
+            )),
+        };
+        ephemeral.terminate_now().await;
+        if let Some((status, message)) = failure {
+            return jsonrpc_error_reply(&self.budget, status, &Value::Null, -32000, message);
+        }
+        Response::builder()
+            .status(StatusCode::ACCEPTED)
+            .header(HeaderName::from_static("x-accel-buffering"), "no")
+            .header(header::CACHE_CONTROL, "no-store")
+            .body(empty_body())
+            .expect("valid 202 reply")
+    }
+
+    // Locally generated disconnect/timeout cancellation stays available at main-pool capacity.
+    fn send_cancel_line(&self, value: &Value) -> Result<(), SendLineErr> {
+        let mut line = serde_json::to_vec(value).map_err(|_| SendLineErr::Closed)?;
+        line.push(b'\n');
+        self.send_raw_line(StdinLine {
+            bytes: Bytes::from(line),
+            flushed: None,
+        })
+    }
+
+    fn rewrite_cancel_notification(
+        &self,
+        payload: &Value,
+    ) -> Result<Option<LeasedJson>, SendLineErr> {
+        let Some(client_req_id) = payload
+            .get("params")
+            .and_then(|params| params.get("requestId"))
+        else {
+            return Ok(None);
+        };
         let wire_id = {
             let waiters = self.in_flight.lock().unwrap_or_else(|p| p.into_inner());
             waiters
@@ -1806,16 +2361,24 @@ impl StdioSession {
                 .rev()
                 .find(|w| json_id_eq(&w.client_id, client_req_id))
                 .map(|w| w.wire_id)
-        }?;
-        let mut cloned = payload.clone();
-        cloned
-            .get_mut("params")?
-            .as_object_mut()?
-            .insert("requestId".to_owned(), json!(wire_id));
-        Some(cloned)
+        };
+        let Some(wire_id) = wire_id else {
+            return Ok(None);
+        };
+        let mut cloned = LeasedJson::copy(payload, &self.budget, "requestId".len())?;
+        let Some(params) = cloned
+            .value
+            .get_mut("params")
+            .and_then(Value::as_object_mut)
+        else {
+            return Ok(None);
+        };
+        params.insert("requestId".to_owned(), json!(wire_id));
+        cloned.finish_rewrite();
+        Ok(Some(cloned))
     }
 
-    fn send_raw_line(&self, line: Vec<u8>) -> Result<(), SendLineErr> {
+    fn send_raw_line(&self, line: StdinLine) -> Result<(), SendLineErr> {
         let guard = self.stdin_tx.lock().unwrap_or_else(|p| p.into_inner());
         let Some(tx) = guard.as_ref() else {
             return Err(SendLineErr::Closed);
@@ -1841,9 +2404,18 @@ impl StdioSession {
         }
     }
 
-    fn map_register_failure(&self, fallback_dead_msg: &str) -> (StatusCode, String) {
+    fn map_register_failure(
+        &self,
+        err: SendLineErr,
+        fallback_dead_msg: &str,
+    ) -> (StatusCode, String) {
         if !self.alive.load(Ordering::Acquire) {
             self.map_dead_session_error(fallback_dead_msg)
+        } else if matches!(err, SendLineErr::Overloaded) {
+            (
+                StatusCode::SERVICE_UNAVAILABLE,
+                "process active byte budget exceeded".to_owned(),
+            )
         } else {
             (
                 StatusCode::SERVICE_UNAVAILABLE,
@@ -1855,6 +2427,11 @@ impl StdioSession {
     fn map_send_failure(&self, err: SendLineErr, fallback_dead_msg: &str) -> (StatusCode, String) {
         if matches!(err, SendLineErr::Closed) || !self.alive.load(Ordering::Acquire) {
             self.map_dead_session_error(fallback_dead_msg)
+        } else if matches!(err, SendLineErr::Overloaded) {
+            (
+                StatusCode::SERVICE_UNAVAILABLE,
+                "process active byte budget exceeded".to_owned(),
+            )
         } else {
             (
                 StatusCode::SERVICE_UNAVAILABLE,
@@ -1865,14 +2442,17 @@ impl StdioSession {
 
     fn register_request(
         self: &Arc<Self>,
-        client_id: Value,
-        client_progress_token: Option<Value>,
-    ) -> Option<(
-        u64,
-        RequestGuard,
-        mpsc::UnboundedReceiver<QueuedNotif>,
-        oneshot::Receiver<RespDelivery>,
-    )> {
+        client_id: &Value,
+        client_progress_token: Option<&Value>,
+    ) -> Result<
+        (
+            u64,
+            RequestGuard,
+            mpsc::UnboundedReceiver<QueuedNotif>,
+            oneshot::Receiver<RespDelivery>,
+        ),
+        SendLineErr,
+    > {
         let claim = ActiveRequestClaim::new(self);
         self.register_request_with_claim(claim, client_id, client_progress_token)
     }
@@ -1880,30 +2460,38 @@ impl StdioSession {
     fn register_request_with_claim(
         self: &Arc<Self>,
         mut claim: ActiveRequestClaim,
-        client_id: Value,
-        client_progress_token: Option<Value>,
-    ) -> Option<(
-        u64,
-        RequestGuard,
-        mpsc::UnboundedReceiver<QueuedNotif>,
-        oneshot::Receiver<RespDelivery>,
-    )> {
+        client_id: &Value,
+        client_progress_token: Option<&Value>,
+    ) -> Result<
+        (
+            u64,
+            RequestGuard,
+            mpsc::UnboundedReceiver<QueuedNotif>,
+            oneshot::Receiver<RespDelivery>,
+        ),
+        SendLineErr,
+    > {
         let mut waiters = self.in_flight.lock().unwrap_or_else(|p| p.into_inner());
-        if !self.alive.load(Ordering::Acquire) || waiters.len() >= MAX_IN_FLIGHT_PER_SESSION {
-            return None;
+        if !self.alive.load(Ordering::Acquire) {
+            return Err(SendLineErr::Closed);
+        }
+        if waiters.len() >= MAX_IN_FLIGHT_PER_SESSION {
+            return Err(SendLineErr::Full);
         }
         let wire_id = self.next_wire_id.fetch_add(1, Ordering::Relaxed);
         let (notif_tx, notif_rx) = mpsc::unbounded_channel();
         let (resp_tx, resp_rx) = oneshot::channel();
-        // Adopt the pre-incremented active_requests count without dipping to zero.
-        claim.disarm_into_guard();
-        waiters.push(InFlightEntry {
+        let entry = InFlightEntry::new(
             wire_id,
             client_id,
             client_progress_token,
             notif_tx,
             resp_tx,
-        });
+            &self.budget,
+        )?;
+        // Adopt the pre-incremented active_requests count without dipping to zero.
+        claim.disarm_into_guard();
+        waiters.push(entry);
         drop(waiters);
 
         let guard = RequestGuard {
@@ -1911,7 +2499,7 @@ impl StdioSession {
             wire_id,
             state: GuardState::Armed,
         };
-        Some((wire_id, guard, notif_rx, resp_rx))
+        Ok((wire_id, guard, notif_rx, resp_rx))
     }
 
     async fn terminate(&self) {
@@ -2107,7 +2695,7 @@ impl RequestGuard {
                     "reason": reason
                 }
             });
-            let _ = self.session.send_json_line(&cancel);
+            let _ = self.session.send_cancel_line(&cancel);
         }
     }
 }
@@ -2336,8 +2924,20 @@ impl Body for StdioSseStreamBody {
                         this.idle_sleep
                             .as_mut()
                             .reset(tokio::time::Instant::now() + this.idle_timeout);
-                        let formatted = format!("data: {}\n\n", queued.line);
-                        return Poll::Ready(Some(Ok(Frame::data(Bytes::from(formatted)))));
+                        let frame = match queued.into_sse(&this.session.budget) {
+                            Ok(bytes) => bytes,
+                            Err(_) => {
+                                this.guard
+                                    .lock()
+                                    .unwrap_or_else(|p| p.into_inner())
+                                    .cancel("process active byte budget exceeded");
+                                this.finish_disarmed();
+                                return Poll::Ready(Some(Err(io::Error::other(
+                                    "process active byte budget exceeded",
+                                ))));
+                            }
+                        };
+                        return Poll::Ready(Some(Ok(Frame::data(frame))));
                     }
                     Poll::Ready(None) => {
                         this.notif_done = true;
@@ -2378,7 +2978,9 @@ impl Body for StdioSseStreamBody {
                 if let Some(delivery) = this.pending_resp.take() {
                     let (json_bytes, lease, is_err) = match delivery {
                         RespDelivery::Ok { json_bytes, lease } => (json_bytes, lease, false),
-                        RespDelivery::HardError { json_bytes, .. } => (json_bytes, None, true),
+                        RespDelivery::HardError {
+                            json_bytes, lease, ..
+                        } => (json_bytes, lease, true),
                     };
                     this.active_resp_is_error = is_err;
                     let mut cursor = LeasedFrameCursor::new(b"data: ", json_bytes, b"\n\n", lease);
@@ -2430,60 +3032,60 @@ fn enqueue_notif(
     notif_budget: &Arc<ByteBudget>,
     tx: &mpsc::UnboundedSender<QueuedNotif>,
     line: String,
+    process_lease: Option<ByteLease>,
 ) {
     if tx.is_closed() {
+        drop(line);
+        drop(process_lease);
         return;
     }
-    let cost = line.len().max(1);
+    let cost = line.capacity().max(1);
     let Some(lease) = ByteBudget::try_acquire(notif_budget, cost) else {
+        drop(line);
+        drop(process_lease);
         return;
     };
     let _ = tx.send(QueuedNotif {
         line,
         _lease: lease,
+        _process_lease: process_lease,
     });
 }
 
+fn encode_notification(value: &Value, budget: &Arc<ByteBudget>) -> Option<(String, ByteLease)> {
+    encode_json_leased(value, b"", budget)
+        .ok()
+        .map(|(bytes, lease)| {
+            (
+                String::from_utf8(bytes).expect("JSON encoding is UTF-8"),
+                lease,
+            )
+        })
+}
+
 fn dispatch_large_response_line(
-    raw: &mut Vec<u8>,
-    outcome: ReadLineOutcome,
+    mut outcome: ReadLineOutcome,
     in_flight: &Mutex<Vec<InFlightEntry>>,
 ) {
-    let Some(mut lease) = outcome.lease else {
-        release_raw_buf(raw);
-        return;
-    };
     if outcome.saw_method || outcome.id_count != 1 {
-        release_raw_buf(raw);
-        drop(lease);
         return;
     }
     let Some(top_id) = outcome.top_id else {
-        release_raw_buf(raw);
-        drop(lease);
         return;
     };
     let Some(wire_id) = top_id.wire_id else {
-        release_raw_buf(raw);
-        drop(lease);
         return;
     };
-    let Ok(text) = std::str::from_utf8(raw) else {
-        release_raw_buf(raw);
-        drop(lease);
+    let Ok(text) = std::str::from_utf8(&outcome.raw) else {
         return;
     };
     let trimmed = text.trim_end_matches(['\r', '\n']);
     if trimmed.trim().is_empty() || serde_json::from_str::<serde::de::IgnoredAny>(trimmed).is_err()
     {
-        release_raw_buf(raw);
-        drop(lease);
         return;
     }
     let trimmed_len = trimmed.len();
     if top_id.end > trimmed_len || top_id.start >= top_id.end {
-        release_raw_buf(raw);
-        drop(lease);
         return;
     }
     let entry = {
@@ -2493,85 +3095,82 @@ fn dispatch_large_response_line(
             .position(|w| w.wire_id == wire_id)
             .map(|pos| waiters.remove(pos))
     };
-    let Some(entry) = entry else {
-        release_raw_buf(raw);
-        drop(lease);
+    let Some(mut entry) = entry else {
         return;
     };
-    let client_id_for_err = entry.client_id.clone();
-    let Ok(client_id_bytes) = serde_json::to_vec(&entry.client_id) else {
-        release_raw_buf(raw);
-        drop(lease);
-        return;
-    };
-    raw.truncate(trimmed_len);
+    // Reuse the already charged error workspace for the temporary encoded ID.
+    serde_json::to_writer(&mut entry.error_buffer.bytes, &entry.client_id)
+        .expect("valid ID fits its reserved encoding workspace");
+    outcome.raw.truncate(trimmed_len);
     let old_id_len = top_id.end - top_id.start;
-    let final_len = trimmed_len - old_id_len + client_id_bytes.len();
-    if !lease.try_reserve(final_len) {
-        release_raw_buf(raw);
-        drop(lease);
-        let msg = "process active byte budget exceeded".to_owned();
-        let err_bytes = build_jsonrpc_error_bytes(client_id_for_err, -32000, &msg);
-        let _ = entry.resp_tx.send(RespDelivery::HardError {
-            status: StatusCode::SERVICE_UNAVAILABLE,
-            message: msg,
-            json_bytes: err_bytes,
-        });
+    let final_len = trimmed_len - old_id_len + entry.error_buffer.bytes.len();
+    if outcome.reserve(final_len, final_len).is_err() {
+        drop(outcome);
+        send_request_error(
+            entry,
+            StatusCode::SERVICE_UNAVAILABLE,
+            "process active byte budget exceeded".to_owned(),
+        );
         return;
     }
-    if final_len > raw.capacity() {
-        raw.reserve_exact(final_len - raw.len());
-    }
-    raw.splice(top_id.start..top_id.end, client_id_bytes);
-    let mut json_bytes = std::mem::take(raw);
-    if json_bytes.capacity().saturating_sub(json_bytes.len()) > 1024 * 1024 {
-        json_bytes.shrink_to_fit();
+    outcome.raw.splice(
+        top_id.start..top_id.end,
+        entry.error_buffer.bytes.iter().copied(),
+    );
+    if outcome.raw.capacity().saturating_sub(outcome.raw.len()) > 1024 * 1024 {
+        outcome.raw.shrink_to_fit();
+        outcome
+            .lease
+            .as_mut()
+            .expect("line lease")
+            .shrink_to(outcome.raw.capacity());
     }
     let _ = entry.resp_tx.send(RespDelivery::Ok {
-        json_bytes,
-        lease: Some(lease),
+        json_bytes: outcome.raw,
+        lease: outcome.lease,
     });
 }
 
 fn dispatch_stdout_message(
     in_flight: &Mutex<Vec<InFlightEntry>>,
-    stdin_tx: &Mutex<Option<mpsc::Sender<Vec<u8>>>>,
+    stdin_tx: &Mutex<Option<mpsc::Sender<StdinLine>>>,
     alive: &AtomicBool,
     notif_budget: &Arc<ByteBudget>,
+    budget: &Arc<ByteBudget>,
     mut val: Value,
-) {
+) -> Result<(), HardRejectError> {
     let Some(obj) = val.as_object() else {
-        return;
+        return Ok(());
     };
     let method_opt = obj.get("method").and_then(Value::as_str);
     let has_method = method_opt.is_some();
 
     if has_method && obj.contains_key("id") {
-        let id = obj.get("id").cloned().unwrap_or(Value::Null);
-        let reply = if method_opt == Some("ping") {
-            json!({
-                "jsonrpc": "2.0",
-                "id": id,
-                "result": {}
-            })
+        let id = obj.get("id").expect("checked id");
+        let sent = if method_opt == Some("ping") {
+            #[derive(serde::Serialize)]
+            struct Pong<'a> {
+                jsonrpc: &'static str,
+                id: &'a Value,
+                result: serde_json::Map<String, Value>,
+            }
+            let reply = Pong {
+                jsonrpc: "2.0",
+                id,
+                result: serde_json::Map::new(),
+            };
+            send_child_stdin_reply(stdin_tx, alive, &reply, budget)
         } else {
-            json!({
-                "jsonrpc": "2.0",
-                "id": id,
-                "error": {
-                    "code": -32601,
-                    "message": "client requests are not supported by gateway"
-                }
-            })
+            let reply =
+                rpc_error_payload(id, -32601, "client requests are not supported by gateway");
+            send_child_stdin_reply(stdin_tx, alive, &reply, budget)
         };
-        drop(val);
-        send_child_stdin_reply(stdin_tx, alive, &reply);
-        return;
+        return sent.map_err(|_| HardRejectError::BudgetExhausted);
     }
 
     if !has_method {
         let Some(wire_id) = obj.get("id").and_then(Value::as_u64) else {
-            return;
+            return Ok(());
         };
         let entry = {
             let mut waiters = in_flight.lock().unwrap_or_else(|p| p.into_inner());
@@ -2581,19 +3180,34 @@ fn dispatch_stdout_message(
                 .map(|pos| waiters.remove(pos))
         };
         let Some(entry) = entry else {
-            return;
+            return Ok(());
         };
+        let mut entry = entry;
         if let Some(map) = val.as_object_mut() {
-            map.insert("id".to_owned(), entry.client_id);
+            map.insert("id".to_owned(), std::mem::take(&mut entry.client_id));
         }
-        if let Ok(out) = serde_json::to_vec(&val) {
-            drop(val);
-            let _ = entry.resp_tx.send(RespDelivery::Ok {
-                json_bytes: out,
-                lease: None,
-            });
+        match encode_json_leased(&val, b"", budget) {
+            Ok((out, lease)) => {
+                drop(val);
+                let _ = entry.resp_tx.send(RespDelivery::Ok {
+                    json_bytes: out,
+                    lease: Some(lease),
+                });
+            }
+            Err(_) => {
+                entry.client_id = val
+                    .as_object_mut()
+                    .and_then(|map| map.remove("id"))
+                    .unwrap_or(Value::Null);
+                drop(val);
+                send_request_error(
+                    entry,
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "process active byte budget exceeded".to_owned(),
+                );
+            }
         }
-        return;
+        return Ok(());
     }
     let is_progress = method_opt == Some("notifications/progress");
     if let Some(rel_wire_id) = obj
@@ -2604,34 +3218,42 @@ fn dispatch_stdout_message(
     {
         let matched = {
             let waiters = in_flight.lock().unwrap_or_else(|p| p.into_inner());
-            waiters.iter().find(|w| w.wire_id == rel_wire_id).map(|w| {
-                (
-                    w.client_id.clone(),
-                    w.client_progress_token.clone(),
-                    w.notif_tx.clone(),
-                )
-            })
+            waiters
+                .iter()
+                .find(|w| w.wire_id == rel_wire_id)
+                .and_then(|w| {
+                    let client_id = LeasedJson::copy(&w.client_id, budget, 0).ok()?;
+                    let progress = match &w.client_progress_token {
+                        Some(value) => Some(LeasedJson::copy(value, budget, 0).ok()?),
+                        None => None,
+                    };
+                    Some((client_id, progress, w.notif_tx.clone()))
+                })
         };
-        if let Some((client_id, client_ptok, notif_tx)) = matched {
+        if let Some((client_id, mut client_ptok, notif_tx)) = matched {
             if let Some(params) = val.get_mut("params").and_then(Value::as_object_mut) {
                 if let Some(meta) = params.get_mut("_meta").and_then(Value::as_object_mut) {
-                    meta.insert("relatedRequestId".to_owned(), client_id);
+                    meta.insert("relatedRequestId".to_owned(), client_id.value);
                 }
                 if is_progress
-                    && let Some(orig_ptok) = client_ptok
+                    && let Some(orig_ptok) = client_ptok.as_mut()
                     && params.get("progressToken").and_then(Value::as_str)
                         == Some(&format!("gw_pt_{rel_wire_id}"))
                 {
-                    params.insert("progressToken".to_owned(), orig_ptok);
+                    params.insert(
+                        "progressToken".to_owned(),
+                        std::mem::take(&mut orig_ptok.value),
+                    );
                 }
             }
             if !notif_tx.is_closed()
-                && let Ok(out) = serde_json::to_string(&val)
+                && let Some((out, lease)) = encode_notification(&val, budget)
             {
-                enqueue_notif(notif_budget, &notif_tx, out);
+                enqueue_notif(notif_budget, &notif_tx, out, Some(lease));
             }
+            drop(val);
         }
-        return;
+        return Ok(());
     }
 
     if is_progress
@@ -2645,27 +3267,29 @@ fn dispatch_stdout_message(
             .and_then(|s| s.strip_prefix("gw_pt_"))
             .and_then(|s| s.parse::<u64>().ok())
         else {
-            return;
+            return Ok(());
         };
         let matched = {
             let waiters = in_flight.lock().unwrap_or_else(|p| p.into_inner());
             waiters.iter().find(|w| w.wire_id == wire_id).and_then(|w| {
-                w.client_progress_token
-                    .clone()
+                let original = w.client_progress_token.as_ref()?;
+                LeasedJson::copy(original, budget, 0)
+                    .ok()
                     .map(|orig| (orig, w.notif_tx.clone()))
             })
         };
         if let Some((orig_ptok, notif_tx)) = matched {
             if let Some(params) = val.get_mut("params").and_then(Value::as_object_mut) {
-                params.insert("progressToken".to_owned(), orig_ptok);
+                params.insert("progressToken".to_owned(), orig_ptok.value);
             }
             if !notif_tx.is_closed()
-                && let Ok(out) = serde_json::to_string(&val)
+                && let Some((out, lease)) = encode_notification(&val, budget)
             {
-                enqueue_notif(notif_budget, &notif_tx, out);
+                enqueue_notif(notif_budget, &notif_tx, out, Some(lease));
             }
+            drop(val);
         }
-        return;
+        return Ok(());
     }
 
     let targets: Vec<mpsc::UnboundedSender<QueuedNotif>> = {
@@ -2676,38 +3300,36 @@ fn dispatch_stdout_message(
             .map(|w| w.notif_tx.clone())
             .collect()
     };
-    if !targets.is_empty()
-        && let Ok(out) = serde_json::to_string(&val)
-    {
-        let mut iter = targets.into_iter();
-        if let Some(first_tx) = iter.next() {
-            for tx in iter {
-                enqueue_notif(notif_budget, &tx, out.clone());
-            }
-            enqueue_notif(notif_budget, &first_tx, out);
-        }
+    for tx in targets {
+        let Some((out, lease)) = encode_notification(&val, budget) else {
+            break;
+        };
+        enqueue_notif(notif_budget, &tx, out, Some(lease));
     }
+    Ok(())
 }
 
-fn send_child_stdin_reply(
-    stdin_tx: &Mutex<Option<mpsc::Sender<Vec<u8>>>>,
+fn send_child_stdin_reply<T: serde::Serialize + ?Sized>(
+    stdin_tx: &Mutex<Option<mpsc::Sender<StdinLine>>>,
     alive: &AtomicBool,
-    reply: &Value,
-) {
+    reply: &T,
+    budget: &Arc<ByteBudget>,
+) -> Result<(), JsonEncodeError> {
     if !alive.load(Ordering::Acquire) {
-        return;
+        return Ok(());
     }
-    let Ok(mut line) = serde_json::to_vec(reply) else {
-        return;
+    let (line, lease) = encode_json_leased(reply, b"\n", budget)?;
+    let line = StdinLine {
+        bytes: leased_bytes(line, Some(lease)),
+        flushed: None,
     };
-    line.push(b'\n');
     let tx_clone = {
         let guard = stdin_tx.lock().unwrap_or_else(|p| p.into_inner());
         let Some(tx) = guard.as_ref() else {
-            return;
+            return Ok(());
         };
         match tx.try_send(line) {
-            Ok(()) | Err(TrySendError::Closed(_)) => return,
+            Ok(()) | Err(TrySendError::Closed(_)) => return Ok(()),
             Err(TrySendError::Full(unsent)) => (tx.clone(), unsent),
         }
     };
@@ -2717,15 +3339,15 @@ fn send_child_stdin_reply(
             let _ = tokio::time::timeout(Duration::from_secs(5), tx.send(unsent)).await;
         });
     }
+    Ok(())
 }
 
-fn extract_progress_token(payload: &Value) -> Option<Value> {
+fn extract_progress_token(payload: &Value) -> Option<&Value> {
     payload
         .get("params")
         .and_then(|p| p.get("_meta"))
         .and_then(|m| m.get("progressToken"))
         .filter(|v| !v.is_null())
-        .cloned()
 }
 
 fn supports_sessionless_version(ver: &str) -> bool {
@@ -2847,37 +3469,41 @@ fn single_rpc_reply(
     builder.body(body).expect("valid RPC reply")
 }
 
-fn build_jsonrpc_error_bytes(id: Value, code: i64, message: &str) -> Vec<u8> {
-    serde_json::to_vec(&json!({
-        "jsonrpc": "2.0",
-        "id": id,
-        "error": {
-            "code": code,
-            "message": message
-        }
-    }))
-    .unwrap_or_else(|_| {
-        br#"{"jsonrpc":"2.0","id":null,"error":{"code":-32000,"message":"internal error"}}"#
-            .to_vec()
-    })
+fn send_request_error(entry: InFlightEntry, status: StatusCode, message: String) {
+    let (json_bytes, lease) = entry.error_buffer.finish(&entry.client_id, &message);
+    let _ = entry.resp_tx.send(RespDelivery::HardError {
+        status,
+        message,
+        json_bytes,
+        lease: Some(lease),
+    });
 }
 
-fn jsonrpc_error_reply(status: StatusCode, id: Value, code: i64, message: &str) -> HttpReply {
-    let body = json!({
-        "jsonrpc": "2.0",
-        "id": id,
-        "error": {
-            "code": code,
-            "message": message
-        }
-    });
-    let encoded = serde_json::to_vec(&body).unwrap_or_else(|_| b"{}".to_vec());
+fn jsonrpc_error_reply(
+    budget: &Arc<ByteBudget>,
+    status: StatusCode,
+    id: &Value,
+    code: i64,
+    message: &str,
+) -> HttpReply {
+    let body = rpc_error_payload(id, code, message);
+    let Ok((encoded, lease)) = encode_json_leased(&body, b"", budget) else {
+        return request_overloaded_reply();
+    };
+    jsonrpc_error_bytes_reply(status, encoded, Some(lease))
+}
+
+fn jsonrpc_error_bytes_reply(
+    status: StatusCode,
+    encoded: Vec<u8>,
+    lease: Option<ByteLease>,
+) -> HttpReply {
     Response::builder()
         .status(status)
         .header(header::CONTENT_TYPE, "application/json")
         .header(header::CACHE_CONTROL, "no-store")
         .header(HeaderName::from_static("x-accel-buffering"), "no")
-        .body(bytes_body(encoded))
+        .body(bytes_body(leased_bytes(encoded, lease)))
         .expect("valid JSON-RPC error reply")
 }
 
@@ -2889,23 +3515,6 @@ fn json_id_eq(left: &Value, right: &Value) -> bool {
         }
         _ => left == right,
     }
-}
-
-fn release_raw_buf(raw: &mut Vec<u8>) {
-    raw.clear();
-    if raw.capacity() > RAW_RETAIN_CAP_BYTES {
-        *raw = Vec::new();
-    }
-}
-
-fn reserve_bounded(out: &mut Vec<u8>, additional: usize, max_cap: usize) {
-    let needed = out.len().saturating_add(additional);
-    if needed <= out.capacity() {
-        return;
-    }
-    let doubled = out.capacity().saturating_mul(2).max(RAW_RETAIN_CAP_BYTES);
-    let target = doubled.max(needed).min(max_cap);
-    out.reserve_exact(target - out.len());
 }
 
 fn has_in_flight(in_flight: &Mutex<Vec<InFlightEntry>>) -> bool {
@@ -2962,11 +3571,47 @@ struct TopIdSpan {
 }
 
 struct ReadLineOutcome {
+    // Keep the allocation and its lease together across reads and cancellation.
+    raw: Vec<u8>,
     len: usize,
-    lease: Option<ByteLease>,
     saw_method: bool,
     id_count: usize,
     top_id: Option<TopIdSpan>,
+    lease: Option<ByteLease>,
+}
+
+impl ReadLineOutcome {
+    fn empty(budget: &Arc<ByteBudget>) -> Self {
+        Self {
+            raw: Vec::new(),
+            len: 0,
+            saw_method: false,
+            id_count: 0,
+            top_id: None,
+            lease: budget.try_acquire(0),
+        }
+    }
+
+    fn reserve(&mut self, needed: usize, limit: usize) -> Result<(), ReadStdoutErr> {
+        if self
+            .lease
+            .as_mut()
+            .expect("line lease")
+            .reserve_vec(&mut self.raw, needed, limit)
+        {
+            Ok(())
+        } else {
+            Err(ReadStdoutErr::Hard(HardRejectError::BudgetExhausted))
+        }
+    }
+
+    fn finish(mut self, scanner: &TopLevelJsonScanner) -> Self {
+        self.len = self.raw.len();
+        self.saw_method = scanner.saw_method;
+        self.id_count = scanner.id_count;
+        self.top_id = scanner.top_id;
+        self
+    }
 }
 
 fn fail_session_waiters(
@@ -2986,12 +3631,7 @@ fn fail_session_waiters(
         std::mem::take(&mut *waiters)
     };
     for entry in drained {
-        let json_bytes = build_jsonrpc_error_bytes(entry.client_id, -32000, &message);
-        let _ = entry.resp_tx.send(RespDelivery::HardError {
-            status,
-            message: message.clone(),
-            json_bytes,
-        });
+        send_request_error(entry, status, message.clone());
     }
 }
 
@@ -3284,160 +3924,80 @@ impl TopLevelJsonScanner {
 
 async fn read_stdout_line<R: tokio::io::AsyncBufRead + Unpin>(
     reader: &mut R,
-    out: &mut Vec<u8>,
     in_flight: &Mutex<Vec<InFlightEntry>>,
     budget: &Arc<ByteBudget>,
     limits: StdioLimits,
 ) -> Result<ReadLineOutcome, ReadStdoutErr> {
-    out.clear();
+    let mut out = ReadLineOutcome::empty(budget);
     let control_limit = limits
         .max_control_line_bytes
         .min(limits.max_stdout_line_bytes);
-    let mut lease: Option<ByteLease> = None;
     let mut scanner = TopLevelJsonScanner::new();
     let mut speculative = false;
 
     loop {
-        let available = match reader.fill_buf().await {
-            Ok(buf) => buf,
-            Err(_) => {
-                release_raw_buf(out);
-                return Err(ReadStdoutErr::Io);
-            }
-        };
+        let available = reader.fill_buf().await.map_err(|_| ReadStdoutErr::Io)?;
         if available.is_empty() {
-            if speculative && !out.is_empty() {
-                release_raw_buf(out);
-                drop(lease);
-                return Ok(ReadLineOutcome {
-                    len: 0,
-                    lease: None,
-                    saw_method: false,
-                    id_count: 0,
-                    top_id: None,
-                });
+            if speculative && !out.raw.is_empty() {
+                return Ok(ReadLineOutcome::empty(budget));
             }
-            return Ok(ReadLineOutcome {
-                len: out.len(),
-                lease,
-                saw_method: scanner.saw_method,
-                id_count: scanner.id_count,
-                top_id: scanner.top_id,
-            });
+            return Ok(out.finish(&scanner));
         }
 
         if !speculative {
-            let rem_ctrl = control_limit.saturating_sub(out.len());
+            let rem_ctrl = control_limit.saturating_sub(out.raw.len());
             if rem_ctrl > 0 {
                 let window = &available[..available.len().min(rem_ctrl)];
-                if let Some(pos) = window.iter().position(|&b| b == b'\n') {
-                    let take = pos + 1;
-                    out.extend_from_slice(&window[..take]);
-                    reader.consume(take);
-                    return Ok(ReadLineOutcome {
-                        len: out.len(),
-                        lease: None,
-                        saw_method: false,
-                        id_count: 0,
-                        top_id: None,
-                    });
+                let newline = window.iter().position(|&b| b == b'\n');
+                let take = newline.map_or(window.len(), |pos| pos + 1);
+                out.reserve(out.raw.len() + take, control_limit)?;
+                out.raw.extend_from_slice(&window[..take]);
+                reader.consume(take);
+                if newline.is_some() {
+                    return Ok(out.finish(&scanner));
                 }
-                let n = window.len();
-                out.extend_from_slice(window);
-                reader.consume(n);
                 continue;
             }
 
             if control_limit >= limits.max_stdout_line_bytes {
-                release_raw_buf(out);
                 return Err(ReadStdoutErr::Hard(HardRejectError::LineTooLarge(
                     limits.max_stdout_line_bytes,
                 )));
             }
             if !has_in_flight(in_flight) {
-                release_raw_buf(out);
                 return Err(ReadStdoutErr::Hard(HardRejectError::UnexpectedLargeOutput(
                     limits.max_control_line_bytes,
                 )));
             }
-            scanner.feed(out);
+            scanner.feed(&out.raw);
             if scanner.saw_method {
-                release_raw_buf(out);
                 return Err(ReadStdoutErr::Hard(
                     HardRejectError::ControlMessageTooLarge(limits.max_control_line_bytes),
                 ));
             }
-            let Some(l) = ByteBudget::try_acquire(budget, out.len()) else {
-                release_raw_buf(out);
-                return Err(ReadStdoutErr::Hard(HardRejectError::BudgetExhausted));
-            };
-            lease = Some(l);
             speculative = true;
         }
 
-        if let Some(pos) = available.iter().position(|&b| b == b'\n') {
-            let take = pos + 1;
-            let Some(new_len) = out
-                .len()
-                .checked_add(take)
-                .filter(|&n| n <= limits.max_stdout_line_bytes)
-            else {
-                release_raw_buf(out);
-                drop(lease);
-                return Err(ReadStdoutErr::Hard(HardRejectError::LineTooLarge(
-                    limits.max_stdout_line_bytes,
-                )));
-            };
-            if !lease
-                .as_mut()
-                .expect("speculative lease")
-                .try_reserve(new_len)
-            {
-                release_raw_buf(out);
-                drop(lease);
-                return Err(ReadStdoutErr::Hard(HardRejectError::BudgetExhausted));
-            }
-            reserve_bounded(out, take, limits.max_stdout_line_bytes);
-            scanner.feed(&available[..take]);
-            out.extend_from_slice(&available[..take]);
-            reader.consume(take);
-            return Ok(ReadLineOutcome {
-                len: out.len(),
-                lease,
-                saw_method: scanner.saw_method,
-                id_count: scanner.id_count,
-                top_id: scanner.top_id,
-            });
-        }
-
-        let len = available.len();
+        let newline = available.iter().position(|&b| b == b'\n');
+        let take = newline.map_or(available.len(), |pos| pos + 1);
         let Some(new_len) = out
+            .raw
             .len()
-            .checked_add(len)
+            .checked_add(take)
             .filter(|&n| n <= limits.max_stdout_line_bytes)
         else {
-            release_raw_buf(out);
-            drop(lease);
             return Err(ReadStdoutErr::Hard(HardRejectError::LineTooLarge(
                 limits.max_stdout_line_bytes,
             )));
         };
-        if !lease
-            .as_mut()
-            .expect("speculative lease")
-            .try_reserve(new_len)
-        {
-            release_raw_buf(out);
-            drop(lease);
-            return Err(ReadStdoutErr::Hard(HardRejectError::BudgetExhausted));
+        out.reserve(new_len, limits.max_stdout_line_bytes)?;
+        scanner.feed(&available[..take]);
+        out.raw.extend_from_slice(&available[..take]);
+        reader.consume(take);
+        if newline.is_some() {
+            return Ok(out.finish(&scanner));
         }
-        reserve_bounded(out, len, limits.max_stdout_line_bytes);
-        scanner.feed(available);
-        out.extend_from_slice(available);
-        reader.consume(len);
         if scanner.saw_method {
-            release_raw_buf(out);
-            drop(lease);
             return Err(ReadStdoutErr::Hard(
                 HardRejectError::ControlMessageTooLarge(limits.max_control_line_bytes),
             ));
@@ -3454,6 +4014,810 @@ mod tests {
     use super::*;
     use std::task::Waker;
 
+    fn request_test_session(budget: &Arc<ByteBudget>) -> Arc<StdioSession> {
+        Arc::new(StdioSession {
+            uid: 1,
+            grant_id: "g".to_owned(),
+            weak_inner: Weak::new(),
+            budget: Arc::clone(budget),
+            writer_cancel: CancellationToken::new(),
+            stdin_tx: Arc::new(Mutex::new(None)),
+            in_flight: Arc::new(Mutex::new(Vec::new())),
+            terminal_error: Arc::new(Mutex::new(None)),
+            next_wire_id: AtomicU64::new(1),
+            alive: Arc::new(AtomicBool::new(true)),
+            active_requests: Arc::new(AtomicUsize::new(0)),
+            last_client_active_ms: AtomicU64::new(0),
+            last_client_seq: AtomicU64::new(1),
+            child: tokio::sync::Mutex::new(None),
+            #[cfg(windows)]
+            job: Mutex::new(None),
+            epoch: Instant::now(),
+        })
+    }
+
+    struct GatedNotificationWriter {
+        written: Arc<Mutex<Vec<u8>>>,
+        flushed_len: Arc<AtomicUsize>,
+        first_flush: bool,
+        gate: Option<oneshot::Receiver<io::Result<()>>>,
+    }
+
+    impl AsyncWrite for GatedNotificationWriter {
+        fn poll_write(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            bytes: &[u8],
+        ) -> Poll<io::Result<usize>> {
+            self.written.lock().unwrap().extend_from_slice(bytes);
+            Poll::Ready(Ok(bytes.len()))
+        }
+
+        fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            if self.first_flush {
+                self.first_flush = false;
+            } else if let Some(gate) = self.gate.as_mut() {
+                let result = std::task::ready!(Pin::new(gate).poll(cx))
+                    .unwrap_or_else(|_| Err(io::Error::from(io::ErrorKind::BrokenPipe)));
+                self.gate = None;
+                if let Err(err) = result {
+                    return Poll::Ready(Err(err));
+                }
+            }
+            self.flushed_len
+                .store(self.written.lock().unwrap().len(), Ordering::Release);
+            Poll::Ready(Ok(()))
+        }
+
+        fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    fn notification_test_session(
+        budget: &Arc<ByteBudget>,
+    ) -> (
+        StdioUpstream,
+        Arc<StdioSession>,
+        EphemeralGuard,
+        mpsc::Receiver<StdinLine>,
+    ) {
+        let up = StdioUpstream::with_limits(
+            StdioUpstreamSettings {
+                command: "unused-test-child".to_owned(),
+                args: Vec::new(),
+                env: std::collections::BTreeMap::new(),
+                cwd: None,
+                max_sessions: 1,
+                session_idle_secs: 30,
+            },
+            Arc::clone(budget),
+            StdioLimits::default(),
+        )
+        .unwrap();
+        let mut session = request_test_session(budget);
+        Arc::get_mut(&mut session).unwrap().weak_inner = Arc::downgrade(&up.inner);
+        let (tx, rx) = mpsc::channel(STDIN_CHANNEL_CAPACITY);
+        *session.stdin_tx.lock().unwrap() = Some(tx);
+        let slot = {
+            let mut table = up.inner.table.lock().unwrap();
+            let mut slot = SlotReservation::new(&up.inner, &mut table);
+            table.live_sessions.push(Arc::clone(&session));
+            table.pending_spawns -= 1;
+            slot.registered = true;
+            slot
+        };
+        let ephemeral = EphemeralGuard::new(Arc::clone(&session), slot);
+        (up, session, ephemeral, rx)
+    }
+
+    #[tokio::test]
+    async fn sessionless_notification_receipt_controls_status_and_reaping() {
+        for outcome in ["flushed", "flush_error", "writer_closed", "timeout"] {
+            let budget = ByteBudget::new(4096);
+            let (up, session, ephemeral, rx) = notification_test_session(&budget);
+            let initialized = json!({"jsonrpc":"2.0","method":"notifications/initialized"});
+            let payload = json!({"jsonrpc":"2.0","method":"notifications/roots/list_changed"});
+            let initialized_len = json_encoded_len(&initialized).unwrap() + 1;
+            let payload_len = json_encoded_len(&payload).unwrap() + 1;
+            session.send_json_line(&initialized).unwrap();
+            let written = Arc::new(Mutex::new(Vec::new()));
+            let flushed_len = Arc::new(AtomicUsize::new(0));
+            let (release, gate) = oneshot::channel();
+            let mut writer = Box::pin(write_stdin_lines(
+                GatedNotificationWriter {
+                    written: Arc::clone(&written),
+                    flushed_len: Arc::clone(&flushed_len),
+                    first_flush: true,
+                    gate: Some(gate),
+                },
+                rx,
+                session.writer_cancel.clone(),
+                Arc::clone(&session.alive),
+            ));
+            let deadline = if outcome == "timeout" {
+                Duration::from_millis(50)
+            } else {
+                Duration::from_secs(2)
+            };
+            let mut notification =
+                Box::pin(session.send_sessionless_notification(&payload, ephemeral, deadline));
+            let mut cx = Context::from_waker(Waker::noop());
+            assert!(notification.as_mut().poll(&mut cx).is_pending());
+            assert!(writer.as_mut().poll(&mut cx).is_pending());
+            assert!(notification.as_mut().poll(&mut cx).is_pending());
+            assert_eq!(flushed_len.load(Ordering::Acquire), initialized_len);
+            assert_eq!(
+                budget.used(),
+                payload_len,
+                "the pending write keeps its bytes"
+            );
+            {
+                let table = up.inner.table.lock().unwrap();
+                assert_eq!(table.reserved_slots, 1);
+                assert_eq!(table.terminating_slots, 0, "reaping must wait for flush");
+            }
+            assert!(!session.writer_cancel.is_cancelled());
+            let lines: Vec<Value> = written
+                .lock()
+                .unwrap()
+                .split(|&byte| byte == b'\n')
+                .filter(|line| !line.is_empty())
+                .map(|line| serde_json::from_slice(line).unwrap())
+                .collect();
+            assert_eq!(lines, vec![initialized, payload.clone()]);
+
+            let expected_status = match outcome {
+                "flushed" => {
+                    release.send(Ok(())).unwrap();
+                    StatusCode::ACCEPTED
+                }
+                "flush_error" => {
+                    release
+                        .send(Err(io::Error::from(io::ErrorKind::BrokenPipe)))
+                        .unwrap();
+                    StatusCode::BAD_GATEWAY
+                }
+                "writer_closed" => {
+                    session.writer_cancel.cancel();
+                    StatusCode::BAD_GATEWAY
+                }
+                "timeout" => StatusCode::GATEWAY_TIMEOUT,
+                _ => unreachable!(),
+            };
+            let (reply, ()) = tokio::time::timeout(Duration::from_secs(3), async {
+                tokio::join!(notification, writer)
+            })
+            .await
+            .expect("notification and writer must finish after receipt or cancellation");
+            assert_eq!(reply.status(), expected_status, "{outcome}");
+            let body = reply.into_body().collect().await.unwrap().to_bytes();
+            if expected_status == StatusCode::ACCEPTED {
+                assert!(body.is_empty());
+                assert_eq!(
+                    flushed_len.load(Ordering::Acquire),
+                    initialized_len + payload_len
+                );
+            } else {
+                let error: Value = serde_json::from_slice(&body).unwrap();
+                assert!(error["id"].is_null());
+                let message = error["error"]["message"].as_str().unwrap();
+                assert_eq!(
+                    message,
+                    if outcome == "timeout" {
+                        "ephemeral notification write timed out"
+                    } else {
+                        "ephemeral child stdin write failed"
+                    }
+                );
+                assert_eq!(flushed_len.load(Ordering::Acquire), initialized_len);
+            }
+            drop(body);
+            up.shutdown().await;
+            let table = up.inner.table.lock().unwrap();
+            assert_eq!(table.used_slots(), 0);
+            assert!(table.live_sessions.is_empty());
+            assert_eq!(budget.used(), 0);
+        }
+    }
+
+    #[tokio::test]
+    async fn sessionless_notification_cancellation_reaps_pending_writer() {
+        let budget = ByteBudget::new(4096);
+        let (up, session, ephemeral, rx) = notification_test_session(&budget);
+        let initialized = json!({"jsonrpc":"2.0","method":"notifications/initialized"});
+        let payload = json!({"jsonrpc":"2.0","method":"notifications/roots/list_changed"});
+        session.send_json_line(&initialized).unwrap();
+        let flushed_len = Arc::new(AtomicUsize::new(0));
+        let (release, gate) = oneshot::channel();
+        let mut writer = Box::pin(write_stdin_lines(
+            GatedNotificationWriter {
+                written: Arc::new(Mutex::new(Vec::new())),
+                flushed_len: Arc::clone(&flushed_len),
+                first_flush: true,
+                gate: Some(gate),
+            },
+            rx,
+            session.writer_cancel.clone(),
+            Arc::clone(&session.alive),
+        ));
+        let mut notification = Box::pin(session.send_sessionless_notification(
+            &payload,
+            ephemeral,
+            STDIN_WRITE_TIMEOUT,
+        ));
+        let mut cx = Context::from_waker(Waker::noop());
+        assert!(notification.as_mut().poll(&mut cx).is_pending());
+        assert!(writer.as_mut().poll(&mut cx).is_pending());
+        assert!(budget.used() > 0);
+        drop(notification);
+        assert_eq!(budget.used(), json_encoded_len(&payload).unwrap() + 1);
+        assert_eq!(up.inner.table.lock().unwrap().terminating_slots, 1);
+        tokio::time::timeout(Duration::from_secs(2), writer)
+            .await
+            .expect("the ephemeral reaper must cancel the pending writer");
+        assert!(release.send(Ok(())).is_err());
+        assert_eq!(
+            flushed_len.load(Ordering::Acquire),
+            json_encoded_len(&initialized).unwrap() + 1
+        );
+        up.shutdown().await;
+        let table = up.inner.table.lock().unwrap();
+        assert_eq!(table.used_slots(), 0);
+        assert!(table.live_sessions.is_empty());
+        assert_eq!(budget.used(), 0);
+    }
+
+    #[tokio::test]
+    async fn sessionless_notification_reaches_child_before_reap() {
+        let dir = tempfile::tempdir().unwrap();
+        let log = dir.path().join("notifications.jsonl");
+        let script = r#"import json, sys
+with open(sys.argv[1], "w", encoding="utf-8") as log:
+    for raw in sys.stdin:
+        message = json.loads(raw)
+        log.write(json.dumps(message) + "\n")
+        log.flush()
+        if message.get("method") == "initialize":
+            print(json.dumps({"jsonrpc":"2.0", "id":message["id"], "result":{
+                "protocolVersion":"2026-07-28", "capabilities":{},
+                "serverInfo":{"name":"notification-fixture", "version":"1"}
+            }}), flush=True)
+"#;
+        let budget = ByteBudget::new(16 * 1024);
+        let up = StdioUpstream::with_limits(
+            StdioUpstreamSettings {
+                command: if cfg!(windows) { "python" } else { "python3" }.to_owned(),
+                args: vec![
+                    "-u".to_owned(),
+                    "-c".to_owned(),
+                    script.to_owned(),
+                    log.to_string_lossy().into_owned(),
+                ],
+                env: std::collections::BTreeMap::new(),
+                cwd: None,
+                max_sessions: 1,
+                session_idle_secs: 30,
+            },
+            Arc::clone(&budget),
+            StdioLimits::default(),
+        )
+        .unwrap();
+        let token = VerifiedToken {
+            grant_id: "notification-grant".to_owned(),
+            client_id: "test-client".to_owned(),
+            pool_slot: 0,
+            scopes: vec!["mcp".to_owned()],
+            resource: "https://mcp.example.com/mcp".to_owned(),
+        };
+        let payload = json!({"jsonrpc":"2.0","method":"notifications/roots/list_changed"});
+        let reply = tokio::time::timeout(
+            Duration::from_secs(5),
+            up.handle_sessionless(
+                &HeaderMap::new(),
+                &token,
+                "2026-07-28",
+                &payload,
+                Some("notifications/roots/list_changed"),
+                None,
+            ),
+        )
+        .await
+        .unwrap();
+        assert_eq!(reply.status(), StatusCode::ACCEPTED);
+        assert!(reply.headers().get("mcp-session-id").is_none());
+        drop(reply);
+        up.shutdown().await;
+        let received: Vec<Value> = std::fs::read_to_string(log)
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        assert_eq!(received.len(), 3);
+        assert_eq!(received[0]["method"], "initialize");
+        assert_eq!(received[1]["method"], "notifications/initialized");
+        assert_eq!(received[2], payload);
+        assert_eq!(up.inner.table.lock().unwrap().used_slots(), 0);
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while budget.used() != 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("reader and writer must release their final byte owners");
+    }
+
+    const NORMAL_REQUEST: &[u8] = br#"{"jsonrpc":"2.0","id":"call-one","method":"tools/call","params":{"_meta":{"progressToken":"progress-one"},"arguments":{"text":"hello"}}}"#;
+
+    #[test]
+    fn request_value_reserves_parse_workspace_and_copy_capacity() {
+        let tight = ByteBudget::new(NORMAL_REQUEST.len() * 3 - 1);
+        assert!(matches!(
+            LeasedJson::parse(NORMAL_REQUEST, &tight),
+            Err(JsonEncodeError::Overloaded),
+        ));
+        assert_eq!(tight.used(), 0);
+
+        let budget = ByteBudget::new(4096);
+        let parsed = LeasedJson::parse(NORMAL_REQUEST, &budget).unwrap();
+        assert_eq!(budget.used(), json_text_capacity(&parsed.value));
+        assert_eq!(parsed.value["params"]["arguments"]["text"], "hello");
+        drop(parsed);
+        assert_eq!(budget.used(), 0);
+
+        let mut text = String::with_capacity(64);
+        text.push_str("ready");
+        let value = Value::String(text);
+        let too_tight = ByteBudget::new(63);
+        assert!(matches!(
+            LeasedJson::copy(&value, &too_tight, 0),
+            Err(SendLineErr::Overloaded)
+        ));
+        assert_eq!(too_tight.used(), 0);
+        let copy = LeasedJson::copy(&value, &budget, 0).unwrap();
+        assert_eq!(budget.used(), 64);
+        assert_eq!(copy.value, value);
+        drop(copy);
+        assert_eq!(budget.used(), 0);
+    }
+
+    #[test]
+    fn request_stdin_queue_keeps_its_lease_after_caller_cancellation() {
+        let budget = ByteBudget::new(4096);
+        let session = request_test_session(&budget);
+        let (tx, mut rx) = mpsc::channel(4);
+        *session.stdin_tx.lock().unwrap() = Some(tx);
+        let parsed = LeasedJson::parse(NORMAL_REQUEST, &budget).unwrap();
+        let (wire_id, mut guard, _notifications, _response) = session
+            .register_request(&parsed.value["id"], extract_progress_token(&parsed.value))
+            .unwrap();
+        session.send_request_line(&parsed.value, wire_id).unwrap();
+        drop(parsed);
+
+        let queued = rx.try_recv().unwrap().bytes;
+        let encoded: Value = serde_json::from_slice(&queued).unwrap();
+        assert_eq!(encoded["id"], wire_id);
+        assert_eq!(
+            encoded["params"]["_meta"]["progressToken"],
+            format!("gw_pt_{wire_id}")
+        );
+        let retained = queued.clone();
+        guard.cancel("client disconnected");
+        let cancellation: Value = serde_json::from_slice(&rx.try_recv().unwrap().bytes).unwrap();
+        assert_eq!(cancellation["params"]["requestId"], wire_id);
+        assert_eq!(
+            budget.used(),
+            queued.len(),
+            "only the encoded queue allocation remains"
+        );
+        drop(queued);
+        assert_eq!(budget.used(), retained.len());
+        drop(retained);
+        assert_eq!(budget.used(), 0);
+    }
+
+    #[test]
+    fn request_error_workspace_preserves_id_when_the_process_pool_is_full() {
+        let budget = ByteBudget::new(2048);
+        let session = request_test_session(&budget);
+        let id = json!("reader \"one\"\n");
+        let (_, mut guard, _notifications, mut response) =
+            session.register_request(&id, None).unwrap();
+        let entry = session.in_flight.lock().unwrap().pop().unwrap();
+        let occupied = budget.try_acquire(budget.limit() - budget.used()).unwrap();
+        assert_eq!(budget.used(), budget.limit());
+        send_request_error(
+            entry,
+            StatusCode::SERVICE_UNAVAILABLE,
+            "process active byte budget exceeded".to_owned(),
+        );
+        guard.disarm();
+        let RespDelivery::HardError {
+            status,
+            json_bytes,
+            lease,
+            ..
+        } = response.try_recv().unwrap()
+        else {
+            panic!("expected the reserved error response");
+        };
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        let error: Value = serde_json::from_slice(&json_bytes).unwrap();
+        assert_eq!(error["id"], id);
+        assert_eq!(
+            error["error"]["message"],
+            "process active byte budget exceeded"
+        );
+        let held = lease.as_ref().unwrap().held();
+        assert_eq!(json_bytes.capacity(), held);
+        let frame = leased_bytes(json_bytes, lease);
+        let retained = frame.clone();
+        drop(occupied);
+        drop(frame);
+        assert_eq!(budget.used(), held);
+        drop(retained);
+        assert_eq!(budget.used(), 0);
+
+        for reason in [
+            HardRejectError::BudgetExhausted,
+            HardRejectError::LineTooLarge(usize::MAX),
+            HardRejectError::ControlMessageTooLarge(usize::MAX),
+            HardRejectError::UnexpectedLargeOutput(usize::MAX),
+        ] {
+            let (_, message) = reason.into_status_and_message();
+            let workspace = ErrorBuffer::new(&id, &budget).unwrap();
+            assert!(
+                json_encoded_len(&rpc_error_payload(&id, -32000, &message)).unwrap()
+                    <= workspace.bytes.capacity()
+            );
+            let (bytes, lease) = workspace.finish(&id, &message);
+            let decoded: Value = serde_json::from_slice(&bytes).unwrap();
+            assert_eq!(decoded["error"]["message"], message);
+            drop(bytes);
+            drop(lease);
+        }
+        assert_eq!(budget.used(), 0);
+    }
+
+    #[test]
+    fn request_metadata_copies_and_notification_frames_keep_their_owners() {
+        let budget = ByteBudget::new(4096);
+        let notif_budget = ByteBudget::new(4096);
+        let session = request_test_session(&budget);
+        let parsed = LeasedJson::parse(NORMAL_REQUEST, &budget).unwrap();
+        let (wire_id, mut guard, mut notifications, _response) = session
+            .register_request(&parsed.value["id"], extract_progress_token(&parsed.value))
+            .unwrap();
+        drop(parsed);
+        dispatch_stdout_message(
+            &session.in_flight,
+            &session.stdin_tx,
+            &session.alive,
+            &notif_budget,
+            &budget,
+            json!({"jsonrpc":"2.0","method":"notifications/progress","params":{
+                "_meta":{"relatedRequestId":wire_id},
+                "progressToken":format!("gw_pt_{wire_id}"),"progress":1
+            }}),
+        )
+        .unwrap();
+        let queued = notifications.try_recv().unwrap();
+        assert_eq!(notif_budget.used(), queued.line.capacity());
+        let frame = queued.into_sse(&budget).unwrap();
+        assert_eq!(
+            notif_budget.used(),
+            0,
+            "the session queue owner ends at dequeue"
+        );
+        let value: Value = serde_json::from_slice(&frame[6..frame.len() - 2]).unwrap();
+        assert_eq!(value["params"]["_meta"]["relatedRequestId"], "call-one");
+        assert_eq!(value["params"]["progressToken"], "progress-one");
+        guard.cancel("client disconnected");
+        assert_eq!(budget.used(), frame.len());
+        let retained = frame.slice(6..);
+        drop(frame);
+        assert!(budget.used() > 0);
+        drop(retained);
+        assert_eq!(budget.used(), 0);
+    }
+
+    #[tokio::test]
+    async fn stdout_small_line_charges_capacity_and_parse_workspace() {
+        let line = b"{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"text\":\"hello\"}}\n";
+        let limits = StdioLimits {
+            max_control_line_bytes: 128,
+            max_stdout_line_bytes: 256,
+            ..StdioLimits::default()
+        };
+        let in_flight = Mutex::new(Vec::new());
+        let budget = ByteBudget::new(1024);
+        let mut reader = BufReader::new(line.as_slice());
+        let outcome = read_stdout_line(&mut reader, &in_flight, &budget, limits)
+            .await
+            .unwrap();
+        assert_eq!(budget.used(), outcome.raw.capacity());
+        let parsed = LeasedJson::parse(&outcome.raw, &budget).unwrap();
+        assert_eq!(
+            budget.used(),
+            outcome.raw.capacity() + json_text_capacity(&parsed.value)
+        );
+        drop(outcome);
+        assert_eq!(budget.used(), json_text_capacity(&parsed.value));
+        assert_eq!(parsed.value["result"]["text"], "hello");
+        drop(parsed);
+        assert_eq!(budget.used(), 0);
+
+        let budget = ByteBudget::new(line.len() - 1);
+        let mut reader = BufReader::new(line.as_slice());
+        assert!(matches!(
+            read_stdout_line(&mut reader, &in_flight, &budget, limits).await,
+            Err(ReadStdoutErr::Hard(HardRejectError::BudgetExhausted))
+        ));
+        assert_eq!(budget.used(), 0);
+    }
+
+    #[tokio::test]
+    async fn stdout_small_line_cancellation_releases_owned_capacity() {
+        use std::future::Future;
+
+        let prefix = b"{\"jsonrpc\":\"2.0\",";
+        let limits = StdioLimits {
+            max_control_line_bytes: 128,
+            max_stdout_line_bytes: 256,
+            ..StdioLimits::default()
+        };
+        for poll in [false, true] {
+            let budget = ByteBudget::new(1024);
+            let in_flight = Mutex::new(Vec::new());
+            let (mut write, read) = tokio::io::duplex(128);
+            write.write_all(prefix).await.unwrap();
+            let mut reader = BufReader::new(read);
+            let mut pending = Box::pin(read_stdout_line(&mut reader, &in_flight, &budget, limits));
+            if poll {
+                let mut cx = Context::from_waker(Waker::noop());
+                assert!(pending.as_mut().poll(&mut cx).is_pending());
+                assert_eq!(budget.used(), prefix.len());
+            } else {
+                assert_eq!(budget.used(), 0);
+            }
+            drop(pending);
+            assert_eq!(budget.used(), 0);
+        }
+    }
+
+    #[tokio::test]
+    async fn stdout_child_reply_owns_encoded_id_through_queue() {
+        for method in ["ping", "roots/list"] {
+            for full_queue in [false, true] {
+                let budget = ByteBudget::new(4096);
+                let source = json!({"jsonrpc":"2.0","id":"child-\"id","method":method});
+                let mut parsed = LeasedJson::copy(&source, &budget, 0).unwrap();
+                let (tx, mut rx) = mpsc::channel(1);
+                if full_queue {
+                    tx.try_send(StdinLine {
+                        bytes: Bytes::from_static(b"ready\n"),
+                        flushed: None,
+                    })
+                    .unwrap();
+                }
+                let stdin = Mutex::new(Some(tx));
+                dispatch_stdout_message(
+                    &Mutex::new(Vec::new()),
+                    &stdin,
+                    &AtomicBool::new(true),
+                    &ByteBudget::new(1024),
+                    &budget,
+                    std::mem::take(&mut parsed.value),
+                )
+                .unwrap();
+                drop(parsed);
+                let charged = budget.used();
+                assert!(charged > 0);
+                if full_queue {
+                    assert_eq!(rx.recv().await.unwrap().bytes, b"ready\n".as_slice());
+                }
+                let line = rx.recv().await.unwrap().bytes;
+                assert_eq!(charged, line.len());
+                let value: Value = serde_json::from_slice(&line).unwrap();
+                assert_eq!(value["id"], source["id"]);
+                if method == "ping" {
+                    assert_eq!(value["result"], json!({}));
+                } else {
+                    assert_eq!(value["error"]["code"], -32601);
+                }
+                let retained = line.slice(..);
+                drop(line);
+                assert_eq!(budget.used(), charged);
+                drop(retained);
+                assert_eq!(budget.used(), 0);
+            }
+        }
+    }
+
+    #[test]
+    fn request_reply_owner_survives_unpolled_and_pending_cleanup() {
+        use std::future::Future;
+
+        for error in [false, true] {
+            for poll in [false, true] {
+                let budget = ByteBudget::new(4096);
+                let (bytes, lease) = encode_json_leased(
+                    &json!({"jsonrpc":"2.0","id":"normal-id","result":{}}),
+                    b"",
+                    &budget,
+                )
+                .unwrap();
+                let charged = bytes.capacity();
+                let reply = if error {
+                    jsonrpc_error_bytes_reply(StatusCode::BAD_GATEWAY, bytes, Some(lease))
+                } else {
+                    single_rpc_reply(&HeaderMap::new(), None, bytes, Some(lease))
+                };
+                // Cleanup may never start, or may be cancelled while awaiting the child.
+                // Capturing the completed body keeps bytes and lease in the same owner.
+                let mut cleanup = Box::pin(async move {
+                    std::future::pending::<()>().await;
+                    reply
+                });
+                assert_eq!(budget.used(), charged);
+                if poll {
+                    let mut cx = Context::from_waker(Waker::noop());
+                    assert!(cleanup.as_mut().poll(&mut cx).is_pending());
+                    assert_eq!(budget.used(), charged);
+                }
+                drop(cleanup);
+                assert_eq!(budget.used(), 0);
+            }
+        }
+    }
+
+    #[test]
+    fn request_rewrite_respects_exact_available_budget() {
+        const AVAILABLE: usize = 40_000;
+        let id = json!("long-client-id-expanded-by-30b");
+        assert_eq!(json_encoded_len(&id).unwrap(), 32);
+        for final_len in [AVAILABLE, AVAILABLE + 1] {
+            let budget = ByteBudget::new(AVAILABLE + 4096);
+            let (notif_tx, _notif_rx) = mpsc::unbounded_channel();
+            let (resp_tx, mut resp_rx) = oneshot::channel();
+            let entry = InFlightEntry::new(2, &id, None, notif_tx, resp_tx, &budget).unwrap();
+            // The retained ID and error workspace share this pool. Leave exactly
+            // AVAILABLE for the response without assuming their implementation size.
+            let occupied = budget
+                .try_acquire(budget.limit() - budget.used() - AVAILABLE)
+                .unwrap();
+            let in_flight = Mutex::new(vec![entry]);
+            let line_len = final_len - 30; // Drop LF, then replace one digit with 32 bytes.
+            let mut lease = budget.try_acquire(0).unwrap();
+            let mut raw = Vec::new();
+            assert!(lease.reserve_vec(&mut raw, line_len, line_len));
+            let prefix = br#"{"jsonrpc":"2.0","result":{"_meta":{"explicit_null":null},"text":""#;
+            let suffix = b"\"},\"id\":2}\n";
+            raw.extend_from_slice(prefix);
+            raw.resize(line_len - suffix.len(), b'x');
+            raw.extend_from_slice(suffix);
+            let outcome = ReadLineOutcome {
+                len: raw.len(),
+                raw,
+                lease: Some(lease),
+                saw_method: false,
+                id_count: 1,
+                top_id: Some(TopIdSpan {
+                    start: line_len - 3,
+                    end: line_len - 2,
+                    wire_id: Some(2),
+                }),
+            };
+            dispatch_large_response_line(outcome, &in_flight);
+            let delivery = resp_rx.try_recv().unwrap();
+            let (bytes, lease) = match delivery {
+                RespDelivery::Ok { json_bytes, lease } => {
+                    assert_eq!(final_len, AVAILABLE);
+                    assert_eq!(json_bytes.len(), AVAILABLE);
+                    let value: Value = serde_json::from_slice(&json_bytes).unwrap();
+                    assert_eq!(value["id"], id);
+                    assert!(value["result"]["_meta"]["explicit_null"].is_null());
+                    (json_bytes, lease)
+                }
+                RespDelivery::HardError {
+                    status,
+                    json_bytes,
+                    lease,
+                    ..
+                } => {
+                    assert_eq!(final_len, AVAILABLE + 1);
+                    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+                    let value: Value = serde_json::from_slice(&json_bytes).unwrap();
+                    assert_eq!(value["id"], id);
+                    assert_eq!(
+                        value["error"]["message"],
+                        "process active byte budget exceeded"
+                    );
+                    (json_bytes, lease)
+                }
+            };
+            let held = lease.as_ref().unwrap().held();
+            let frame = leased_bytes(bytes, lease);
+            drop(occupied);
+            assert_eq!(budget.used(), held);
+            drop(frame);
+            assert_eq!(budget.used(), 0);
+        }
+    }
+
+    #[test]
+    fn request_id_owner_transfers_to_the_encoded_response() {
+        let budget = ByteBudget::new(4096);
+        let session = request_test_session(&budget);
+        let (wire_id, mut guard, _notifications, mut response) =
+            session.register_request(&json!("normal-id"), None).unwrap();
+        dispatch_stdout_message(
+            &session.in_flight,
+            &session.stdin_tx,
+            &session.alive,
+            &ByteBudget::new(4096),
+            &budget,
+            json!({"jsonrpc":"2.0","id":wire_id,"result":{"text":"done"}}),
+        )
+        .unwrap();
+        guard.mark_completed();
+        let RespDelivery::Ok { json_bytes, lease } = response.try_recv().unwrap() else {
+            panic!("expected response");
+        };
+        assert_eq!(
+            serde_json::from_slice::<Value>(&json_bytes).unwrap()["id"],
+            "normal-id"
+        );
+        assert_eq!(budget.used(), json_bytes.capacity());
+        let bytes = leased_bytes(json_bytes, lease);
+        assert!(budget.used() > 0);
+        drop(bytes);
+        assert_eq!(budget.used(), 0);
+    }
+
+    #[test]
+    fn init_response_classification_skips_payloads_and_keeps_last_error_shape() {
+        let cases = [
+            (
+                r#"{"jsonrpc":"2.0","id":1,"result":{"serverInfo":{"name":"nested\\server","version":"1"},"capabilities":{},"extensions":[{"error":null},true,3]}}"#,
+                InitOutcome::Ok,
+            ),
+            (r#"{"result":[1,true,null]}"#, InitOutcome::Ok),
+            (r#"{"result":null}"#, InitOutcome::Ok),
+            (r#"{"result":"ready"}"#, InitOutcome::Ok),
+            (r#"{"result":3}"#, InitOutcome::Ok),
+            (r#"{"result":false}"#, InitOutcome::Ok),
+            (
+                r#"{"error": {"code":-32601,"message":"unavailable","data":{"result":[1,2]}}}"#,
+                InitOutcome::RpcError,
+            ),
+            (
+                r#"{"error":"earlier\\value","error":{}}"#,
+                InitOutcome::RpcError,
+            ),
+            (r#"{"error":{},"error":null}"#, InitOutcome::Malformed),
+            (r#"{"result":null,"result":false}"#, InitOutcome::Ok),
+            (r#"{"result":null,"error":{}}"#, InitOutcome::Malformed),
+            (
+                r#"{"\u0072esult":{},"extension":{"error":{}}}"#,
+                InitOutcome::Ok,
+            ),
+            (
+                r#"{"\u0072\u0065\u0073\u0075\u006c\u0074":null}"#,
+                InitOutcome::Ok,
+            ),
+            (
+                r#"{"\u0065\u0078\u0074\u0065\u006e\u0073\u0069\u006f\u006e":{"note":"ready"},"result":{}}"#,
+                InitOutcome::Ok,
+            ),
+            (r#"{}"#, InitOutcome::Malformed),
+            (r#"[]"#, InitOutcome::Malformed),
+        ];
+        for (json, expected) in cases {
+            assert_eq!(classify_init_response(json.as_bytes()), expected, "{json}");
+        }
+    }
+
     #[tokio::test]
     async fn sse_stream_handles_resp_drop_before_notif_close_without_panic() {
         let now = Instant::now();
@@ -3462,6 +4826,7 @@ mod tests {
             uid: 1,
             grant_id: "g".to_owned(),
             weak_inner: Weak::new(),
+            budget: ByteBudget::new(4096),
             writer_cancel: CancellationToken::new(),
             stdin_tx: Arc::new(Mutex::new(None)),
             in_flight: Arc::new(Mutex::new(Vec::new())),
@@ -3502,6 +4867,7 @@ mod tests {
             &notif_budget,
             &notif_tx,
             r#"{"jsonrpc":"2.0","method":"notifications/progress"}"#.to_owned(),
+            None,
         );
         drop(notif_tx);
 
@@ -3588,6 +4954,47 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn stdio_large_line_keeps_allocated_capacity_leased() {
+        let budget = ByteBudget::new(140 * 1024);
+        let limits = StdioLimits {
+            max_stdout_line_bytes: 512 * 1024,
+            max_control_line_bytes: 1024,
+            ..StdioLimits::default()
+        };
+        let (notif_tx, _notif_rx) = mpsc::unbounded_channel();
+        let (resp_tx, resp_rx) = oneshot::channel();
+        let in_flight = Mutex::new(vec![
+            InFlightEntry::new(
+                1,
+                &json!("client"),
+                None,
+                notif_tx,
+                resp_tx,
+                &ByteBudget::new(4096),
+            )
+            .unwrap(),
+        ]);
+        let line = format!(
+            "{{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":\"{}\"}}\n",
+            "x".repeat(129 * 1024),
+        );
+        let mut reader = BufReader::new(line.as_bytes());
+        let outcome = read_stdout_line(&mut reader, &in_flight, &budget, limits)
+            .await
+            .unwrap();
+        assert_eq!(budget.used(), outcome.raw.capacity());
+        assert!(outcome.raw.capacity() <= budget.limit());
+        dispatch_large_response_line(outcome, &in_flight);
+        let RespDelivery::Ok { json_bytes, lease } = resp_rx.await.unwrap() else {
+            panic!("response should fit the tight capacity budget");
+        };
+        assert_eq!(budget.used(), json_bytes.capacity());
+        drop(json_bytes);
+        drop(lease);
+        assert_eq!(budget.used(), 0);
+    }
+
+    #[tokio::test]
     async fn read_stdout_line_inplace_rewrite_and_raw_shrink_across_all_exits() {
         let budget = ByteBudget::new(140 * 1024);
         let limits = StdioLimits {
@@ -3600,17 +5007,19 @@ mod tests {
         let push_waiter = |wire_id: u64, client_id: Value| {
             let (notif_tx, _notif_rx) = mpsc::unbounded_channel();
             let (resp_tx, resp_rx) = oneshot::channel();
-            in_flight.lock().unwrap().push(InFlightEntry {
-                wire_id,
-                client_id,
-                client_progress_token: None,
-                notif_tx,
-                resp_tx,
-            });
+            in_flight.lock().unwrap().push(
+                InFlightEntry::new(
+                    wire_id,
+                    &client_id,
+                    None,
+                    notif_tx,
+                    resp_tx,
+                    &ByteBudget::new(4096),
+                )
+                .unwrap(),
+            );
             resp_rx
         };
-
-        let mut raw = Vec::new();
 
         // 1. Valid 120 KiB response under tight 140 KiB budget (would fail if 2x AST coexisted) splices `id` in place and resets `raw` to 0 capacity.
         let rx1 = push_waiter(1, json!("client-long-id-rewrite-0001"));
@@ -3621,16 +5030,15 @@ mod tests {
         w.write_all(valid_line.as_bytes()).await.unwrap();
         drop(w);
         let mut reader = BufReader::new(r);
-        let out1 = read_stdout_line(&mut reader, &mut raw, &in_flight, &budget, limits)
+        let out1 = read_stdout_line(&mut reader, &in_flight, &budget, limits)
             .await
             .unwrap();
-        assert!(raw.capacity() > RAW_RETAIN_CAP_BYTES);
-        dispatch_large_response_line(&mut raw, out1, &in_flight);
-        assert_eq!(raw.capacity(), 0);
+        assert!(out1.raw.capacity() > 64 * 1024);
+        dispatch_large_response_line(out1, &in_flight);
         let delivered = rx1.await.unwrap();
         match delivered {
             RespDelivery::Ok { json_bytes, lease } => {
-                assert_eq!(budget.used(), json_bytes.len());
+                assert_eq!(budget.used(), json_bytes.capacity());
                 let parsed: Value = serde_json::from_slice(&json_bytes).unwrap();
                 assert_eq!(parsed["id"], "client-long-id-rewrite-0001");
                 assert_eq!(parsed["result"]["blob"].as_str().unwrap().len(), 120 * 1024);
@@ -3650,11 +5058,10 @@ mod tests {
         w.write_all(&bad_utf8).await.unwrap();
         drop(w);
         let mut reader = BufReader::new(r);
-        let out2 = read_stdout_line(&mut reader, &mut raw, &in_flight, &budget, limits)
+        let out2 = read_stdout_line(&mut reader, &in_flight, &budget, limits)
             .await
             .unwrap();
-        dispatch_large_response_line(&mut raw, out2, &in_flight);
-        assert_eq!(raw.capacity(), 0);
+        dispatch_large_response_line(out2, &in_flight);
         assert_eq!(budget.used(), 0);
 
         // 3a. Oversized line > max_stdout_line_bytes hard-rejects and resets `raw` + lease.
@@ -3668,13 +5075,11 @@ mod tests {
             let _ = w.write_all(&too_big).await;
         });
         let mut reader = BufReader::new(r);
-        let err3 =
-            read_stdout_line(&mut reader, &mut raw, &in_flight, &budget, line_cap_limits).await;
+        let err3 = read_stdout_line(&mut reader, &in_flight, &budget, line_cap_limits).await;
         assert!(matches!(
             err3,
             Err(ReadStdoutErr::Hard(HardRejectError::LineTooLarge(_)))
         ));
-        assert_eq!(raw.capacity(), 0);
         assert_eq!(budget.used(), 0);
 
         // 3b. Line exceeding process ByteBudget (< max_stdout_line_bytes) hard-rejects with BudgetExhausted and resets `raw` + lease.
@@ -3684,12 +5089,11 @@ mod tests {
             let _ = w.write_all(&over_budget).await;
         });
         let mut reader = BufReader::new(r);
-        let err3b = read_stdout_line(&mut reader, &mut raw, &in_flight, &budget, limits).await;
+        let err3b = read_stdout_line(&mut reader, &in_flight, &budget, limits).await;
         assert!(matches!(
             err3b,
             Err(ReadStdoutErr::Hard(HardRejectError::BudgetExhausted))
         ));
-        assert_eq!(raw.capacity(), 0);
         assert_eq!(budget.used(), 0);
 
         // 4. EOF mid-speculative line (> 64 KiB without '\n') resets `raw` + lease cleanly.
@@ -3701,11 +5105,11 @@ mod tests {
         w.write_all(partial.as_bytes()).await.unwrap();
         drop(w);
         let mut reader = BufReader::new(r);
-        let out4 = read_stdout_line(&mut reader, &mut raw, &in_flight, &budget, limits)
+        let out4 = read_stdout_line(&mut reader, &in_flight, &budget, limits)
             .await
             .unwrap();
         assert_eq!(out4.len, 0);
-        assert_eq!(raw.capacity(), 0);
+        assert_eq!(out4.raw.capacity(), 0);
         assert_eq!(budget.used(), 0);
     }
 
@@ -3732,8 +5136,8 @@ mod tests {
                         } else {
                             assert_eq!(
                                 lease.held(),
-                                0,
-                                "failed try_reserve must release all held bytes immediately"
+                                initial,
+                                "failed growth keeps the existing live buffer charged until drop"
                             );
                         }
                     }
@@ -3751,8 +5155,38 @@ mod tests {
     }
 
     #[test]
+    fn notif_queue_charges_spare_capacity_until_the_entry_drops() {
+        let make_line = || {
+            let mut line = String::with_capacity(128);
+            line.push_str("notification");
+            line
+        };
+        let capacity = make_line().capacity();
+        let budget = ByteBudget::new(capacity);
+        let (tx, mut rx) = mpsc::unbounded_channel();
+
+        let occupied = ByteBudget::try_acquire(&budget, 1).unwrap();
+        enqueue_notif(&budget, &tx, make_line(), None);
+        assert_eq!(budget.used(), 1);
+        assert!(rx.try_recv().is_err());
+        drop(occupied);
+
+        enqueue_notif(&budget, &tx, make_line(), None);
+        assert_eq!(budget.used(), capacity);
+        let queued = rx.try_recv().unwrap();
+        assert_eq!(
+            budget.used(),
+            capacity,
+            "the dequeued entry still owns its string"
+        );
+        enqueue_notif(&budget, &tx, "x".into(), None);
+        assert!(rx.try_recv().is_err());
+        drop(queued);
+        assert_eq!(budget.used(), 0);
+    }
+
+    #[test]
     fn notif_queue_byte_budget_tracks_enqueued_copies_and_reclaims_on_recv_or_drop() {
-        let notif_budget = ByteBudget::new(900);
         let in_flight: Mutex<Vec<InFlightEntry>> = Mutex::new(Vec::new());
         let stdin_tx = Mutex::new(None);
         let alive = AtomicBool::new(true);
@@ -3768,27 +5202,25 @@ mod tests {
 
         {
             let mut w = in_flight.lock().unwrap();
-            w.push(InFlightEntry {
-                wire_id: 1,
-                client_id: json!("sse-1"),
-                client_progress_token: None,
-                notif_tx: tx1,
-                resp_tx: rtx1,
-            });
-            w.push(InFlightEntry {
-                wire_id: 2,
-                client_id: json!("sse-2"),
-                client_progress_token: None,
-                notif_tx: tx2,
-                resp_tx: rtx2,
-            });
-            w.push(InFlightEntry {
-                wire_id: 3,
-                client_id: json!("json-closed"),
-                client_progress_token: None,
-                notif_tx: tx_closed,
-                resp_tx: rtx3,
-            });
+            w.push(
+                InFlightEntry::new(1, &json!("sse-1"), None, tx1, rtx1, &ByteBudget::new(4096))
+                    .unwrap(),
+            );
+            w.push(
+                InFlightEntry::new(2, &json!("sse-2"), None, tx2, rtx2, &ByteBudget::new(4096))
+                    .unwrap(),
+            );
+            w.push(
+                InFlightEntry::new(
+                    3,
+                    &json!("json-closed"),
+                    None,
+                    tx_closed,
+                    rtx3,
+                    &ByteBudget::new(4096),
+                )
+                .unwrap(),
+            );
         }
 
         let make_notif = |target_len: usize, tag: usize| -> Value {
@@ -3802,36 +5234,358 @@ mod tests {
             .unwrap()
         };
 
-        // Broadcast 450 B across 2 open SSE waiters -> 2 * 450 = 900 B (exact N limit; closed waiter = 0 B).
-        dispatch_stdout_message(
-            &in_flight,
-            &stdin_tx,
-            &alive,
-            &notif_budget,
-            make_notif(450, 1),
-        );
-        assert_eq!(notif_budget.used(), 900);
+        let notification = make_notif(450, 1);
+        let cloned_capacity = json_encoded_len(&notification).unwrap();
+        let total_capacity = 2 * cloned_capacity;
+        let notif_budget = ByteBudget::new(total_capacity);
+        let process_budget = ByteBudget::new(4096);
 
-        // Next notification exceeds 900 B -> dropped for both waiters, budget stays 900 B.
+        // Two exact-capacity encodings fill the budget; the closed waiter costs nothing.
         dispatch_stdout_message(
             &in_flight,
             &stdin_tx,
             &alive,
             &notif_budget,
+            &process_budget,
+            notification,
+        )
+        .unwrap();
+        assert_eq!(notif_budget.used(), total_capacity);
+
+        // Both open waiters drop the next notification when their shared queue budget is full.
+        dispatch_stdout_message(
+            &in_flight,
+            &stdin_tx,
+            &alive,
+            &notif_budget,
+            &process_budget,
             make_notif(100, 2),
-        );
-        assert_eq!(notif_budget.used(), 900);
+        )
+        .unwrap();
+        assert_eq!(notif_budget.used(), total_capacity);
 
-        // Popping from rx1 frees 450 B immediately.
         let q1 = rx1.try_recv().unwrap();
         assert_eq!(q1.line.len(), 450);
+        assert_eq!(notif_budget.used(), total_capacity);
         drop(q1);
-        assert_eq!(notif_budget.used(), 450);
+        assert_eq!(notif_budget.used(), cloned_capacity);
         assert!(rx1.try_recv().is_err());
 
-        // Dropping rx2 frees the remaining 450 B immediately.
+        // Dropping rx2 releases its queued copy.
         drop(rx2);
         assert_eq!(notif_budget.used(), 0);
+    }
+
+    #[tokio::test]
+    async fn shutdown_waits_for_unregistered_spawn_reservation() {
+        let up = Arc::new(
+            StdioUpstream::new(StdioUpstreamSettings {
+                command: "unused".into(),
+                args: Vec::new(),
+                env: std::collections::BTreeMap::new(),
+                cwd: None,
+                max_sessions: 1,
+                session_idle_secs: 60,
+            })
+            .unwrap(),
+        );
+        let slot = acquire_slot(&up.inner, "g").await.unwrap();
+        let stopping = Arc::clone(&up);
+        let shutdown = tokio::spawn(async move { stopping.shutdown().await });
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while !up.inner.table.lock().unwrap().shutting_down {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        assert!(
+            !shutdown.is_finished(),
+            "reserved spawn must finish cleanup before shutdown"
+        );
+        drop(slot);
+        tokio::time::timeout(Duration::from_secs(1), shutdown)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(up.inner.table.lock().unwrap().used_slots(), 0);
+    }
+
+    #[cfg(windows)]
+    mod windows_spawn_tests {
+        use super::*;
+        use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
+        use std::path::Path;
+        use windows_sys::Win32::Foundation::WAIT_OBJECT_0;
+        use windows_sys::Win32::System::JobObjects::IsProcessInJob;
+        use windows_sys::Win32::System::Threading::{
+            OpenProcess, PROCESS_SYNCHRONIZE, ResumeThread, SuspendThread, WaitForSingleObject,
+        };
+
+        fn upstream(dir: &Path) -> StdioUpstream {
+            StdioUpstream::new(StdioUpstreamSettings {
+                command: "python".to_owned(),
+                args: vec![
+                    "-u".to_owned(),
+                    "-c".to_owned(),
+                    r#"import json, os, pathlib, subprocess, sys, time
+helper = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(120)"])
+pathlib.Path("tree.json").write_text(json.dumps([os.getpid(), helper.pid]))
+time.sleep(120)
+"#
+                    .to_owned(),
+                ],
+                env: std::collections::BTreeMap::new(),
+                cwd: Some(dir.to_owned()),
+                max_sessions: 1,
+                session_idle_secs: 60,
+            })
+            .unwrap()
+        }
+
+        fn process_handle(pid: u32) -> OwnedHandle {
+            let raw = unsafe { OpenProcess(PROCESS_SYNCHRONIZE, 0, pid) };
+            assert!(
+                !raw.is_null(),
+                "OpenProcess({pid}): {}",
+                io::Error::last_os_error()
+            );
+            unsafe { OwnedHandle::from_raw_handle(raw) }
+        }
+
+        fn wait_tree(dir: &Path) -> [u32; 2] {
+            let deadline = Instant::now() + Duration::from_secs(5);
+            loop {
+                if let Ok(bytes) = std::fs::read(dir.join("tree.json"))
+                    && let Ok(pids) = serde_json::from_slice(&bytes)
+                {
+                    return pids;
+                }
+                assert!(Instant::now() < deadline, "child must run after resume");
+                std::thread::sleep(Duration::from_millis(10));
+            }
+        }
+
+        fn assert_exited(process: &OwnedHandle) {
+            assert_eq!(
+                unsafe { WaitForSingleObject(process.as_raw_handle(), 5000) },
+                WAIT_OBJECT_0
+            );
+        }
+
+        fn assert_empty(up: &StdioUpstream) {
+            let table = up.inner.table.lock().unwrap();
+            assert_eq!(table.used_slots(), 0);
+            assert!(table.live_sessions.is_empty());
+        }
+
+        #[tokio::test]
+        async fn suspended_spawn_joins_job_before_running_and_reaps_tree_and_slot() {
+            let dir = tempfile::tempdir().unwrap();
+            let up = upstream(dir.path());
+            let marker = dir.path().join("tree.json");
+            let checks = Arc::new(AtomicUsize::new(0));
+            let checked = Arc::clone(&checks);
+            *up.inner.spawn_hook.lock().unwrap() = Some(Box::new(move |stage, job, child| {
+                // This hook gates the actual StdioSession::spawn path before assignment/resume.
+                assert!(!marker.exists());
+                let mut in_job = 0;
+                assert_ne!(
+                    unsafe { IsProcessInJob(child.raw_handle().unwrap(), job.0, &mut in_job) },
+                    0
+                );
+                assert_eq!(in_job != 0, stage == WindowsSpawnStage::BeforeResume);
+                with_owned_child_threads(child.id().unwrap(), |thread| {
+                    let previous = unsafe { SuspendThread(thread) };
+                    if previous == u32::MAX {
+                        return Err(io::Error::last_os_error());
+                    }
+                    let restored = unsafe { ResumeThread(thread) };
+                    assert_eq!(restored, previous + 1);
+                    assert_eq!(
+                        previous, 1,
+                        "child must already be suspended at the spawn gate"
+                    );
+                    Ok(())
+                })
+                .map_err(|e| e.to_string())?;
+                checked.fetch_add(1, Ordering::Relaxed);
+                Ok(())
+            }));
+
+            let slot = acquire_slot(&up.inner, "g").await.unwrap();
+            let (_session, mut guard) = StdioSession::spawn(&up.inner, "g".into(), 0, slot)
+                .await
+                .unwrap();
+            assert_eq!(checks.load(Ordering::Relaxed), 2);
+            let pids = wait_tree(dir.path());
+            let leader = process_handle(pids[0]);
+            let helper = process_handle(pids[1]);
+            assert_eq!(up.inner.table.lock().unwrap().reserved_slots, 1);
+            guard.terminate_now().await;
+            assert_exited(&leader);
+            assert_exited(&helper);
+            assert_empty(&up);
+            let reused = acquire_slot(&up.inner, "next")
+                .await
+                .expect("reaped slot must be reusable");
+            drop(reused);
+            up.shutdown().await;
+            assert_empty(&up);
+        }
+
+        #[tokio::test]
+        async fn failed_assignment_or_resume_reaps_child_and_releases_slot() {
+            for stage in [
+                WindowsSpawnStage::BeforeAssign,
+                WindowsSpawnStage::BeforeResume,
+            ] {
+                let dir = tempfile::tempdir().unwrap();
+                let up = upstream(dir.path());
+                let child_handle = Arc::new(Mutex::new(None));
+                let observed = Arc::clone(&child_handle);
+                *up.inner.spawn_hook.lock().unwrap() = Some(Box::new(move |at, _job, child| {
+                    if at != stage {
+                        return Ok(());
+                    }
+                    *observed.lock().unwrap() = Some(process_handle(child.id().unwrap()));
+                    if stage == WindowsSpawnStage::BeforeAssign {
+                        // Exercise the real assignment error, then the production failure cleanup.
+                        WindowsJobObject(std::ptr::null_mut()).assign(child)
+                    } else {
+                        Err("injected ResumeThread failure".to_owned())
+                    }
+                }));
+                let slot = acquire_slot(&up.inner, "g").await.unwrap();
+                let result = StdioSession::spawn(&up.inner, "g".into(), 0, slot).await;
+                assert!(result.is_err());
+                assert_exited(child_handle.lock().unwrap().as_ref().unwrap());
+                assert!(!dir.path().join("tree.json").exists());
+                assert_empty(&up);
+                up.shutdown().await;
+            }
+        }
+
+        #[tokio::test]
+        async fn cancelled_failed_spawn_keeps_slot_and_shutdown_waits_for_reap() {
+            let dir = tempfile::tempdir().unwrap();
+            let up = Arc::new(upstream(dir.path()));
+            let process = Arc::new(Mutex::new(None));
+            let observed = Arc::clone(&process);
+            *up.inner.spawn_hook.lock().unwrap() = Some(Box::new(move |stage, _job, child| {
+                if stage == WindowsSpawnStage::BeforeAssign {
+                    *observed.lock().unwrap() = Some(process_handle(child.id().unwrap()));
+                    return Err("injected assignment failure".into());
+                }
+                Ok(())
+            }));
+            let (entered, waiting) = oneshot::channel();
+            let (resume, gate) = oneshot::channel();
+            *up.inner.failed_spawn_reap_gate.lock().unwrap() = Some((entered, gate));
+            let slot = acquire_slot(&up.inner, "g").await.unwrap();
+            let spawning = Arc::clone(&up.inner);
+            let caller =
+                tokio::spawn(
+                    async move { StdioSession::spawn(&spawning, "g".into(), 0, slot).await },
+                );
+            tokio::time::timeout(Duration::from_secs(5), waiting)
+                .await
+                .unwrap()
+                .unwrap();
+            caller.abort();
+            let _ = caller.await;
+            {
+                let table = up.inner.table.lock().unwrap();
+                assert_eq!(table.reserved_slots, 0);
+                assert_eq!(table.terminating_slots, 1);
+                assert_eq!(table.used_slots(), 1);
+                assert!(table.live_sessions.is_empty());
+            }
+            let stopping = Arc::clone(&up);
+            let shutdown = tokio::spawn(async move { stopping.shutdown().await });
+            tokio::time::timeout(Duration::from_secs(1), async {
+                while !up.inner.table.lock().unwrap().shutting_down {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .unwrap();
+            assert!(
+                !shutdown.is_finished(),
+                "shutdown must await the paused reaper"
+            );
+            resume.send(()).unwrap();
+            tokio::time::timeout(Duration::from_secs(5), shutdown)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_exited(process.lock().unwrap().as_ref().unwrap());
+            assert_empty(&up);
+        }
+
+        #[tokio::test]
+        async fn failed_start_after_resume_also_reaps_descendants() {
+            let dir = tempfile::tempdir().unwrap();
+            let up = upstream(dir.path());
+            let marker_dir = dir.path().to_owned();
+            let processes = Arc::new(Mutex::new(Vec::new()));
+            let observed = Arc::clone(&processes);
+            *up.inner.spawn_hook.lock().unwrap() = Some(Box::new(move |stage, _job, child| {
+                if stage == WindowsSpawnStage::BeforeResume {
+                    resume_windows_child(child)?;
+                    let pids = wait_tree(&marker_dir);
+                    *observed.lock().unwrap() = pids.into_iter().map(process_handle).collect();
+                    return Err("injected failure after partial resume".to_owned());
+                }
+                Ok(())
+            }));
+            let slot = acquire_slot(&up.inner, "g").await.unwrap();
+            assert!(
+                StdioSession::spawn(&up.inner, "g".into(), 0, slot)
+                    .await
+                    .is_err()
+            );
+            {
+                let handles = processes.lock().unwrap();
+                assert_eq!(handles.len(), 2);
+                for process in handles.iter() {
+                    assert_exited(process);
+                }
+            }
+            assert_empty(&up);
+            up.shutdown().await;
+        }
+    }
+
+    #[tokio::test]
+    async fn shutdown_does_not_wait_for_a_retained_ephemeral_response_guard() {
+        let up = StdioUpstream::new(StdioUpstreamSettings {
+            command: if cfg!(windows) { "python" } else { "python3" }.into(),
+            args: vec!["-c".into(), "import time; time.sleep(10)".into()],
+            env: std::collections::BTreeMap::new(),
+            cwd: None,
+            max_sessions: 1,
+            session_idle_secs: 60,
+        })
+        .unwrap();
+        let slot = acquire_slot(&up.inner, "g").await.unwrap();
+        let (session, guard) = StdioSession::spawn(&up.inner, "g".into(), 0, slot)
+            .await
+            .unwrap();
+        assert_eq!(up.inner.table.lock().unwrap().pending_spawns, 0);
+        // A downstream may retain its response body after shutdown has reaped the process.
+        let stopped = tokio::time::timeout(Duration::from_secs(3), up.shutdown()).await;
+        let child_reaped = session.child.lock().await.is_none();
+        drop(guard);
+        up.shutdown().await;
+        assert!(
+            stopped.is_ok(),
+            "a retained response guard must not block shutdown"
+        );
+        assert!(child_reaped);
+        let table = up.inner.table.lock().unwrap();
+        assert_eq!(table.used_slots(), 0);
+        assert!(table.live_sessions.is_empty());
     }
 
     #[cfg(unix)]

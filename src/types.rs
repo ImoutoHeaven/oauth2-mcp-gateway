@@ -1,4 +1,4 @@
-use bytes::{Bytes, BytesMut};
+use bytes::Bytes;
 use http::{Response, StatusCode, header};
 use http_body::{Body, Frame, SizeHint};
 use http_body_util::{BodyExt, Full, combinators::BoxBody};
@@ -100,7 +100,7 @@ impl ByteLease {
         self.shrink_to(0);
     }
 
-    // Releases all held bytes on failure so streaming callers never hold partial budget.
+    // Keep the old lease until the caller frees its buffer after a failed growth.
     pub fn try_reserve(&mut self, target_bytes: usize) -> bool {
         if target_bytes <= self.held {
             self.shrink_to(target_bytes);
@@ -111,9 +111,44 @@ impl ByteLease {
             self.held = target_bytes;
             true
         } else {
-            self.release();
             false
         }
+    }
+
+    pub(crate) fn reserve_vec(
+        &mut self,
+        buffer: &mut Vec<u8>,
+        needed: usize,
+        max_capacity: usize,
+    ) -> bool {
+        if needed > max_capacity {
+            return false;
+        }
+        let target = if needed <= buffer.capacity() {
+            buffer.capacity()
+        } else {
+            let preferred = buffer
+                .capacity()
+                .saturating_mul(2)
+                .max(needed)
+                .min(max_capacity);
+            let available = self
+                .budget
+                .limit()
+                .saturating_sub(self.budget.used())
+                .saturating_add(self.held);
+            if preferred <= available {
+                preferred
+            } else {
+                needed
+            }
+        };
+        if !self.try_reserve(target) {
+            return false;
+        }
+        buffer.reserve_exact(target.saturating_sub(buffer.len()));
+        debug_assert!(buffer.capacity() <= self.held);
+        true
     }
 }
 
@@ -126,12 +161,135 @@ impl Drop for ByteLease {
     }
 }
 
+struct LeasedBytes {
+    payload: Vec<u8>,
+    _lease: ByteLease,
+}
+
+impl AsRef<[u8]> for LeasedBytes {
+    fn as_ref(&self) -> &[u8] {
+        &self.payload
+    }
+}
+
+pub(crate) fn leased_bytes(payload: Vec<u8>, lease: Option<ByteLease>) -> Bytes {
+    match lease {
+        Some(lease) => Bytes::from_owner(LeasedBytes {
+            payload,
+            _lease: lease,
+        }),
+        None => Bytes::from(payload),
+    }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum ReadBodyError {
+    TooLarge,
+    Invalid,
+    Overloaded,
+}
+
+/// Accumulate only after reserving the allocation; returned slices keep its lease.
+pub(crate) async fn read_bounded_body<B>(
+    mut body: B,
+    budget: &Arc<ByteBudget>,
+    limit: usize,
+) -> Result<Bytes, ReadBodyError>
+where
+    B: Body<Data = Bytes> + Unpin,
+{
+    // On cancellation, field order frees the buffer before returning its byte lease.
+    let mut owned = LeasedBytes {
+        payload: Vec::new(),
+        _lease: budget.try_acquire(0).expect("empty byte lease"),
+    };
+    while let Some(frame) = body.frame().await {
+        let frame = frame.map_err(|_| ReadBodyError::Invalid)?;
+        let Ok(data) = frame.into_data() else {
+            continue;
+        };
+        let Some(needed) = owned
+            .payload
+            .len()
+            .checked_add(data.len())
+            .filter(|&n| n <= limit)
+        else {
+            return Err(ReadBodyError::TooLarge);
+        };
+        if !owned._lease.reserve_vec(&mut owned.payload, needed, limit) {
+            return Err(ReadBodyError::Overloaded);
+        }
+        owned.payload.extend_from_slice(&data);
+    }
+    Ok(Bytes::from_owner(owned))
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum JsonEncodeError {
+    Invalid,
+    Overloaded,
+}
+
+pub(crate) fn json_encoded_len<T: serde::Serialize + ?Sized>(
+    value: &T,
+) -> Result<usize, serde_json::Error> {
+    struct Counter(usize);
+    impl io::Write for Counter {
+        fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+            self.0 = self
+                .0
+                .checked_add(bytes.len())
+                .ok_or_else(|| io::Error::other("JSON length overflow"))?;
+            Ok(bytes.len())
+        }
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+    let mut counter = Counter(0);
+    serde_json::to_writer(&mut counter, value)?;
+    Ok(counter.0)
+}
+
+/// The counting pass allocates no payload; encoding begins only after admission.
+pub(crate) fn encode_json_leased<T: serde::Serialize + ?Sized>(
+    value: &T,
+    suffix: &[u8],
+    budget: &Arc<ByteBudget>,
+) -> Result<(Vec<u8>, ByteLease), JsonEncodeError> {
+    let len = json_encoded_len(value)
+        .map_err(|_| JsonEncodeError::Invalid)?
+        .checked_add(suffix.len())
+        .ok_or(JsonEncodeError::Overloaded)?;
+    let mut owned = LeasedBytes {
+        payload: Vec::new(),
+        _lease: budget.try_acquire(len).ok_or(JsonEncodeError::Overloaded)?,
+    };
+    if !owned._lease.reserve_vec(&mut owned.payload, len, len) {
+        return Err(JsonEncodeError::Overloaded);
+    }
+    serde_json::to_writer(&mut owned.payload, value).map_err(|_| JsonEncodeError::Invalid)?;
+    owned.payload.extend_from_slice(suffix);
+    debug_assert_eq!(owned.payload.len(), len);
+    Ok((owned.payload, owned._lease))
+}
+
+pub(crate) fn request_overloaded_reply() -> HttpReply {
+    Response::builder()
+        .status(StatusCode::SERVICE_UNAVAILABLE)
+        .header(header::CONTENT_TYPE, "text/plain; charset=utf-8")
+        .header(header::CACHE_CONTROL, "no-store")
+        .header(header::CONNECTION, "close")
+        .body(bytes_body(Bytes::from_static(
+            b"process active byte budget exceeded",
+        )))
+        .expect("valid overload reply")
+}
+
 pub(crate) struct LeasedFrameCursor {
     prefix: &'static [u8],
-    payload: Vec<u8>,
-    offset: usize,
+    payload: Bytes,
     suffix: &'static [u8],
-    lease: Option<ByteLease>,
     done: bool,
 }
 
@@ -144,10 +302,8 @@ impl LeasedFrameCursor {
     ) -> Self {
         Self {
             prefix,
-            payload,
-            offset: 0,
+            payload: leased_bytes(payload, lease),
             suffix,
-            lease,
             done: false,
         }
     }
@@ -156,66 +312,34 @@ impl LeasedFrameCursor {
         self.done
     }
 
-    fn finish_and_release(&mut self) {
-        self.prefix = b"";
-        self.payload = Vec::new();
-        self.offset = 0;
-        self.suffix = b"";
-        self.done = true;
-        self.lease = None;
-    }
-
     pub(crate) fn next_frame(&mut self) -> Option<Frame<Bytes>> {
         if self.done {
             return None;
         }
-        let rem_payload = self.payload.len().saturating_sub(self.offset);
-        let rem_total = self.prefix.len() + rem_payload + self.suffix.len();
-        if rem_total == 0 {
-            self.finish_and_release();
-            return None;
-        }
-        if rem_total <= STREAM_CHUNK_BYTES {
-            let out = if self.prefix.is_empty() && self.suffix.is_empty() {
-                if self.offset == 0
-                    && self.lease.is_none()
-                    && self.payload.capacity() <= STREAM_CHUNK_BYTES
-                {
-                    Bytes::from(std::mem::take(&mut self.payload))
-                } else {
-                    Bytes::copy_from_slice(&self.payload[self.offset..])
-                }
-            } else {
-                let mut buf = BytesMut::with_capacity(rem_total);
-                buf.extend_from_slice(self.prefix);
-                buf.extend_from_slice(&self.payload[self.offset..]);
-                buf.extend_from_slice(self.suffix);
-                buf.freeze()
-            };
-            self.finish_and_release();
-            return Some(Frame::data(out));
-        }
         if !self.prefix.is_empty() {
-            let take = (STREAM_CHUNK_BYTES - self.prefix.len()).min(rem_payload);
-            let mut buf = BytesMut::with_capacity(self.prefix.len() + take);
-            buf.extend_from_slice(self.prefix);
-            buf.extend_from_slice(&self.payload[self.offset..self.offset + take]);
-            self.prefix = b"";
-            self.offset += take;
-            return Some(Frame::data(buf.freeze()));
+            return Some(Frame::data(Bytes::from_static(std::mem::take(
+                &mut self.prefix,
+            ))));
         }
-        if rem_payload > STREAM_CHUNK_BYTES {
-            let end = self.offset + STREAM_CHUNK_BYTES;
-            let chunk = Bytes::copy_from_slice(&self.payload[self.offset..end]);
-            self.offset = end;
+        if !self.payload.is_empty() {
+            let chunk = self
+                .payload
+                .split_to(self.payload.len().min(STREAM_CHUNK_BYTES));
+            if self.payload.is_empty() {
+                self.payload = Bytes::new();
+                self.done = self.suffix.is_empty();
+            }
             return Some(Frame::data(chunk));
         }
-        let out = Bytes::copy_from_slice(&self.payload[self.offset..]);
-        self.offset = self.payload.len();
+        self.payload = Bytes::new();
+        self.done = true;
         if self.suffix.is_empty() {
-            self.finish_and_release();
+            None
+        } else {
+            Some(Frame::data(Bytes::from_static(std::mem::take(
+                &mut self.suffix,
+            ))))
         }
-        Some(Frame::data(out))
     }
 }
 
@@ -328,53 +452,150 @@ pub fn hex_nibble(b: u8) -> Option<u8> {
 mod tests {
     use super::*;
 
+    struct RequestChunks {
+        chunks: std::collections::VecDeque<Bytes>,
+        pending: bool,
+    }
+
+    impl Body for RequestChunks {
+        type Data = Bytes;
+        type Error = io::Error;
+
+        fn poll_frame(
+            mut self: Pin<&mut Self>,
+            _: &mut Context<'_>,
+        ) -> Poll<Option<Result<Frame<Bytes>, io::Error>>> {
+            match self.chunks.pop_front() {
+                Some(bytes) => Poll::Ready(Some(Ok(Frame::data(bytes)))),
+                None if self.pending => Poll::Pending,
+                None => Poll::Ready(None),
+            }
+        }
+    }
+
+    fn request_chunks(chunks: &[&'static [u8]], pending: bool) -> RequestChunks {
+        RequestChunks {
+            chunks: chunks
+                .iter()
+                .map(|bytes| Bytes::from_static(bytes))
+                .collect(),
+            pending,
+        }
+    }
+
+    #[tokio::test]
+    async fn request_body_keeps_capacity_charged_through_forwarded_bytes() {
+        let budget = ByteBudget::new(16);
+        let bytes = read_bounded_body(request_chunks(&[b"a", b"bc", b"d"], false), &budget, 16)
+            .await
+            .unwrap();
+        assert_eq!(&bytes[..], b"abcd");
+        assert_eq!(budget.used(), 6, "growth spare capacity remains charged");
+        let forwarded = bytes.slice(1..);
+        drop(bytes);
+        assert_eq!(budget.used(), 6);
+        assert!(budget.try_acquire(11).is_none());
+        drop(forwarded);
+        assert_eq!(budget.used(), 0);
+    }
+
+    #[tokio::test]
+    async fn request_body_releases_partial_reads_and_preserves_empty_control_bodies() {
+        let budget = ByteBudget::new(1);
+        assert!(matches!(
+            read_bounded_body(request_chunks(&[b"{", b"}"], false), &budget, 2).await,
+            Err(ReadBodyError::Overloaded),
+        ));
+        assert_eq!(budget.used(), 0);
+        let occupied = budget.try_acquire(1).unwrap();
+        assert!(
+            read_bounded_body(request_chunks(&[], false), &budget, 2)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(budget.used(), 1);
+        drop(occupied);
+
+        let mut pending = Box::pin(read_bounded_body(request_chunks(&[b"{"], true), &budget, 2));
+        let waiting = std::future::poll_fn(|cx| {
+            Poll::Ready(std::future::Future::poll(pending.as_mut(), cx).is_pending())
+        })
+        .await;
+        assert!(waiting);
+        assert_eq!(budget.used(), 1);
+        drop(pending);
+        assert_eq!(budget.used(), 0);
+
+        assert!(matches!(
+            read_bounded_body(request_chunks(&[b"{}"], false), &budget, 1).await,
+            Err(ReadBodyError::TooLarge),
+        ));
+        assert_eq!(budget.used(), 0);
+    }
+
     #[test]
-    fn leased_frame_cursor_copies_independent_chunks_and_frees_vec_with_lease_on_final_chunk() {
-        let len = 150 * 1024;
-        let budget = ByteBudget::new(256 * 1024);
-        let lease = ByteBudget::try_acquire(&budget, len).unwrap();
-        let mut cursor = LeasedFrameCursor::new(b"data: ", vec![b'Q'; len], b"\n\n", Some(lease));
-
-        let mut held_frames = Vec::new();
-        // First two 64 KiB frames leave ~22 KiB + "\n\n" remaining; Vec and lease must remain active.
-        for _ in 0..2 {
-            let frame = cursor.next_frame().unwrap();
-            held_frames.push(frame);
-            assert!(!cursor.is_done());
-            assert!(cursor.payload.capacity() >= len);
-            assert_eq!(budget.used(), len);
-        }
-
-        // Taking the final chunk frees `payload` (capacity == 0) and drops `lease` synchronously,
-        // even while earlier `Frame<Bytes>` items stay pinned in a downstream write queue.
-        let last = cursor.next_frame().unwrap();
-        held_frames.push(last);
-        assert!(cursor.is_done());
-        assert_eq!(cursor.payload.capacity(), 0);
+    fn request_json_encoding_admits_exact_length_before_allocating() {
+        let value = serde_json::json!({"text": "hello\n世界"});
+        let len = json_encoded_len(&value).unwrap() + 1;
+        let budget = ByteBudget::new(len);
+        let occupied = budget.try_acquire(1).unwrap();
+        assert!(matches!(
+            encode_json_leased(&value, b"\n", &budget),
+            Err(JsonEncodeError::Overloaded),
+        ));
+        assert_eq!(budget.used(), 1);
+        drop(occupied);
+        let (bytes, lease) = encode_json_leased(&value, b"\n", &budget).unwrap();
+        assert_eq!(bytes.len(), len);
+        assert_eq!(bytes.capacity(), budget.used());
+        let forwarded = leased_bytes(bytes, Some(lease));
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(&forwarded).unwrap(),
+            value
+        );
+        assert_eq!(budget.used(), len);
+        drop(forwarded);
         assert_eq!(budget.used(), 0);
-        assert!(cursor.next_frame().is_none());
+    }
 
-        let mut assembled = Vec::new();
-        for f in held_frames {
-            assembled.extend_from_slice(&f.into_data().unwrap());
+    #[test]
+    fn returned_frames_keep_allocated_capacity_leased() {
+        let payload = vec![b'X'; 150 * 1024];
+        let budget = ByteBudget::new(payload.capacity());
+        let lease = budget.try_acquire(payload.capacity()).unwrap();
+        let mut cursor = LeasedFrameCursor::new(b"data: ", payload, b"\n\n", Some(lease));
+        let mut frames = Vec::new();
+        while let Some(frame) = cursor.next_frame() {
+            frames.push(frame);
         }
-        assert_eq!(assembled.len(), 6 + len + 2);
-        assert!(assembled.starts_with(b"data: QQQQ"));
-        assert!(assembled.ends_with(b"QQQQ\n\n"));
-
-        // Boundary split where payload finishes in frame 2 (`65535` B left) and `"\n\n"` lands in frame 3.
-        let split_len = (STREAM_CHUNK_BYTES - 6) + (STREAM_CHUNK_BYTES - 1);
-        let split_lease = ByteBudget::try_acquire(&budget, split_len).unwrap();
-        let mut split_cursor =
-            LeasedFrameCursor::new(b"data: ", vec![b'R'; split_len], b"\n\n", Some(split_lease));
-        let _f1 = split_cursor.next_frame().unwrap();
-        let _f2 = split_cursor.next_frame().unwrap();
-        assert!(!split_cursor.is_done());
-        assert_eq!(budget.used(), split_len);
-        let f3 = split_cursor.next_frame().unwrap();
-        assert_eq!(&f3.into_data().unwrap()[..], b"\n\n");
-        assert!(split_cursor.is_done());
-        assert_eq!(split_cursor.payload.capacity(), 0);
+        assert_eq!(budget.used(), budget.limit());
+        assert!(budget.try_acquire(1).is_none());
+        drop(cursor);
+        assert_eq!(budget.used(), budget.limit());
+        drop(frames);
         assert_eq!(budget.used(), 0);
+    }
+
+    #[test]
+    fn leased_frame_cursor_preserves_sse_bytes_and_bounds_each_frame() {
+        for len in [0, STREAM_CHUNK_BYTES - 1, 2 * STREAM_CHUNK_BYTES + 1] {
+            let budget = ByteBudget::new(len);
+            let lease = budget.try_acquire(len).unwrap();
+            let mut cursor =
+                LeasedFrameCursor::new(b"data: ", vec![b'Q'; len], b"\n\n", Some(lease));
+            let mut assembled = Vec::new();
+            while let Some(frame) = cursor.next_frame() {
+                let bytes = frame.into_data().unwrap();
+                assert!(bytes.len() <= STREAM_CHUNK_BYTES);
+                assembled.extend_from_slice(&bytes);
+            }
+            assert!(cursor.is_done());
+            assert_eq!(budget.used(), 0);
+            assert_eq!(
+                assembled,
+                [b"data: ".as_slice(), &vec![b'Q'; len], b"\n\n"].concat()
+            );
+        }
     }
 }

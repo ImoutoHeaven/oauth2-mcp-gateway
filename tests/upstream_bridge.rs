@@ -1335,6 +1335,106 @@ fn build_stdio_upstream(
 }
 
 #[tokio::test]
+async fn stdio_late_cancellation_does_not_cancel_an_unrelated_wire_id() {
+    let tmp = TempDir::new().unwrap();
+    let script = write_mock_mcp_python_script(tmp.path());
+    let upstream = build_stdio_upstream(&script, tmp.path(), 1);
+    let bridge = Arc::clone(&upstream);
+    let (addr, stop) = spawn_http1_harness(move |req| {
+        let bridge = Arc::clone(&bridge);
+        async move { bridge.handle_mcp(req, &make_token("cancel", 0)).await }
+    })
+    .await;
+    let client = make_client();
+    let post = |sid: Option<&str>, accept: &str, payload: Value| {
+        let mut req = Request::builder()
+            .method(Method::POST)
+            .uri(format!("http://{addr}/mcp"))
+            .header(header::CONTENT_TYPE, "application/json")
+            .header(header::ACCEPT, accept);
+        if let Some(sid) = sid {
+            req = req.header("mcp-session-id", sid);
+        }
+        client.request(req.body(bytes_body(payload.to_string())).unwrap())
+    };
+
+    let init = post(
+        None,
+        "application/json",
+        json!({"jsonrpc":"2.0","id":"init","method":"initialize","params":{}}),
+    )
+    .await
+    .unwrap();
+    assert_eq!(init.status(), StatusCode::OK);
+    let sid = init.headers()["mcp-session-id"]
+        .to_str()
+        .unwrap()
+        .to_owned();
+    let _ = init.into_body().collect().await.unwrap();
+
+    let finished = post(
+        Some(&sid),
+        "application/json",
+        json!({"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"bump"}}),
+    )
+    .await
+    .unwrap();
+    let _ = finished.into_body().collect().await.unwrap();
+
+    let active = post(
+        Some(&sid),
+        "text/event-stream",
+        json!({"jsonrpc":"2.0","id":"next","method":"tools/call","params":{"name":"hang_until_cancel","_meta":{"progressToken":"next-progress"}}}),
+    )
+    .await
+    .unwrap();
+    let mut body = active.into_body();
+    tokio::time::timeout(Duration::from_secs(5), async {
+        let mut received = Vec::new();
+        while !String::from_utf8_lossy(&received).contains("notifications/progress") {
+            received.extend_from_slice(&body.frame().await.unwrap().unwrap().into_data().unwrap());
+        }
+    })
+    .await
+    .unwrap();
+
+    for (request_id, expected_cancellations) in [(json!(3), 0), (json!("next"), 1)] {
+        let cancelled = post(
+            Some(&sid),
+            "application/json",
+            json!({"jsonrpc":"2.0","method":"notifications/cancelled","params":{"requestId":request_id}}),
+        )
+        .await
+        .unwrap();
+        assert_eq!(cancelled.status(), StatusCode::ACCEPTED);
+        let _ = cancelled.into_body().collect().await.unwrap();
+
+        // This reply confirms the child processed every earlier stdin message.
+        let barrier = post(
+            Some(&sid),
+            "application/json",
+            json!({"jsonrpc":"2.0","id":"barrier","method":"tools/call","params":{"name":"bump"}}),
+        )
+        .await
+        .unwrap();
+        let _ = barrier.into_body().collect().await.unwrap();
+        let cancellations =
+            std::fs::read_to_string(tmp.path().join("cancelled.jsonl")).unwrap_or_default();
+        let messages: Vec<Value> = cancellations
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        assert_eq!(messages.len(), expected_cancellations);
+        if let Some(message) = messages.first() {
+            assert_eq!(message["params"]["requestId"], 3);
+        }
+    }
+    drop(body);
+    upstream.shutdown().await;
+    stop.cancel();
+}
+
+#[tokio::test]
 async fn stdio_isolation_grant_binding_schema_progress_cancel_delete_and_sessionless() {
     let tmp = TempDir::new().unwrap();
     let script_path = write_mock_mcp_python_script(tmp.path());
@@ -3850,6 +3950,15 @@ for raw_line in sys.stdin.buffer:
             if w_gate and w_cnt > 0:
                 with waiter_cond:
                     waiter_cond.wait_for(lambda: gate_waiter_counts.get(w_gate, 0) >= w_cnt, timeout=10.0)
+            ready_file = a.get("ready_file")
+            release_file = a.get("release_file")
+            if ready_file:
+                with open(ready_file, "w", encoding="utf-8") as ready:
+                    ready.write("ready")
+            if release_file:
+                deadline = time.monotonic() + 10.0
+                while not os.path.exists(release_file) and time.monotonic() < deadline:
+                    time.sleep(0.01)
             target = int(a["target_bytes"])
             bad_line = build_tail_id_line(rid, target)
             follow = (json.dumps({"jsonrpc": "2.0", "id": rid, "result": {"should_never_arrive": True}}, separators=(",", ":")) + "\n").encode("utf-8")
@@ -4138,12 +4247,9 @@ async fn stdio_midline_hard_reject_terminates_session_and_notifies_json_and_sse_
     let script = write_multimodal_stdio_mock_script(tmp.path());
 
     for scenario in ["midline_method", "oversized_line", "budget_exhausted"] {
-        let budget = ByteBudget::new(2048);
-        let held_lease = if scenario == "budget_exhausted" {
-            Some(ByteBudget::try_acquire(&budget, 1800).unwrap())
-        } else {
-            None
-        };
+        let budget = ByteBudget::new(16 * 1024);
+        let ready_file = tmp.path().join("response_ready");
+        let release_file = tmp.path().join("response_release");
 
         let stdio_up = Arc::new(
             StdioUpstream::with_limits(
@@ -4283,27 +4389,39 @@ async fn stdio_midline_hard_reject_terminates_session_and_notifies_json_and_sse_
                 "params": {
                     "name": "trigger_oversized_line_then_valid",
                     "arguments": {
-                        "target_bytes": 700,
+                        "target_bytes": 1536,
                         "wait_for_gate": "g1",
-                        "expected_waiters": 2
+                        "expected_waiters": 2,
+                        "ready_file": ready_file,
+                        "release_file": release_file
                     }
                 }
             }),
         };
 
-        let trig_resp = client
-            .request(
-                Request::builder()
-                    .method(Method::POST)
-                    .uri(format!("http://{gw_addr}/mcp"))
-                    .header("mcp-session-id", &sid)
-                    .header(header::ACCEPT, "application/json")
-                    .header(header::CONTENT_TYPE, "application/json")
-                    .body(bytes_body(trigger_body.to_string()))
-                    .unwrap(),
-            )
-            .await
+        let trig_request = Request::builder()
+            .method(Method::POST)
+            .uri(format!("http://{gw_addr}/mcp"))
+            .header("mcp-session-id", &sid)
+            .header(header::ACCEPT, "application/json")
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(bytes_body(trigger_body.to_string()))
             .unwrap();
+        let trig_client = client.clone();
+        let trigger = tokio::spawn(async move { trig_client.request(trig_request).await.unwrap() });
+        let held_lease = if scenario == "budget_exhausted" {
+            // Admit all ordinary requests and their correlated error buffers first.
+            // The child then waits while this test leaves only a small output allowance.
+            wait_until(|| ready_file.exists()).await;
+            let held = budget
+                .try_acquire(budget.limit() - budget.used() - 64)
+                .unwrap();
+            std::fs::write(&release_file, b"release").unwrap();
+            Some(held)
+        } else {
+            None
+        };
+        let trig_resp = trigger.await.unwrap();
         let trig_status = trig_resp.status();
         let trig_val: Value =
             serde_json::from_slice(&trig_resp.into_body().collect().await.unwrap().to_bytes())
@@ -4374,6 +4492,8 @@ async fn stdio_midline_hard_reject_terminates_session_and_notifies_json_and_sse_
         );
 
         assert!(wait_process_gone(child_pid).await);
+        drop(held_lease);
+        assert_eq!(budget.used(), 0);
 
         let after_resp = client
             .request(
@@ -4391,7 +4511,6 @@ async fn stdio_midline_hard_reject_terminates_session_and_notifies_json_and_sse_
             .unwrap();
         assert_eq!(after_resp.status(), StatusCode::NOT_FOUND);
 
-        drop(held_lease);
         assert_eq!(budget.used(), 0);
         stdio_up.shutdown().await;
         gw_cancel.cancel();
@@ -4883,8 +5002,9 @@ async fn stdio_complete_line_discard_notif_byte_budget_and_slow_receiver_backpre
                 .await;
         });
 
-        // Wait deterministically until background stdout reader acquires the 32 KiB half-line lease.
-        wait_until(|| budget.used() == 32 * 1024).await;
+        // The raw allocation and this active request's metadata are both charged.
+        // After cancellation below, only the exact 32 KiB reader allocation remains.
+        wait_until(|| budget.used() > 32 * 1024).await;
 
         // Cancel caller and wait deterministically until child receives `notifications/cancelled` (wire_id = 4 on ctrl_sid: 1=init, 2=ctrl-ok, 3=after-drain, 4=cancel-mid-line).
         cancel_task.abort();
@@ -4945,8 +5065,7 @@ async fn stdio_complete_line_discard_notif_byte_budget_and_slow_receiver_backpre
 }
 
 #[tokio::test]
-async fn stdio_unsolicited_large_output_sessionless_hard_rejects_and_tight_budget_inplace_id_rewrite()
- {
+async fn stdio_unsolicited_large_output_sessionless_hard_rejects() {
     let tmp = TempDir::new().unwrap();
     let script = write_multimodal_stdio_mock_script(tmp.path());
 
@@ -5184,139 +5303,139 @@ async fn stdio_unsolicited_large_output_sessionless_hard_rejects_and_tight_budge
         stdio_up.shutdown().await;
         gw_cancel.cancel();
     }
+}
 
-    // 4. Tight process budget in-place `id` rewrite: 39,970 B line expanded by 31-byte client `id` to exact 40,000 B budget passes (1.0x buffer, zero 2x AST); 39,971 B -> 40,001 B fails with 503.
-    {
-        let tight_limit = 40_000usize;
-        let budget = ByteBudget::new(tight_limit);
-        let stdio_up = Arc::new(
-            StdioUpstream::with_limits(
-                StdioUpstreamSettings {
-                    command: python_executable().to_owned(),
-                    args: vec!["-u".to_owned(), script.to_str().unwrap().to_owned()],
-                    env: BTreeMap::new(),
-                    cwd: Some(tmp.path().to_path_buf()),
-                    max_sessions: 4,
-                    session_idle_secs: 30,
-                },
-                Arc::clone(&budget),
-                StdioLimits {
-                    max_stdout_line_bytes: 60_000,
-                    max_control_line_bytes: 512,
-                    max_notif_queue_bytes: 4096,
-                    ..StdioLimits::default()
-                },
-            )
-            .unwrap(),
-        );
-        let up_ref = Arc::clone(&stdio_up);
-        let (gw_addr, gw_cancel) = spawn_http1_harness(move |req: Request<Incoming>| {
-            let up = Arc::clone(&up_ref);
-            async move { up.handle_mcp(req, &make_token("grant-tight", 0)).await }
-        })
-        .await;
+#[tokio::test]
+async fn stdio_request_and_rewrite_buffers_share_the_process_budget() {
+    let tmp = TempDir::new().unwrap();
+    let script = write_multimodal_stdio_mock_script(tmp.path());
 
-        let client = make_client();
-        let init_resp = client
-            .request(
-                Request::builder()
-                    .method(Method::POST)
-                    .uri(format!("http://{gw_addr}/mcp"))
-                    .header(header::CONTENT_TYPE, "application/json")
-                    .body(bytes_body(
-                        r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}"#,
-                    ))
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        let sid = init_resp
-            .headers()
-            .get("mcp-session-id")
-            .unwrap()
-            .to_str()
-            .unwrap()
-            .to_owned();
-        let _ = init_resp.into_body().collect().await.unwrap();
+    let response_len = 40_000usize;
+    // Ingress values, retained IDs, and the correlated error workspace share this pool.
+    // The unit test isolates the exact 40,000/40,001-byte rewrite allowance.
+    let budget = ByteBudget::new(response_len + 4096);
+    let stdio_up = Arc::new(
+        StdioUpstream::with_limits(
+            StdioUpstreamSettings {
+                command: python_executable().to_owned(),
+                args: vec!["-u".to_owned(), script.to_str().unwrap().to_owned()],
+                env: BTreeMap::new(),
+                cwd: Some(tmp.path().to_path_buf()),
+                max_sessions: 4,
+                session_idle_secs: 30,
+            },
+            Arc::clone(&budget),
+            StdioLimits {
+                max_stdout_line_bytes: 60_000,
+                max_control_line_bytes: 512,
+                max_notif_queue_bytes: 4096,
+                ..StdioLimits::default()
+            },
+        )
+        .unwrap(),
+    );
+    let up_ref = Arc::clone(&stdio_up);
+    let (gw_addr, gw_cancel) = spawn_http1_harness(move |req: Request<Incoming>| {
+        let up = Arc::clone(&up_ref);
+        async move { up.handle_mcp(req, &make_token("grant-tight", 0)).await }
+    })
+    .await;
 
-        // wire_id = 2 ("2" = 1 B) -> client_id = "long-client-id-expanded-by-30b" (serialized JSON = 32 B).
-        // Line 39,970 B (39,969 B without '\n') - 1 + 32 = 40,000 B == tight_limit!
-        let long_cid = "long-client-id-expanded-by-30b";
-        assert_eq!(serde_json::to_vec(&json!(long_cid)).unwrap().len(), 32);
+    let client = make_client();
+    let init_resp = client
+        .request(
+            Request::builder()
+                .method(Method::POST)
+                .uri(format!("http://{gw_addr}/mcp"))
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(bytes_body(
+                    r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}"#,
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let sid = init_resp
+        .headers()
+        .get("mcp-session-id")
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .to_owned();
+    let _ = init_resp.into_body().collect().await.unwrap();
 
-        let exact_fit = client
-            .request(
-                Request::builder()
-                    .method(Method::POST)
-                    .uri(format!("http://{gw_addr}/mcp"))
-                    .header("mcp-session-id", &sid)
-                    .header(header::ACCEPT, "application/json")
-                    .header(header::CONTENT_TYPE, "application/json")
-                    .body(bytes_body(
-                        json!({
-                            "jsonrpc": "2.0",
-                            "id": long_cid,
-                            "method": "tools/call",
-                            "params": {
-                                "name": "exact_tail_id",
-                                "arguments": {"target_bytes": 39_970}
-                            }
-                        })
-                        .to_string(),
-                    ))
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(exact_fit.status(), StatusCode::OK);
-        let exact_bytes = exact_fit.into_body().collect().await.unwrap().to_bytes();
-        assert_eq!(exact_bytes.len(), tight_limit);
-        let exact_val: Value = serde_json::from_slice(&exact_bytes).unwrap();
-        assert_eq!(exact_val["id"], long_cid);
-        assert!(exact_val["result"]["_meta"]["explicit_null"].is_null());
-        assert_eq!(budget.used(), 0);
+    // wire_id = 2 ("2" = 1 B) -> client_id = "long-client-id-expanded-by-30b" (serialized JSON = 32 B).
+    // Line 39,970 B (39,969 B without '\n') - 1 + 32 = 40,000 B.
+    let long_cid = "long-client-id-expanded-by-30b";
+    assert_eq!(serde_json::to_vec(&json!(long_cid)).unwrap().len(), 32);
 
-        // wire_id = 3 ("3" = 1 B): 39,971 B -> rewritten 40,001 B > 40,000 B -> rejected with 503 during in-place splice `try_reserve`, freeing `raw` & keeping session!
-        let plus_one = client
-            .request(
-                Request::builder()
-                    .method(Method::POST)
-                    .uri(format!("http://{gw_addr}/mcp"))
-                    .header("mcp-session-id", &sid)
-                    .header(header::ACCEPT, "application/json")
-                    .header(header::CONTENT_TYPE, "application/json")
-                    .body(bytes_body(
-                        json!({
-                            "jsonrpc": "2.0",
-                            "id": long_cid,
-                            "method": "tools/call",
-                            "params": {
-                                "name": "exact_tail_id",
-                                "arguments": {"target_bytes": 39_971}
-                            }
-                        })
-                        .to_string(),
-                    ))
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(plus_one.status(), StatusCode::SERVICE_UNAVAILABLE);
-        let plus_val: Value =
-            serde_json::from_slice(&plus_one.into_body().collect().await.unwrap().to_bytes())
-                .unwrap();
-        assert_eq!(plus_val["id"], long_cid);
-        assert!(
-            plus_val["error"]["message"]
-                .as_str()
-                .unwrap()
-                .contains("byte budget")
-        );
-        assert_eq!(budget.used(), 0);
+    let exact_fit = client
+        .request(
+            Request::builder()
+                .method(Method::POST)
+                .uri(format!("http://{gw_addr}/mcp"))
+                .header("mcp-session-id", &sid)
+                .header(header::ACCEPT, "application/json")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(bytes_body(
+                    json!({
+                        "jsonrpc": "2.0",
+                        "id": long_cid,
+                        "method": "tools/call",
+                        "params": {
+                            "name": "exact_tail_id",
+                            "arguments": {"target_bytes": 39_970}
+                        }
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(exact_fit.status(), StatusCode::OK);
+    let exact_bytes = exact_fit.into_body().collect().await.unwrap().to_bytes();
+    assert_eq!(exact_bytes.len(), response_len);
+    let exact_val: Value = serde_json::from_slice(&exact_bytes).unwrap();
+    assert_eq!(exact_val["id"], long_cid);
+    assert!(exact_val["result"]["_meta"]["explicit_null"].is_null());
+    assert_eq!(budget.used(), 0);
 
-        stdio_up.shutdown().await;
-        gw_cancel.cancel();
-    }
+    // Both adjacent response lengths fit together with the ordinary request metadata.
+    let plus_one = client
+        .request(
+            Request::builder()
+                .method(Method::POST)
+                .uri(format!("http://{gw_addr}/mcp"))
+                .header("mcp-session-id", &sid)
+                .header(header::ACCEPT, "application/json")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(bytes_body(
+                    json!({
+                        "jsonrpc": "2.0",
+                        "id": long_cid,
+                        "method": "tools/call",
+                        "params": {
+                            "name": "exact_tail_id",
+                            "arguments": {"target_bytes": 39_971}
+                        }
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(plus_one.status(), StatusCode::OK);
+    let plus_bytes = plus_one.into_body().collect().await.unwrap().to_bytes();
+    assert_eq!(plus_bytes.len(), response_len + 1);
+    let plus_val: Value = serde_json::from_slice(&plus_bytes).unwrap();
+    assert_eq!(plus_val["id"], long_cid);
+    assert!(plus_val["result"]["_meta"]["explicit_null"].is_null());
+    assert_eq!(budget.used(), 0);
+
+    stdio_up.shutdown().await;
+    gw_cancel.cancel();
 }
 
 #[tokio::test]
@@ -5347,6 +5466,15 @@ def spam_notifications():
             break
         i += 1
         write_line({"jsonrpc": "2.0", "method": "notifications/message", "params": {"tick": i}})
+
+def hold_until_file(req_id, args):
+    ready_path = args["ready_path"]
+    release_path = args["release_path"]
+    with open(ready_path, "w") as f:
+        f.write("ready")
+    while not os.path.exists(release_path):
+        time.sleep(0.005)
+    write_line({"jsonrpc": "2.0", "id": req_id, "result": {"content": [{"type": "text", "text": "done"}]}})
 
 t = threading.Thread(target=spam_notifications, daemon=True)
 t.start()
@@ -5380,13 +5508,7 @@ for raw in sys.stdin:
         if name == "ping_fast":
             write_line({"jsonrpc": "2.0", "id": req_id, "result": {"content": [{"type": "text", "text": "pong"}]}})
         elif name == "hold_until_file":
-            ready_path = args["ready_path"]
-            release_path = args["release_path"]
-            with open(ready_path, "w") as f:
-                f.write("ready")
-            while not os.path.exists(release_path):
-                time.sleep(0.005)
-            write_line({"jsonrpc": "2.0", "id": req_id, "result": {"content": [{"type": "text", "text": "done"}]}})
+            threading.Thread(target=hold_until_file, args=(req_id, args), daemon=True).start()
 
 stop_flag = True
 "#,
@@ -5544,7 +5666,6 @@ stop_flag = True
         let _ = r.into_body().collect().await.unwrap();
     }
     drop(raw_conn);
-    std::fs::write(&release3, "go").unwrap();
 
     let cancel_marker = cancel_dir.join(format!("cancel_{pid3}"));
     let cancel_deadline = tokio::time::Instant::now() + Duration::from_secs(3);
@@ -5552,6 +5673,7 @@ stop_flag = True
         assert!(tokio::time::Instant::now() < cancel_deadline);
         tokio::time::sleep(Duration::from_millis(5)).await;
     }
+    std::fs::write(&release3, "go").unwrap();
 
     // Immediately (well under 80 ms after disconnect!) initialize sid5: sid3 must be evicted.
     let (_sid5, _pid5) = init_one(5).await;
