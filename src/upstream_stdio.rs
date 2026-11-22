@@ -4883,6 +4883,10 @@ async fn read_stdout_line<R: tokio::io::AsyncBufRead + Unpin>(
         scanner.feed(&available[..take]);
         total_len = new_len;
         reader.consume(take);
+        if newline.is_some() {
+            out.len = total_len;
+            return Ok(out.finish(&scanner));
+        }
         if scanner.saw_method {
             return Err(ReadStdoutErr::Hard(
                 HardRejectError::ControlMessageTooLarge(limits.max_control_line_bytes),
@@ -4894,10 +4898,6 @@ async fn read_stdout_line<R: tokio::io::AsyncBufRead + Unpin>(
             && is_events_waiter(in_flight, wire_id)
         {
             out.discard_buffer();
-        }
-        if newline.is_some() {
-            out.len = total_len;
-            return Ok(out.finish(&scanner));
         }
     }
 }
