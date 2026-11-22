@@ -853,6 +853,18 @@ impl HttpUpstream {
         }
 
         let is_sse = is_event_stream(&up_parts.headers);
+        let filter_priming = is_sse
+            && up_parts
+                .headers
+                .get_all(header::CONTENT_ENCODING)
+                .iter()
+                .all(|value| {
+                    value.to_str().is_ok_and(|encodings| {
+                        encodings
+                            .split(',')
+                            .all(|encoding| encoding.trim_ascii().eq_ignore_ascii_case("identity"))
+                    })
+                });
         let mut reply = Response::builder().status(up_parts.status);
         if let Some(headers) = reply.headers_mut() {
             copy_filtered_headers(&up_parts.headers, headers, false, true);
@@ -865,7 +877,7 @@ impl HttpUpstream {
             );
         }
 
-        let out_body: ReplyBody = if is_sse {
+        let out_body: ReplyBody = if filter_priming {
             GrantBoundBody::new(
                 SsePrimingFilterBody::new(
                     up_body,

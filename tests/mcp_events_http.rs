@@ -715,3 +715,91 @@ async fn http_upstream_events_list_poll_and_sse_stream_passthrough() {
     gw_task.await.unwrap().unwrap();
     up_cancel.cancel();
 }
+
+#[tokio::test]
+async fn http_upstream_preserves_gzip_sse_bytes_and_encoding() {
+    const DATA: &[u8] = b"data: {\"jsonrpc\":\"2.0\",\"id\":7,\"result\":{}}\n\n";
+    // DATA compressed with gzip, using mtime = 0.
+    const GZIP_DATA: &[u8] = &[
+        0x1f, 0x8b, 0x08, 0x00, 0x00, 0x00, 0x00, 0x00, 0x02, 0xff, 0x4b, 0x49, 0x2c, 0x49, 0xb4,
+        0x52, 0xa8, 0x56, 0xca, 0x2a, 0xce, 0xcf, 0x2b, 0x2a, 0x48, 0x56, 0xb2, 0x52, 0x32, 0xd2,
+        0x33, 0x50, 0xd2, 0x51, 0xca, 0x4c, 0x51, 0xb2, 0x32, 0xd7, 0x51, 0x2a, 0x4a, 0x2d, 0x2e,
+        0xcd, 0x29, 0x51, 0xb2, 0xaa, 0xae, 0xad, 0xe5, 0xe2, 0x02, 0x00, 0xb1, 0x75, 0xc9, 0x26,
+        0x2c, 0x00, 0x00, 0x00,
+    ];
+
+    let (up_addr, up_cancel) = spawn_http1_harness(|req: Request<Incoming>| async move {
+        let encoding = req.headers().get(header::ACCEPT_ENCODING).unwrap().clone();
+        let body = req.into_body().collect().await.unwrap().to_bytes();
+        let rpc: Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(rpc["method"], "ping");
+        assert_eq!(rpc["id"], 7);
+        let wire = if encoding == "gzip" {
+            Bytes::from_static(GZIP_DATA)
+        } else {
+            assert_eq!(encoding, "identity");
+            Bytes::from([b": ready\n\n".as_slice(), DATA].concat())
+        };
+        Response::builder()
+            .status(StatusCode::OK)
+            .header(header::CONTENT_TYPE, "text/event-stream")
+            .header(header::CONTENT_ENCODING, encoding)
+            .body(bytes_body(wire))
+            .unwrap()
+    })
+    .await;
+
+    let tmp = TempDir::new().unwrap();
+    let owner_hash = PasswordVerifier::from_plaintext_with_iterations(OWNER_PASSWORD, 10_000)
+        .unwrap()
+        .encode();
+    let cfg = Arc::new(
+        GatewayConfig::from_json_str(
+            &json!({
+                "listen": "127.0.0.1:0",
+                "public_url": PUBLIC_URL,
+                "state_path": "state.json",
+                "oauth": { "owner_password_hash": owner_hash },
+                "upstream": {
+                    "transport": "http",
+                    "url": format!("http://{up_addr}/mcp"),
+                    "bearer_tokens": [UPSTREAM_BEARER],
+                    "request_timeout_secs": 30
+                }
+            })
+            .to_string(),
+            tmp.path(),
+        )
+        .unwrap(),
+    );
+    let (gw_addr, gw_shutdown, gw_task) = spawn_gateway(cfg).await;
+    let client = make_client();
+    let bearer = format!("Bearer {}", authorize_access_token(&client, gw_addr).await);
+
+    for (encoding, expected) in [("gzip", GZIP_DATA), ("identity", DATA)] {
+        let (status, headers, body) = tokio::time::timeout(
+            Duration::from_secs(5),
+            send_http(
+                &client,
+                Method::POST,
+                &format!("http://{gw_addr}/mcp"),
+                &[
+                    ("authorization", &bearer),
+                    ("content-type", "application/json"),
+                    ("accept", "application/json, text/event-stream"),
+                    ("accept-encoding", encoding),
+                ],
+                bytes_body(r#"{"jsonrpc":"2.0","id":7,"method":"ping"}"#),
+            ),
+        )
+        .await
+        .expect("SSE response timeout");
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(headers.get(header::CONTENT_ENCODING).unwrap(), encoding);
+        assert_eq!(body.as_ref(), expected, "Content-Encoding: {encoding}");
+    }
+
+    gw_shutdown.cancel();
+    gw_task.await.unwrap().unwrap();
+    up_cancel.cancel();
+}
