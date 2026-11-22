@@ -1011,9 +1011,14 @@ async fn stdio_events_malformed_and_oversized_completions_fail_stream_and_spare_
         assert_eq!(rel_json["result"]["pid"], shared_pid);
 
         let (bad_next, sib_rest) = tokio::join!(bad_sse.next_event(), sib_sse.collect_all());
+        let Err(bad_err) = bad_next else {
+            panic!(
+                "variant {variant} must fail stream with transport error without passing through any frame, got {bad_next:?}"
+            );
+        };
         assert!(
-            bad_next.is_err(),
-            "variant {variant} must fail stream with transport error without passing through any frame, got {bad_next:?}"
+            bad_err.starts_with("transport error:"),
+            "variant {variant} must fail with transport error, not timeout or parse error: {bad_err}"
         );
 
         let mut sib_all = vec![sib_active];
