@@ -3942,12 +3942,14 @@ fn dispatch_stdout_message(
                 fail_live_events_waiter(live, "malformed events/stream completion");
                 return Ok(());
             }
+            let mut sub_id_copy_lease = None;
             if is_valid_complete {
                 let Ok(sub_id_copy) = LeasedJson::copy(&live.client_id, budget, 0) else {
                     drop(val);
                     fail_live_events_waiter(live, "process active byte budget exceeded");
                     return Ok(());
                 };
+                sub_id_copy_lease = Some(sub_id_copy._lease);
                 if let Some(meta) = val
                     .get_mut("result")
                     .and_then(Value::as_object_mut)
@@ -3963,6 +3965,7 @@ fn dispatch_stdout_message(
             match encode_json_leased(&val, b"", budget) {
                 Ok((out, lease)) => {
                     drop(val);
+                    drop(sub_id_copy_lease);
                     let _ = live.resp_tx.send(RespDelivery::Ok {
                         json_bytes: out,
                         lease: Some(lease),
@@ -3970,6 +3973,7 @@ fn dispatch_stdout_message(
                 }
                 Err(_) => {
                     drop(val);
+                    drop(sub_id_copy_lease);
                     fail_live_events_waiter(live, "process active byte budget exceeded");
                 }
             }
@@ -7065,6 +7069,87 @@ time.sleep(120)
         assert_eq!(session.active_requests.load(Ordering::Acquire), 0);
         assert_eq!(notif_budget.used(), 0);
         assert_eq!(budget.used(), 0);
+    }
+
+    #[test]
+    fn events_completion_keeps_subscription_id_copy_leased_until_encoding() {
+        for enough_room in [false, true] {
+            let budget = ByteBudget::new(4096);
+            let notif_budget = ByteBudget::new(4096);
+            let session = request_test_session(&budget);
+            let client_id = json!("complete-request");
+            let (wire_id, mut guard, notifications, mut response) = session
+                .register_request_opts(&client_id, None, true, None)
+                .unwrap();
+            let upstream = json!({
+                "jsonrpc": "2.0",
+                "id": wire_id,
+                "result": {
+                    "resultType": "complete",
+                    "_meta": { SUBSCRIPTION_ID_META_KEY: wire_id }
+                }
+            });
+            let restored = json!({
+                "jsonrpc": "2.0",
+                "id": client_id,
+                "result": {
+                    "resultType": "complete",
+                    "_meta": { SUBSCRIPTION_ID_META_KEY: client_id }
+                }
+            });
+            let mut parsed =
+                LeasedJson::parse(&serde_json::to_vec(&upstream).unwrap(), &budget).unwrap();
+            let encoded_len = json_encoded_len(&restored).unwrap();
+            let copy_bytes = json_text_capacity(&client_id);
+            let available = encoded_len + copy_bytes - usize::from(!enough_room);
+            let retained = budget
+                .try_acquire(budget.limit() - budget.used() - available)
+                .unwrap();
+
+            dispatch_stdout_message(
+                &session.in_flight,
+                &session.stdin_tx,
+                &session.alive,
+                &notif_budget,
+                &budget,
+                std::mem::take(&mut parsed.value),
+            )
+            .unwrap();
+
+            if enough_room {
+                let RespDelivery::Ok { json_bytes, lease } = response.try_recv().unwrap() else {
+                    panic!("complete with enough overlap capacity must succeed");
+                };
+                assert_eq!(
+                    serde_json::from_slice::<Value>(&json_bytes).unwrap(),
+                    restored
+                );
+                assert_eq!(
+                    budget.used(),
+                    retained.held() + parsed._lease.held() + json_bytes.capacity()
+                );
+                drop(json_bytes);
+                drop(lease);
+                guard.mark_completed();
+            } else {
+                assert_eq!(
+                    notifications.take_failure().as_deref(),
+                    Some("process active byte budget exceeded"),
+                    "encoding cannot reuse the live subscription ID copy's capacity"
+                );
+                assert!(matches!(
+                    response.try_recv(),
+                    Err(oneshot::error::TryRecvError::Closed)
+                ));
+                assert_eq!(budget.used(), retained.held() + parsed._lease.held());
+            }
+            assert_eq!(session.active_requests.load(Ordering::Acquire), 0);
+            assert!(session.in_flight.lock().unwrap().is_empty());
+            drop(parsed);
+            drop(retained);
+            drop(guard);
+            assert_eq!(budget.used(), 0);
+        }
     }
 
     #[tokio::test]
