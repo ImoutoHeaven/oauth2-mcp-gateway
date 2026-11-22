@@ -779,7 +779,15 @@ async fn wait_for_cancel_id(
             }),
         )
         .await;
-        assert_eq!(status, StatusCode::OK);
+        if status == StatusCode::SERVICE_UNAVAILABLE {
+            assert!(
+                Instant::now() < deadline,
+                "timed out waiting for cancel of wire_id={expected_wire_id}, last status={status} body={val}"
+            );
+            tokio::time::sleep(Duration::from_millis(15)).await;
+            continue;
+        }
+        assert_eq!(status, StatusCode::OK, "unexpected response: {val}");
         let ids: Vec<u64> = val["result"]["cancelled"]
             .as_array()
             .unwrap()
@@ -791,7 +799,7 @@ async fn wait_for_cancel_id(
         }
         assert!(
             Instant::now() < deadline,
-            "timed out waiting for cancel of wire_id={expected_wire_id}, got {ids:?}"
+            "timed out waiting for cancel of wire_id={expected_wire_id}, last status={status} body={val}"
         );
         tokio::time::sleep(Duration::from_millis(15)).await;
     }
