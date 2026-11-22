@@ -3157,7 +3157,7 @@ impl RequestStopOwner {
             }
         });
 
-        if let Some(mut ephemeral) = ephemeral {
+        if ephemeral.is_some() || self.session_id.is_none() {
             let removed = {
                 let mut waiters = self
                     .session
@@ -3174,8 +3174,10 @@ impl RequestStopOwner {
             if self.session.alive.load(Ordering::Acquire) {
                 let _ = self.session.send_cancel_line(&cancel);
             }
-            let _ = ephemeral.begin_reap();
-            drop(ephemeral);
+            if let Some(mut ephemeral) = ephemeral {
+                let _ = ephemeral.begin_reap();
+                drop(ephemeral);
+            }
             return;
         }
 
@@ -3415,8 +3417,8 @@ impl StdioSseStreamBody {
                     let now = elapsed_ms(epoch);
                     let elapsed = now.saturating_sub(last);
                     if elapsed >= timeout_ms {
-                        wd_stop.stop("request timed out", None);
                         wd_timed_out.cancel();
+                        wd_stop.stop("request timed out", None);
                         break;
                     }
                     let wait = Duration::from_millis(timeout_ms - elapsed);
@@ -3700,10 +3702,39 @@ fn is_events_push_notification(method: &str) -> bool {
     )
 }
 
+fn is_valid_rpc_error(obj: &serde_json::Map<String, Value>) -> bool {
+    !obj.contains_key("result") && obj.get("error").is_some_and(Value::is_object)
+}
+
 fn is_valid_final_response(obj: &serde_json::Map<String, Value>) -> bool {
-    let has_result = obj.contains_key("result");
-    let has_error = obj.contains_key("error");
-    (has_result && !has_error) || (!has_result && obj.get("error").is_some_and(Value::is_object))
+    (obj.contains_key("result") && !obj.contains_key("error")) || is_valid_rpc_error(obj)
+}
+
+fn is_valid_events_complete(obj: &serde_json::Map<String, Value>, wire_id: u64) -> bool {
+    obj.contains_key("result")
+        && !obj.contains_key("error")
+        && obj
+            .get("result")
+            .and_then(Value::as_object)
+            .is_some_and(|res| {
+                res.get("resultType").and_then(Value::as_str) == Some("complete")
+                    && res
+                        .get("_meta")
+                        .and_then(Value::as_object)
+                        .and_then(|meta| meta.get(SUBSCRIPTION_ID_META_KEY))
+                        .and_then(Value::as_u64)
+                        == Some(wire_id)
+            })
+}
+
+// Signal failure before dropping live so closing channels cannot race into a clean EOF.
+fn fail_live_events_waiter(live: LiveInFlight, reason: &str) {
+    if let Some(stop) = live.stop.upgrade() {
+        stop.fail_without_cancel(reason);
+    } else {
+        live.notif_tx.queue().fail(reason);
+    }
+    drop(live);
 }
 
 fn dispatch_large_response_line(
@@ -3722,7 +3753,7 @@ fn dispatch_large_response_line(
 
     enum LargeWaiter {
         EventsLive(Box<LiveInFlight>),
-        EventsStopping(Arc<StopSettlement>),
+        EventsStopping,
         Other,
     }
 
@@ -3730,11 +3761,14 @@ fn dispatch_large_response_line(
     let events_match = {
         let mut waiters = in_flight.lock().unwrap_or_else(|p| p.into_inner());
         match waiters.iter().position(|w| w.wire_id == wire_id) {
-            Some(pos) if waiters[pos].is_events_stream() => match waiters.remove(pos).state {
-                InFlightState::Live(live) => Some(LargeWaiter::EventsLive(live)),
-                InFlightState::Stopping(stopping) => {
-                    Some(LargeWaiter::EventsStopping(stopping.settled))
+            Some(pos) if waiters[pos].is_events_stream() => match &waiters[pos].state {
+                InFlightState::Live(_) => {
+                    let InFlightState::Live(live) = waiters.remove(pos).state else {
+                        unreachable!();
+                    };
+                    Some(LargeWaiter::EventsLive(live))
                 }
+                InFlightState::Stopping(_) => Some(LargeWaiter::EventsStopping),
             },
             Some(_) => Some(LargeWaiter::Other),
             None => None,
@@ -3744,19 +3778,11 @@ fn dispatch_large_response_line(
         None => return,
         Some(LargeWaiter::EventsLive(live)) => {
             drop(outcome);
-            let stop = live.stop.upgrade();
-            let queue = live.notif_tx.queue();
-            drop(live);
-            if let Some(stop) = stop {
-                stop.fail_without_cancel("events/stream completion exceeds control line limit");
-            } else {
-                queue.fail("events/stream completion exceeds control line limit");
-            }
+            fail_live_events_waiter(*live, "events/stream completion exceeds control line limit");
             return;
         }
-        Some(LargeWaiter::EventsStopping(settled)) => {
+        Some(LargeWaiter::EventsStopping) => {
             drop(outcome);
-            settled.observe_final_response();
             return;
         }
         Some(LargeWaiter::Other) => {}
@@ -3862,6 +3888,7 @@ fn dispatch_stdout_message(
             return Ok(());
         };
         let valid_final = is_valid_final_response(obj);
+        let valid_events_final = is_valid_rpc_error(obj) || is_valid_events_complete(obj, wire_id);
         enum RemovedWaiter {
             Live(Box<LiveInFlight>),
             Stopping(Arc<StopSettlement>),
@@ -3876,7 +3903,13 @@ fn dispatch_stdout_message(
                         };
                         Some(RemovedWaiter::Live(live))
                     }
-                    InFlightState::Stopping(_) if valid_final => {
+                    InFlightState::Stopping(stopping)
+                        if if stopping.is_events_stream {
+                            valid_events_final
+                        } else {
+                            valid_final
+                        } =>
+                    {
                         let InFlightState::Stopping(stopping) = waiters.remove(pos).state else {
                             unreachable!();
                         };
@@ -3899,45 +3932,17 @@ fn dispatch_stdout_message(
             RemovedWaiter::Live(live) => *live,
         };
         if live.is_events_stream {
-            let is_rpc_error =
-                !obj.contains_key("result") && obj.get("error").is_some_and(Value::is_object);
-            let is_valid_complete = obj.contains_key("result")
-                && !obj.contains_key("error")
-                && obj
-                    .get("result")
-                    .and_then(Value::as_object)
-                    .is_some_and(|res| {
-                        res.get("resultType").and_then(Value::as_str) == Some("complete")
-                            && res
-                                .get("_meta")
-                                .and_then(Value::as_object)
-                                .and_then(|meta| meta.get(SUBSCRIPTION_ID_META_KEY))
-                                .and_then(Value::as_u64)
-                                == Some(wire_id)
-                    });
+            let is_rpc_error = is_valid_rpc_error(obj);
+            let is_valid_complete = is_valid_events_complete(obj, wire_id);
             if !is_rpc_error && !is_valid_complete {
                 drop(val);
-                let stop = live.stop.upgrade();
-                let queue = live.notif_tx.queue();
-                drop(live);
-                if let Some(stop) = stop {
-                    stop.fail_without_cancel("malformed events/stream completion");
-                } else {
-                    queue.fail("malformed events/stream completion");
-                }
+                fail_live_events_waiter(live, "malformed events/stream completion");
                 return Ok(());
             }
             if is_valid_complete {
                 let Ok(sub_id_copy) = LeasedJson::copy(&live.client_id, budget, 0) else {
                     drop(val);
-                    let stop = live.stop.upgrade();
-                    let queue = live.notif_tx.queue();
-                    drop(live);
-                    if let Some(stop) = stop {
-                        stop.fail_without_cancel("process active byte budget exceeded");
-                    } else {
-                        queue.fail("process active byte budget exceeded");
-                    }
+                    fail_live_events_waiter(live, "process active byte budget exceeded");
                     return Ok(());
                 };
                 if let Some(meta) = val
@@ -3962,14 +3967,7 @@ fn dispatch_stdout_message(
                 }
                 Err(_) => {
                     drop(val);
-                    let stop = live.stop.upgrade();
-                    let queue = live.notif_tx.queue();
-                    drop(live);
-                    if let Some(stop) = stop {
-                        stop.fail_without_cancel("process active byte budget exceeded");
-                    } else {
-                        queue.fail("process active byte budget exceeded");
-                    }
+                    fail_live_events_waiter(live, "process active byte budget exceeded");
                 }
             }
             return Ok(());
@@ -4295,7 +4293,7 @@ fn accept_contains(headers: &HeaderMap, target: &str) -> bool {
                 if !key.trim().eq_ignore_ascii_case("q") {
                     return false;
                 }
-                !matches!(value.trim().parse::<f32>(), Ok(q) if q > 0.0)
+                !matches!(value.trim().parse::<f32>(), Ok(q) if q.is_finite() && q > 0.0)
             })
         })
 }
@@ -6682,6 +6680,8 @@ time.sleep(120)
         assert!(!accepts(Some("text/event-stream; q = 0.000")));
         assert!(!accepts(Some("text/event-stream; Q=0")));
         assert!(!accepts(Some("text/event-stream; q=NaN")));
+        assert!(!accepts(Some("text/event-stream; q=inf")));
+        assert!(!accepts(Some("text/event-stream; q=infinity")));
         assert!(!accepts(Some("text/event-stream; q=-0.5")));
         assert!(!accepts(Some("text/event-stream; q=invalid")));
 
@@ -7386,5 +7386,102 @@ time.sleep(120)
             up.shutdown().await;
             assert_eq!(budget.used(), 0);
         }
+    }
+
+    #[tokio::test]
+    async fn events_stopping_ignores_malformed_and_oversized_completions_and_sessionless_skips_stopping()
+     {
+        let budget = ByteBudget::new(16 * 1024);
+        let notif_budget = ByteBudget::new(4096);
+        let limits = StdioLimits {
+            max_control_line_bytes: 256,
+            max_stdout_line_bytes: 16 * 1024,
+            stdin_write_timeout: Duration::from_secs(2),
+            stdin_channel_capacity: 1,
+            ..StdioLimits::default()
+        };
+        let mut session = request_test_session(&budget);
+        Arc::get_mut(&mut session).unwrap().limits = limits;
+        let (tx, mut rx) = mpsc::channel(1);
+        *session.stdin_tx.lock().unwrap() = Some(tx);
+
+        // 1. Sessionless request without an attached ephemeral guard removes its slot immediately.
+        let (_w_ephem, mut g_ephem, _n_ephem, _r_ephem) = session
+            .register_request_opts(&json!("sessless"), None, true, None)
+            .unwrap();
+        g_ephem.cancel("client disconnected");
+        assert!(session.in_flight.lock().unwrap().is_empty());
+        assert_eq!(session.active_requests.load(Ordering::Acquire), 0);
+        let _ephem_cancel = rx.recv().await.unwrap();
+
+        // 2. Shared session Events entry in Stopping ignores malformed and oversized completions.
+        let (w_ev, mut g_ev, _n_ev, _r_ev) = session
+            .register_request_opts(&json!("ev-stop"), None, true, Some("sid".into()))
+            .unwrap();
+        session
+            .send_raw_line(StdinLine {
+                bytes: Bytes::from_static(b"{}\n"),
+                flushed: None,
+            })
+            .unwrap();
+        g_ev.cancel("client disconnected");
+        assert!(
+            session
+                .in_flight
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|w| w.wire_id == w_ev && matches!(w.state, InFlightState::Stopping(_)))
+        );
+
+        // Malformed completions must not settle the Stopping entry.
+        for bad in [
+            json!({"jsonrpc":"2.0","id":w_ev,"result":{"resultType":"partial","_meta":{SUBSCRIPTION_ID_META_KEY:w_ev}}}),
+            json!({"jsonrpc":"2.0","id":w_ev,"result":{"resultType":"complete","_meta":{SUBSCRIPTION_ID_META_KEY:9999}}}),
+            json!({"jsonrpc":"2.0","id":w_ev,"result":{}}),
+        ] {
+            dispatch_stdout_message(
+                &session.in_flight,
+                &session.stdin_tx,
+                &session.alive,
+                &notif_budget,
+                &budget,
+                bad,
+            )
+            .unwrap();
+            assert_eq!(session.in_flight.lock().unwrap().len(), 1);
+        }
+
+        // Oversized Events completion must not settle the Stopping entry either.
+        let big_line = format!(
+            "{{\"jsonrpc\":\"2.0\",\"id\":{w_ev},\"result\":{{\"resultType\":\"complete\",\"_meta\":{{\"{SUBSCRIPTION_ID_META_KEY}\":{w_ev}}},\"pad\":\"{}\"}}}}\n",
+            "X".repeat(1024)
+        );
+        let mut reader = BufReader::new(big_line.as_bytes());
+        let outcome = read_stdout_line(&mut reader, &session.in_flight, &budget, limits)
+            .await
+            .unwrap();
+        dispatch_large_response_line(outcome, &session.in_flight);
+        assert_eq!(session.in_flight.lock().unwrap().len(), 1);
+
+        // A valid JSON-RPC error settles the Stopping entry and releases the slot.
+        dispatch_stdout_message(
+            &session.in_flight,
+            &session.stdin_tx,
+            &session.alive,
+            &notif_budget,
+            &budget,
+            json!({"jsonrpc":"2.0","id":w_ev,"error":{"code":-32800,"message":"cancelled"}}),
+        )
+        .unwrap();
+        assert!(session.in_flight.lock().unwrap().is_empty());
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while session.active_requests.load(Ordering::Acquire) != 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(budget.used(), 0);
     }
 }
