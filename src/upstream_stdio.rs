@@ -3950,17 +3950,18 @@ fn dispatch_stdout_message(
                     return Ok(());
                 };
                 sub_id_copy_lease = Some(sub_id_copy._lease);
-                if let Some(meta) = val
+                if let Some(sub_id) = val
                     .get_mut("result")
                     .and_then(Value::as_object_mut)
                     .and_then(|res| res.get_mut("_meta"))
                     .and_then(Value::as_object_mut)
+                    .and_then(|meta| meta.get_mut(SUBSCRIPTION_ID_META_KEY))
                 {
-                    meta.insert(SUBSCRIPTION_ID_META_KEY.to_owned(), sub_id_copy.value);
+                    *sub_id = sub_id_copy.value;
                 }
             }
-            if let Some(map) = val.as_object_mut() {
-                map.insert("id".to_owned(), std::mem::take(&mut live.client_id));
+            if let Some(id) = val.get_mut("id") {
+                *id = std::mem::take(&mut live.client_id);
             }
             match encode_json_leased(&val, b"", budget) {
                 Ok((out, lease)) => {
@@ -3979,8 +3980,8 @@ fn dispatch_stdout_message(
             }
             return Ok(());
         }
-        if let Some(map) = val.as_object_mut() {
-            map.insert("id".to_owned(), std::mem::take(&mut live.client_id));
+        if let Some(id) = val.get_mut("id") {
+            *id = std::mem::take(&mut live.client_id);
         }
         match encode_json_leased(&val, b"", budget) {
             Ok((out, lease)) => {
@@ -4044,13 +4045,14 @@ fn dispatch_stdout_message(
             fail_stream("process active byte budget exceeded");
             return Ok(());
         };
-        if let Some(meta) = val
+        if let Some(sub_id) = val
             .get_mut("params")
             .and_then(Value::as_object_mut)
             .and_then(|p| p.get_mut("_meta"))
             .and_then(Value::as_object_mut)
+            .and_then(|meta| meta.get_mut(SUBSCRIPTION_ID_META_KEY))
         {
-            meta.insert(SUBSCRIPTION_ID_META_KEY.to_owned(), client_id.value);
+            *sub_id = client_id.value;
         }
         let Some((out, lease)) = encode_notification(&val, budget) else {
             drop(val);
@@ -4088,18 +4090,26 @@ fn dispatch_stdout_message(
         };
         if let Some((client_id, mut client_ptok, notif_tx)) = matched {
             if let Some(params) = val.get_mut("params").and_then(Value::as_object_mut) {
-                if let Some(meta) = params.get_mut("_meta").and_then(Value::as_object_mut) {
-                    meta.insert("relatedRequestId".to_owned(), client_id.value);
-                }
-                if is_progress
-                    && let Some(orig_ptok) = client_ptok.as_mut()
-                    && params.get("progressToken").and_then(Value::as_str)
-                        == Some(&format!("gw_pt_{rel_wire_id}"))
+                if let Some(related_id) = params
+                    .get_mut("_meta")
+                    .and_then(Value::as_object_mut)
+                    .and_then(|meta| meta.get_mut("relatedRequestId"))
                 {
-                    params.insert(
-                        "progressToken".to_owned(),
-                        std::mem::take(&mut orig_ptok.value),
-                    );
+                    *related_id = client_id.value;
+                }
+                if is_progress && let Some(orig_ptok) = client_ptok.as_mut() {
+                    use std::io::Write as _;
+                    const MAX_TOKEN_BYTES: usize = "gw_pt_".len() + 20;
+                    let mut token = [0u8; MAX_TOKEN_BYTES];
+                    let mut remaining = token.as_mut_slice();
+                    write!(&mut remaining, "gw_pt_{rel_wire_id}")
+                        .expect("u64 progress token fits buffer");
+                    let len = MAX_TOKEN_BYTES - remaining.len();
+                    if let Some(progress_token) = params.get_mut("progressToken")
+                        && progress_token.as_str().map(str::as_bytes) == Some(&token[..len])
+                    {
+                        *progress_token = std::mem::take(&mut orig_ptok.value);
+                    }
                 }
             }
             if !notif_tx.is_closed()
@@ -4139,8 +4149,12 @@ fn dispatch_stdout_message(
                 })
         };
         if let Some((orig_ptok, notif_tx)) = matched {
-            if let Some(params) = val.get_mut("params").and_then(Value::as_object_mut) {
-                params.insert("progressToken".to_owned(), orig_ptok.value);
+            if let Some(progress_token) = val
+                .get_mut("params")
+                .and_then(Value::as_object_mut)
+                .and_then(|params| params.get_mut("progressToken"))
+            {
+                *progress_token = orig_ptok.value;
             }
             if !notif_tx.is_closed()
                 && let Some((out, lease)) = encode_notification(&val, budget)
