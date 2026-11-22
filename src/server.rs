@@ -276,6 +276,8 @@ async fn wait_for_conn_idle(activity: &ConnActivity, timeout: Duration) {
     let timeout_ns = u64::try_from(timeout.as_nanos()).unwrap_or(u64::MAX);
     loop {
         let notified = activity.idle_notify.notified();
+        tokio::pin!(notified);
+        notified.as_mut().enable();
         if activity.in_flight.load(Ordering::Acquire) > 0 {
             notified.await;
             continue;
@@ -584,4 +586,53 @@ fn is_allowed_origin(headers: &HeaderMap, public_url: &str) -> bool {
         return false;
     }
     parsed.origin().ascii_serialization() == public_url
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn wait_for_conn_idle_wakes_when_in_flight_drops_to_zero() {
+        let activity = Arc::new(ConnActivity::new());
+        activity.in_flight.store(1, Ordering::Release);
+        let guard = ActiveReqGuard {
+            activity: Arc::clone(&activity),
+        };
+
+        let waiter = tokio::spawn({
+            let activity = Arc::clone(&activity);
+            async move {
+                wait_for_conn_idle(&activity, Duration::from_millis(10)).await;
+            }
+        });
+
+        tokio::time::sleep(Duration::from_millis(25)).await;
+        assert!(!waiter.is_finished(), "must wait while in_flight > 0");
+
+        drop(guard);
+        tokio::time::timeout(Duration::from_secs(1), waiter)
+            .await
+            .expect("wait_for_conn_idle should wake promptly after in_flight reaches 0")
+            .unwrap();
+
+        // Exercise the race window between in_flight.load and notified.await.
+        for _ in 0..200 {
+            let activity = Arc::new(ConnActivity::new());
+            activity.in_flight.store(1, Ordering::Release);
+            let guard = ActiveReqGuard {
+                activity: Arc::clone(&activity),
+            };
+            let dropper = tokio::spawn(async move {
+                drop(guard);
+            });
+            tokio::time::timeout(
+                Duration::from_secs(1),
+                wait_for_conn_idle(&activity, Duration::ZERO),
+            )
+            .await
+            .expect("wait_for_conn_idle must not lose wakeup when in_flight hits 0 concurrently");
+            dropper.await.unwrap();
+        }
+    }
 }
