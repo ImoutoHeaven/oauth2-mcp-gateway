@@ -2888,7 +2888,7 @@ impl StdioSession {
         waiters.push(entry);
         drop(waiters);
 
-        let guard = RequestGuard { stop };
+        let guard = RequestGuard { stop: Some(stop) };
         Ok((wire_id, guard, notif_rx, resp_rx))
     }
 
@@ -3338,32 +3338,35 @@ async fn retire_shared_session(session: &Arc<StdioSession>, session_id: Option<&
 }
 
 struct RequestGuard {
-    stop: Arc<RequestStopOwner>,
+    stop: Option<Arc<RequestStopOwner>>,
 }
 
 impl RequestGuard {
     fn mark_completed(&mut self) {
-        self.stop.mark_completed();
+        self.stop.as_ref().expect("request owner").mark_completed();
     }
 
     fn disarm(&mut self) {
-        self.stop.disarm();
+        self.stop.as_ref().expect("request owner").disarm();
     }
 
     fn cancel(&mut self, reason: &str) {
-        self.stop.stop(reason, None);
+        self.stop
+            .as_ref()
+            .expect("request owner")
+            .stop(reason, None);
     }
 
-    fn into_stop(self) -> Arc<RequestStopOwner> {
-        let stop = Arc::clone(&self.stop);
-        std::mem::forget(self);
-        stop
+    fn into_stop(mut self) -> Arc<RequestStopOwner> {
+        self.stop.take().expect("request owner")
     }
 }
 
 impl Drop for RequestGuard {
     fn drop(&mut self) {
-        self.stop.stop("client disconnected", None);
+        if let Some(stop) = self.stop.as_ref() {
+            stop.stop("client disconnected", None);
+        }
     }
 }
 
@@ -5723,6 +5726,100 @@ with open(sys.argv[1], "w", encoding="utf-8") as log:
     }
 
     #[tokio::test]
+    async fn sse_request_owner_is_released_after_complete_disconnect_and_timeout() {
+        for is_events_stream in [false, true] {
+            for ending in ["complete", "disconnect", "timeout"] {
+                let budget = ByteBudget::new(4096);
+                let notif_budget = ByteBudget::new(4096);
+                let session = request_test_session(&budget);
+                let weak_session = Arc::downgrade(&session);
+                let (stdin_tx, mut stdin_rx) = mpsc::channel(4);
+                *session.stdin_tx.lock().unwrap() = Some(stdin_tx);
+                let (wire_id, guard, notif_rx, resp_rx) = session
+                    .register_request_opts(
+                        &json!("owner-request"),
+                        None,
+                        is_events_stream,
+                        Some("owner-session".to_owned()),
+                    )
+                    .unwrap();
+                let weak_stop = session.in_flight.lock().unwrap()[0]
+                    .as_live()
+                    .unwrap()
+                    .stop
+                    .clone();
+                let mut body = StdioSseStreamBody::new(
+                    notif_rx,
+                    resp_rx,
+                    guard,
+                    Arc::clone(&session),
+                    Duration::from_millis(20),
+                    None,
+                );
+
+                if ending == "complete" {
+                    let result = if is_events_stream {
+                        json!({
+                            "resultType": "complete",
+                            "_meta": { SUBSCRIPTION_ID_META_KEY: wire_id }
+                        })
+                    } else {
+                        json!({})
+                    };
+                    dispatch_stdout_message(
+                        &session.in_flight,
+                        &session.stdin_tx,
+                        &session.alive,
+                        &notif_budget,
+                        &budget,
+                        json!({ "jsonrpc": "2.0", "id": wire_id, "result": result }),
+                    )
+                    .unwrap();
+                    drop(body.collect().await.unwrap());
+                } else {
+                    if ending == "timeout" {
+                        let error = tokio::time::timeout(Duration::from_secs(1), body.frame())
+                            .await
+                            .unwrap()
+                            .unwrap()
+                            .unwrap_err();
+                        assert_eq!(error.kind(), io::ErrorKind::TimedOut);
+                    }
+                    drop(body);
+                    let cancel = tokio::time::timeout(Duration::from_secs(1), stdin_rx.recv())
+                        .await
+                        .unwrap()
+                        .unwrap();
+                    let value: Value = serde_json::from_slice(&cancel.bytes).unwrap();
+                    assert_eq!(value["method"], "notifications/cancelled");
+                    assert_eq!(value["params"]["requestId"], wire_id);
+                    cancel.flushed.unwrap().send(()).unwrap();
+                }
+
+                tokio::time::timeout(Duration::from_secs(1), async {
+                    while weak_stop.upgrade().is_some()
+                        || session.active_requests.load(Ordering::Acquire) != 0
+                    {
+                        tokio::task::yield_now().await;
+                    }
+                })
+                .await
+                .unwrap_or_else(|_| {
+                    panic!("request owner retained: events={is_events_stream}, ending={ending}")
+                });
+                assert!(session.in_flight.lock().unwrap().is_empty());
+                assert_eq!(budget.used(), 0);
+                assert_eq!(notif_budget.used(), 0);
+                drop(session);
+                assert!(
+                    weak_session.upgrade().is_none(),
+                    "session retained: events={is_events_stream}, ending={ending}"
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
     async fn sse_stream_handles_resp_drop_before_notif_close_without_panic() {
         let now = Instant::now();
         let notif_budget = ByteBudget::new(MAX_NOTIF_QUEUE_BYTES);
@@ -5755,13 +5852,13 @@ with open(sys.argv[1], "w", encoding="utf-8") as log:
             notif_rx,
             resp_rx,
             RequestGuard {
-                stop: Arc::new(RequestStopOwner::new(
+                stop: Some(Arc::new(RequestStopOwner::new(
                     Arc::clone(&session),
                     None,
                     1,
                     false,
                     notif_tx.queue(),
-                )),
+                ))),
             },
             Arc::clone(&session),
             Duration::from_secs(30),
