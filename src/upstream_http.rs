@@ -28,6 +28,7 @@ use tokio_util::sync::CancellationToken;
 pub const MAX_MCP_BODY_BYTES: usize = 16 * 1024 * 1024;
 pub const MAX_PRIMING_BUFFER_BYTES: usize = 1024 * 1024;
 const PRIMING_FLUSH_CHUNK_BYTES: usize = 64 * 1024;
+const UTF8_BOM: &[u8] = b"\xef\xbb\xbf";
 
 pub const MAX_HTTP_SESSIONS: usize = 4096;
 pub const MAX_HTTP_SESSIONS_PER_GRANT: usize = 32;
@@ -1279,6 +1280,7 @@ struct SsePrimingFilterBody<B> {
     max_priming_bytes: usize,
     scan_pos: usize,
     line_start: usize,
+    at_start: bool,
     filtering: bool,
     inner_eof: bool,
     pending_frame: Option<Frame<Bytes>>,
@@ -1295,6 +1297,7 @@ impl<B> SsePrimingFilterBody<B> {
             max_priming_bytes,
             scan_pos: 0,
             line_start: 0,
+            at_start: true,
             filtering: true,
             inner_eof: false,
             pending_frame: None,
@@ -1385,7 +1388,21 @@ where
                                     this.filtering = false;
                                     break;
                                 }
-                                let take = next_priming_step_len(&chunk, room);
+                                let take = if this.at_start {
+                                    let matched = chunk
+                                        .iter()
+                                        .zip(&UTF8_BOM[this.buf.len()..])
+                                        .take_while(|(byte, expected)| byte == expected)
+                                        .count();
+                                    if matched == 0 {
+                                        this.at_start = false;
+                                        next_priming_step_len(&chunk, room)
+                                    } else {
+                                        matched.min(room)
+                                    }
+                                } else {
+                                    next_priming_step_len(&chunk, room)
+                                };
                                 let target_len = this.buf.len() + take;
                                 if !this.reserve_buf_lease(target_len) {
                                     this.clear_buffers();
@@ -1395,13 +1412,20 @@ where
                                 }
                                 this.buf.extend_from_slice(&chunk[..take]);
                                 chunk = chunk.slice(take..);
-                                scan_priming_buffer(
-                                    &mut this.buf,
-                                    &mut this.scan_pos,
-                                    &mut this.line_start,
-                                    &mut this.filtering,
-                                    false,
-                                );
+                                if this.at_start {
+                                    if this.buf.len() == UTF8_BOM.len() {
+                                        this.buf.clear();
+                                        this.at_start = false;
+                                    }
+                                } else {
+                                    scan_priming_buffer(
+                                        &mut this.buf,
+                                        &mut this.scan_pos,
+                                        &mut this.line_start,
+                                        &mut this.filtering,
+                                        false,
+                                    );
+                                }
                                 this.sync_buf_lease();
                             }
                             if !this.filtering && !chunk.is_empty() {
@@ -1536,6 +1560,42 @@ fn is_sse_data_line(line: &[u8]) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn sse_priming_preserves_bom_prefixed_first_events_across_chunks() {
+        for eol in ["\n", "\r\n", "\r"] {
+            let event = format!(
+                "data: {{\"jsonrpc\":\"2.0\",\"id\":7,\"result\":{{\"text\":\"kept\u{feff}inside\"}}}}{eol}{eol}"
+            );
+            for priming in [String::new(), format!(": ready{eol}{eol}")] {
+                let wire = format!("\u{feff}{priming}{event}").into_bytes();
+                for split in [0, 1, 2, 3, wire.len()] {
+                    let budget = ByteBudget::new(4096);
+                    let (tx, rx) = tokio::sync::mpsc::channel(2);
+                    tx.send(Ok(Frame::data(Bytes::copy_from_slice(&wire[..split]))))
+                        .await
+                        .unwrap();
+                    tx.send(Ok(Frame::data(Bytes::copy_from_slice(&wire[split..]))))
+                        .await
+                        .unwrap();
+                    drop(tx);
+                    let filter = SsePrimingFilterBody::new(
+                        futures_channel_body(rx),
+                        Arc::clone(&budget),
+                        1024,
+                    );
+                    let output = filter.collect().await.unwrap().to_bytes();
+                    assert_eq!(
+                        output.as_ref(),
+                        event.as_bytes(),
+                        "BOM split {split}, line ending {eol:?}, priming {priming:?}"
+                    );
+                    drop(output);
+                    assert_eq!(budget.used(), 0);
+                }
+            }
+        }
+    }
 
     #[tokio::test]
     async fn sse_priming_filter_handles_bare_cr_bare_data_and_large_comments_linearly() {
