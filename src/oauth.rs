@@ -65,6 +65,8 @@ struct EngineCore {
     persist_lock: Arc<tokio::sync::Mutex<()>>,
     pw_verify_gate: tokio::sync::Mutex<()>,
     on_revoke: Option<RevokeHook>,
+    #[cfg(test)]
+    register_persist_barrier: Mutex<Option<tests::RegisterPersistBarrier>>,
 }
 
 struct EngineState {
@@ -340,6 +342,8 @@ impl OAuthEngine {
                 persist_lock: Arc::new(tokio::sync::Mutex::new(())),
                 pw_verify_gate: tokio::sync::Mutex::new(()),
                 on_revoke,
+                #[cfg(test)]
+                register_persist_barrier: Mutex::new(None),
             }),
         }))
     }
@@ -433,7 +437,10 @@ impl OAuthEngine {
                 self.handle_register(req).await
             }
             "/oauth/authorize" => match *req.method() {
-                Method::GET => self.handle_authorize_get(&req, peer_ip),
+                Method::GET => {
+                    let _persist_guard = self.core.persist_lock.lock().await;
+                    self.handle_authorize_get(&req, peer_ip)
+                }
                 Method::POST => self.handle_authorize_post(req, peer_ip).await,
                 _ => method_not_allowed("GET, POST"),
             },
@@ -838,6 +845,9 @@ impl OAuthEngine {
                 snap.clients = candidate_clients;
                 snap
             };
+
+            #[cfg(test)]
+            tests::pause_register_persist(&core).await;
 
             let Ok(persisted) = persist_snapshot(&core.store, snapshot).await else {
                 return oauth_error(
@@ -3138,4 +3148,177 @@ fn not_found_reply() -> HttpReply {
         "text/plain; charset=utf-8",
         "not found",
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::crypto::PasswordVerifier;
+    use http_body_util::Full;
+    use hyper_util::rt::TokioIo;
+    use std::convert::Infallible;
+    use std::task::Poll;
+    use tokio::sync::oneshot;
+
+    pub(super) struct RegisterPersistBarrier {
+        planned: oneshot::Sender<()>,
+        resume: oneshot::Receiver<()>,
+    }
+
+    pub(super) async fn pause_register_persist(core: &EngineCore) {
+        let barrier = core.register_persist_barrier.lock().unwrap().take();
+        if let Some(barrier) = barrier {
+            let _ = barrier.planned.send(());
+            let _ = barrier.resume.await;
+        }
+    }
+
+    async fn dispatch(
+        engine: Arc<OAuthEngine>,
+        req: Request<Full<Bytes>>,
+        first_poll: Option<oneshot::Sender<()>>,
+    ) -> (StatusCode, Bytes) {
+        let (client_io, server_io) = tokio::io::duplex(64 * 1024);
+        let server = tokio::spawn(async move {
+            let first_poll = Mutex::new(first_poll);
+            let service = hyper::service::service_fn(move |req| {
+                let engine = Arc::clone(&engine);
+                let first_poll = first_poll.lock().unwrap().take();
+                async move {
+                    let reply = if let Some(first_poll) = first_poll {
+                        let mut response = Box::pin(engine.handle(req));
+                        let polled =
+                            std::future::poll_fn(|cx| Poll::Ready(response.as_mut().poll(cx)))
+                                .await;
+                        let _ = first_poll.send(());
+                        match polled {
+                            Poll::Ready(reply) => reply,
+                            Poll::Pending => response.await,
+                        }
+                    } else {
+                        engine.handle(req).await
+                    };
+                    Ok::<_, Infallible>(reply)
+                }
+            });
+            hyper::server::conn::http1::Builder::new()
+                .serve_connection(TokioIo::new(server_io), service)
+                .await
+                .unwrap();
+        });
+        let (mut sender, conn) = hyper::client::conn::http1::handshake(TokioIo::new(client_io))
+            .await
+            .unwrap();
+        let client = tokio::spawn(conn);
+        let response = sender.send_request(req).await.unwrap();
+        let status = response.status();
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        drop(sender);
+        client.await.unwrap().unwrap();
+        server.await.unwrap();
+        (status, body)
+    }
+
+    fn registration_request() -> Request<Full<Bytes>> {
+        Request::builder()
+            .method(Method::POST)
+            .uri("/oauth/register")
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Full::new(Bytes::from_static(
+                br#"{"redirect_uris":["http://127.0.0.1:43210/callback"]}"#,
+            )))
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn authorize_get_waits_for_client_eviction_commit() {
+        tokio::time::timeout(Duration::from_secs(10), async {
+            let tmp = tempfile::TempDir::new().unwrap();
+            let owner_hash =
+                PasswordVerifier::from_plaintext_with_iterations("owner-test-password", 10_000)
+                    .unwrap()
+                    .encode();
+            let config = GatewayConfig::from_json_str(
+                &json!({
+                    "listen": "127.0.0.1:0",
+                    "public_url": "https://mcp.example.com",
+                    "state_path": "state.json",
+                    "oauth": {
+                        "owner_password_hash": owner_hash,
+                        "max_registered_clients": 16
+                    },
+                    "upstream": {
+                        "transport": "http",
+                        "url": "http://127.0.0.1:9090/mcp",
+                        "bearer_tokens": ["test-upstream-token"]
+                    }
+                })
+                .to_string(),
+                tmp.path(),
+            )
+            .unwrap();
+            let engine = OAuthEngine::open(Arc::new(config)).unwrap();
+            let mut clients = Vec::new();
+            for _ in 0..16 {
+                let (status, body) =
+                    dispatch(Arc::clone(&engine), registration_request(), None).await;
+                assert_eq!(status, StatusCode::CREATED);
+                clients.push(
+                    serde_json::from_slice::<serde_json::Value>(&body).unwrap()["client_id"]
+                        .as_str()
+                        .unwrap()
+                        .to_owned(),
+                );
+            }
+
+            let (planned_tx, planned_rx) = oneshot::channel();
+            let (resume_tx, resume_rx) = oneshot::channel();
+            *engine.core.register_persist_barrier.lock().unwrap() = Some(RegisterPersistBarrier {
+                planned: planned_tx,
+                resume: resume_rx,
+            });
+            let registration =
+                tokio::spawn(dispatch(Arc::clone(&engine), registration_request(), None));
+            planned_rx.await.unwrap();
+
+            let challenge = sha256_b64("ordinary-pkce-verifier-0123456789abcdef0123456789");
+            let query = form_urlencoded::Serializer::new(String::new())
+                .extend_pairs([
+                    ("response_type", "code"),
+                    ("client_id", clients[0].as_str()),
+                    ("redirect_uri", "http://127.0.0.1:43210/callback"),
+                    ("code_challenge", challenge.as_str()),
+                    ("code_challenge_method", "S256"),
+                ])
+                .finish();
+            let req = Request::builder()
+                .uri(format!("/oauth/authorize?{query}"))
+                .body(Full::new(Bytes::new()))
+                .unwrap();
+            let (polled_tx, polled_rx) = oneshot::channel();
+            let authorization = tokio::spawn(dispatch(Arc::clone(&engine), req, Some(polled_tx)));
+            polled_rx.await.unwrap();
+            resume_tx.send(()).unwrap();
+
+            assert_eq!(registration.await.unwrap().0, StatusCode::CREATED);
+            let (status, _) = authorization.await.unwrap();
+            let state = engine.core.inner.lock().unwrap();
+            assert_eq!(state.persisted.clients.len(), 16);
+            assert!(
+                state
+                    .persisted
+                    .clients
+                    .iter()
+                    .all(|client| client.client_id != clients[0])
+            );
+            let pending = state
+                .pending_auths
+                .iter()
+                .filter(|pending| pending.client_id == clients[0])
+                .count();
+            assert_eq!((status, pending), (StatusCode::BAD_REQUEST, 0));
+        })
+        .await
+        .expect("DCR and authorization requests settle");
+    }
 }
