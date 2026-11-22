@@ -14,14 +14,14 @@ use http_body::{Body, Frame, SizeHint};
 use http_body_util::BodyExt;
 use hyper::body::Incoming;
 use serde_json::{Value, json};
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::future::Future;
 use std::io;
 use std::pin::Pin;
 use std::process::Stdio;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, Weak};
-use std::task::{Context, Poll};
+use std::task::{Context, Poll, Waker};
 use std::time::{Duration, Instant};
 use tokio::io::{AsyncBufReadExt, AsyncWrite, AsyncWriteExt, BufReader};
 use tokio::process::{Child, Command};
@@ -50,6 +50,9 @@ pub struct StdioLimits {
     pub max_control_line_bytes: usize,
     pub max_notif_queue_bytes: usize,
     pub pressure_idle: Duration,
+    pub stdin_write_timeout: Duration,
+    pub stdin_channel_capacity: usize,
+    pub max_in_flight_per_session: usize,
 }
 
 impl Default for StdioLimits {
@@ -59,11 +62,16 @@ impl Default for StdioLimits {
             max_control_line_bytes: MAX_CONTROL_LINE_BYTES,
             max_notif_queue_bytes: MAX_NOTIF_QUEUE_BYTES,
             pressure_idle: DEFAULT_PRESSURE_IDLE,
+            stdin_write_timeout: STDIN_WRITE_TIMEOUT,
+            stdin_channel_capacity: STDIN_CHANNEL_CAPACITY,
+            max_in_flight_per_session: MAX_IN_FLIGHT_PER_SESSION,
         }
     }
 }
 const SESSIONLESS_META_KEY: &str = "io.modelcontextprotocol/protocolVersion";
 const MIN_SESSIONLESS_PROTOCOL_VERSION: &str = "2026-07-28";
+const EVENTS_STREAM_METHOD: &str = "events/stream";
+const SUBSCRIPTION_ID_META_KEY: &str = "io.modelcontextprotocol/subscriptionId";
 
 const SAFE_ENV_ALLOWLIST: &[&str] = &[
     "PATH",
@@ -340,47 +348,361 @@ impl ErrorBuffer {
     }
 }
 
-struct InFlightEntry {
-    wire_id: u64,
+struct NotifQueueInner {
+    queue: VecDeque<QueuedNotif>,
+    closed: bool,
+    failed: Option<String>,
+    waker: Option<Waker>,
+}
+
+struct NotifQueue {
+    inner: Mutex<NotifQueueInner>,
+}
+
+impl NotifQueue {
+    fn new() -> Arc<Self> {
+        Arc::new(Self {
+            inner: Mutex::new(NotifQueueInner {
+                queue: VecDeque::new(),
+                closed: false,
+                failed: None,
+                waker: None,
+            }),
+        })
+    }
+
+    fn is_closed(&self) -> bool {
+        let guard = self.inner.lock().unwrap_or_else(|p| p.into_inner());
+        guard.closed || guard.failed.is_some()
+    }
+
+    fn close_normal(&self) {
+        let waker = {
+            let mut guard = self.inner.lock().unwrap_or_else(|p| p.into_inner());
+            guard.closed = true;
+            guard.waker.take()
+        };
+        if let Some(waker) = waker {
+            waker.wake();
+        }
+    }
+
+    fn close_and_drain(&self) {
+        let (dropped, waker) = {
+            let mut guard = self.inner.lock().unwrap_or_else(|p| p.into_inner());
+            guard.closed = true;
+            (std::mem::take(&mut guard.queue), guard.waker.take())
+        };
+        drop(dropped);
+        if let Some(waker) = waker {
+            waker.wake();
+        }
+    }
+
+    // Discard unsent gateway-owned frames immediately so cleanup does not wait for a body poll.
+    fn fail(&self, reason: &str) {
+        let (dropped, waker) = {
+            let mut guard = self.inner.lock().unwrap_or_else(|p| p.into_inner());
+            if guard.failed.is_none() {
+                guard.failed = Some(reason.to_owned());
+            }
+            guard.closed = true;
+            (std::mem::take(&mut guard.queue), guard.waker.take())
+        };
+        drop(dropped);
+        if let Some(waker) = waker {
+            waker.wake();
+        }
+    }
+
+    fn take_failure(&self) -> Option<String> {
+        self.inner
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .failed
+            .clone()
+    }
+
+    fn enqueue(
+        &self,
+        notif_budget: &Arc<ByteBudget>,
+        line: String,
+        process_lease: Option<ByteLease>,
+    ) -> Result<(), SendLineErr> {
+        if self.is_closed() {
+            drop(line);
+            drop(process_lease);
+            return Err(SendLineErr::Closed);
+        }
+        let cost = line.capacity().max(1);
+        let Some(lease) = ByteBudget::try_acquire(notif_budget, cost) else {
+            drop(line);
+            drop(process_lease);
+            return Err(SendLineErr::Overloaded);
+        };
+        let (rejected, waker) = {
+            let mut guard = self.inner.lock().unwrap_or_else(|p| p.into_inner());
+            if guard.closed || guard.failed.is_some() {
+                (
+                    Some(QueuedNotif {
+                        line,
+                        _lease: lease,
+                        _process_lease: process_lease,
+                    }),
+                    None,
+                )
+            } else {
+                guard.queue.push_back(QueuedNotif {
+                    line,
+                    _lease: lease,
+                    _process_lease: process_lease,
+                });
+                (None, guard.waker.take())
+            }
+        };
+        if let Some(item) = rejected {
+            drop(item);
+            return Err(SendLineErr::Closed);
+        }
+        if let Some(waker) = waker {
+            waker.wake();
+        }
+        Ok(())
+    }
+
+    fn poll_pop(&self, cx: &mut Context<'_>) -> Poll<Result<Option<QueuedNotif>, String>> {
+        let mut guard = self.inner.lock().unwrap_or_else(|p| p.into_inner());
+        if let Some(reason) = guard.failed.clone() {
+            return Poll::Ready(Err(reason));
+        }
+        if let Some(item) = guard.queue.pop_front() {
+            return Poll::Ready(Ok(Some(item)));
+        }
+        if guard.closed {
+            return Poll::Ready(Ok(None));
+        }
+        guard.waker = Some(cx.waker().clone());
+        Poll::Pending
+    }
+
+    #[cfg(test)]
+    fn try_pop(&self) -> Option<QueuedNotif> {
+        let mut guard = self.inner.lock().unwrap_or_else(|p| p.into_inner());
+        if guard.failed.is_some() {
+            return None;
+        }
+        guard.queue.pop_front()
+    }
+}
+
+struct NotifQueueTx {
+    queue: Arc<NotifQueue>,
+}
+
+impl NotifQueueTx {
+    fn is_closed(&self) -> bool {
+        self.queue.is_closed()
+    }
+
+    fn queue(&self) -> Arc<NotifQueue> {
+        Arc::clone(&self.queue)
+    }
+}
+
+impl Drop for NotifQueueTx {
+    fn drop(&mut self) {
+        self.queue.close_normal();
+    }
+}
+
+struct NotifQueueRx {
+    queue: Arc<NotifQueue>,
+}
+
+impl NotifQueueRx {
+    fn take_failure(&self) -> Option<String> {
+        self.queue.take_failure()
+    }
+
+    fn poll_pop(&self, cx: &mut Context<'_>) -> Poll<Result<Option<QueuedNotif>, String>> {
+        self.queue.poll_pop(cx)
+    }
+
+    #[cfg(test)]
+    fn try_recv(&self) -> Result<QueuedNotif, ()> {
+        self.queue.try_pop().ok_or(())
+    }
+}
+
+impl Drop for NotifQueueRx {
+    fn drop(&mut self) {
+        self.queue.close_and_drain();
+    }
+}
+
+fn notif_channel() -> (NotifQueueTx, NotifQueueRx) {
+    let queue = NotifQueue::new();
+    (
+        NotifQueueTx {
+            queue: Arc::clone(&queue),
+        },
+        NotifQueueRx { queue },
+    )
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum StopOutcome {
+    Pending,
+    SettledByResponse,
+    SettledByReceipt,
+    RetireChild,
+}
+
+struct StopSettlement {
+    outcome: Mutex<StopOutcome>,
+    notify: tokio::sync::Notify,
+}
+
+impl StopSettlement {
+    fn new() -> Self {
+        Self {
+            outcome: Mutex::new(StopOutcome::Pending),
+            notify: tokio::sync::Notify::new(),
+        }
+    }
+
+    fn is_settled(&self) -> bool {
+        *self.outcome.lock().unwrap_or_else(|p| p.into_inner()) != StopOutcome::Pending
+    }
+
+    async fn wait_settled(&self) {
+        loop {
+            let notified = self.notify.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            if self.is_settled() {
+                return;
+            }
+            notified.await;
+        }
+    }
+
+    fn observe_final_response(&self) -> bool {
+        let mut outcome = self.outcome.lock().unwrap_or_else(|p| p.into_inner());
+        if *outcome == StopOutcome::Pending {
+            *outcome = StopOutcome::SettledByResponse;
+            drop(outcome);
+            self.notify.notify_waiters();
+            true
+        } else {
+            false
+        }
+    }
+
+    fn try_decide_receipt(&self) -> StopOutcome {
+        let mut outcome = self.outcome.lock().unwrap_or_else(|p| p.into_inner());
+        if *outcome == StopOutcome::Pending {
+            *outcome = StopOutcome::SettledByReceipt;
+            let decided = *outcome;
+            drop(outcome);
+            self.notify.notify_waiters();
+            decided
+        } else {
+            *outcome
+        }
+    }
+
+    fn try_decide_retire(&self) -> StopOutcome {
+        let mut outcome = self.outcome.lock().unwrap_or_else(|p| p.into_inner());
+        if *outcome == StopOutcome::Pending {
+            *outcome = StopOutcome::RetireChild;
+            let decided = *outcome;
+            drop(outcome);
+            self.notify.notify_waiters();
+            decided
+        } else {
+            *outcome
+        }
+    }
+}
+
+struct LiveInFlight {
     client_id: Value,
     client_progress_token: Option<Value>,
-    notif_tx: mpsc::UnboundedSender<QueuedNotif>,
+    is_events_stream: bool,
+    notif_tx: NotifQueueTx,
     resp_tx: oneshot::Sender<RespDelivery>,
     error_buffer: ErrorBuffer,
+    stop: Weak<RequestStopOwner>,
     _lease: ByteLease,
 }
 
+struct StoppingInFlight {
+    is_events_stream: bool,
+    settled: Arc<StopSettlement>,
+}
+
+enum InFlightState {
+    Live(Box<LiveInFlight>),
+    Stopping(StoppingInFlight),
+}
+
+struct InFlightEntry {
+    wire_id: u64,
+    state: InFlightState,
+}
+
 impl InFlightEntry {
+    #[allow(clippy::too_many_arguments)]
     fn new(
         wire_id: u64,
         client_id: &Value,
         client_progress_token: Option<&Value>,
-        notif_tx: mpsc::UnboundedSender<QueuedNotif>,
+        is_events_stream: bool,
+        notif_tx: NotifQueueTx,
         resp_tx: oneshot::Sender<RespDelivery>,
+        stop: Weak<RequestStopOwner>,
         budget: &Arc<ByteBudget>,
     ) -> Result<Self, SendLineErr> {
         let bytes = json_text_capacity(client_id)
             .saturating_add(client_progress_token.map_or(0, json_text_capacity));
         let lease = budget.try_acquire(bytes).ok_or(SendLineErr::Overloaded)?;
         let error_buffer = ErrorBuffer::new(client_id, budget)?;
-        let mut owned = Self {
-            wire_id,
+        let mut live = LiveInFlight {
             client_id: client_id.clone(),
             client_progress_token: client_progress_token.cloned(),
+            is_events_stream,
             notif_tx,
             resp_tx,
             error_buffer,
+            stop,
             _lease: lease,
         };
-        owned._lease.shrink_to(
-            json_text_capacity(&owned.client_id).saturating_add(
-                owned
-                    .client_progress_token
+        live._lease.shrink_to(
+            json_text_capacity(&live.client_id).saturating_add(
+                live.client_progress_token
                     .as_ref()
                     .map_or(0, json_text_capacity),
             ),
         );
-        Ok(owned)
+        Ok(Self {
+            wire_id,
+            state: InFlightState::Live(Box::new(live)),
+        })
+    }
+
+    fn as_live(&self) -> Option<&LiveInFlight> {
+        match &self.state {
+            InFlightState::Live(live) => Some(live),
+            InFlightState::Stopping(_) => None,
+        }
+    }
+
+    fn is_events_stream(&self) -> bool {
+        match &self.state {
+            InFlightState::Live(live) => live.is_events_stream,
+            InFlightState::Stopping(stopping) => stopping.is_events_stream,
+        }
     }
 }
 
@@ -552,6 +874,7 @@ struct StdioSession {
     grant_id: String,
     weak_inner: Weak<StdioInner>,
     budget: Arc<ByteBudget>,
+    limits: StdioLimits,
     writer_cancel: CancellationToken,
     stdin_tx: Arc<Mutex<Option<mpsc::Sender<StdinLine>>>>,
     in_flight: Arc<Mutex<Vec<InFlightEntry>>>,
@@ -1177,18 +1500,34 @@ impl StdioUpstream {
         }
 
         let id = req_id.unwrap();
-        let (wire_id, mut guard, notif_rx, resp_rx) =
-            match session.register_request_with_claim(claim, id, extract_progress_token(payload)) {
-                Ok(registered) => registered,
-                Err(err) => {
-                    let (status, msg) =
-                        session.map_register_failure(err, "upstream child closed stdin");
-                    if !session.alive.load(Ordering::Acquire) {
-                        remove_and_terminate(&self.inner, session_id, &session).await;
-                    }
-                    return jsonrpc_error_reply(&self.inner.budget, status, id, -32000, &msg);
+        let is_events_stream = method == Some(EVENTS_STREAM_METHOD);
+        if is_events_stream && !client_accepts_sse(headers) {
+            drop(claim);
+            return jsonrpc_error_reply(
+                &self.inner.budget,
+                StatusCode::NOT_ACCEPTABLE,
+                id,
+                -32600,
+                "events/stream requires Accept: text/event-stream",
+            );
+        }
+        let (wire_id, mut guard, notif_rx, resp_rx) = match session.register_request_with_claim(
+            claim,
+            id,
+            extract_progress_token(payload),
+            is_events_stream,
+            Some(session_id.to_owned()),
+        ) {
+            Ok(registered) => registered,
+            Err(err) => {
+                let (status, msg) =
+                    session.map_register_failure(err, "upstream child closed stdin");
+                if !session.alive.load(Ordering::Acquire) {
+                    remove_and_terminate(&self.inner, session_id, &session).await;
                 }
-            };
+                return jsonrpc_error_reply(&self.inner.budget, status, id, -32000, &msg);
+            }
+        };
         if let Err(err) = session.send_request_line(payload, wire_id) {
             guard.disarm();
             let (status, msg) = session.map_send_failure(err, "upstream child closed stdin");
@@ -1265,6 +1604,16 @@ impl StdioUpstream {
         req_id: Option<&Value>,
     ) -> HttpReply {
         let err_id = req_id.unwrap_or(&Value::Null);
+        let is_events_stream = method == Some(EVENTS_STREAM_METHOD) && req_id.is_some();
+        if is_events_stream && !client_accepts_sse(headers) {
+            return jsonrpc_error_reply(
+                &self.inner.budget,
+                StatusCode::NOT_ACCEPTABLE,
+                err_id,
+                -32600,
+                "events/stream requires Accept: text/event-stream",
+            );
+        }
         let start_epoch = {
             let tbl = self.inner.table.lock().unwrap_or_else(|p| p.into_inner());
             tbl.grant_epoch(&token.grant_id)
@@ -1397,21 +1746,29 @@ impl StdioUpstream {
         let is_request = method.is_some() && req_id.is_some();
         if !is_request {
             return session
-                .send_sessionless_notification(payload, ephemeral, STDIN_WRITE_TIMEOUT)
+                .send_sessionless_notification(
+                    payload,
+                    ephemeral,
+                    self.inner.limits.stdin_write_timeout,
+                )
                 .await;
         }
 
         let id = req_id.unwrap();
-        let (wire_id, mut guard, notif_rx, resp_rx) =
-            match session.register_request(id, extract_progress_token(payload)) {
-                Ok(registered) => registered,
-                Err(err) => {
-                    let (status, msg) =
-                        session.map_register_failure(err, "ephemeral child closed stdin");
-                    ephemeral.terminate_now().await;
-                    return jsonrpc_error_reply(&self.inner.budget, status, id, -32000, &msg);
-                }
-            };
+        let (wire_id, mut guard, notif_rx, resp_rx) = match session.register_request_opts(
+            id,
+            extract_progress_token(payload),
+            is_events_stream,
+            None,
+        ) {
+            Ok(registered) => registered,
+            Err(err) => {
+                let (status, msg) =
+                    session.map_register_failure(err, "ephemeral child closed stdin");
+                ephemeral.terminate_now().await;
+                return jsonrpc_error_reply(&self.inner.budget, status, id, -32000, &msg);
+            }
+        };
         if let Err(err) = session.send_request_line(payload, wire_id) {
             guard.disarm();
             let (status, msg) = session.map_send_failure(err, "ephemeral child closed stdin");
@@ -2104,7 +2461,8 @@ impl StdioSession {
             return Err("failed to capture child stdout".to_owned());
         };
 
-        let (stdin_tx, stdin_rx) = mpsc::channel::<StdinLine>(STDIN_CHANNEL_CAPACITY);
+        let (stdin_tx, stdin_rx) =
+            mpsc::channel::<StdinLine>(inner.limits.stdin_channel_capacity.max(1));
         let stdin_tx_arc = Arc::new(Mutex::new(Some(stdin_tx)));
         let writer_cancel = CancellationToken::new();
         let alive = Arc::new(AtomicBool::new(true));
@@ -2121,6 +2479,7 @@ impl StdioSession {
             grant_id,
             weak_inner: Arc::downgrade(inner),
             budget: Arc::clone(&inner.budget),
+            limits: inner.limits,
             writer_cancel: writer_cancel.clone(),
             stdin_tx: Arc::clone(&stdin_tx_arc),
             in_flight: Arc::clone(&in_flight),
@@ -2356,11 +2715,11 @@ impl StdioSession {
         };
         let wire_id = {
             let waiters = self.in_flight.lock().unwrap_or_else(|p| p.into_inner());
-            waiters
-                .iter()
-                .rev()
-                .find(|w| json_id_eq(&w.client_id, client_req_id))
-                .map(|w| w.wire_id)
+            waiters.iter().rev().find_map(|w| {
+                w.as_live()
+                    .filter(|live| json_id_eq(&live.client_id, client_req_id))
+                    .map(|_| w.wire_id)
+            })
         };
         let Some(wire_id) = wire_id else {
             return Ok(None);
@@ -2448,13 +2807,37 @@ impl StdioSession {
         (
             u64,
             RequestGuard,
-            mpsc::UnboundedReceiver<QueuedNotif>,
+            NotifQueueRx,
+            oneshot::Receiver<RespDelivery>,
+        ),
+        SendLineErr,
+    > {
+        self.register_request_opts(client_id, client_progress_token, false, None)
+    }
+
+    fn register_request_opts(
+        self: &Arc<Self>,
+        client_id: &Value,
+        client_progress_token: Option<&Value>,
+        is_events_stream: bool,
+        session_id: Option<String>,
+    ) -> Result<
+        (
+            u64,
+            RequestGuard,
+            NotifQueueRx,
             oneshot::Receiver<RespDelivery>,
         ),
         SendLineErr,
     > {
         let claim = ActiveRequestClaim::new(self);
-        self.register_request_with_claim(claim, client_id, client_progress_token)
+        self.register_request_with_claim(
+            claim,
+            client_id,
+            client_progress_token,
+            is_events_stream,
+            session_id,
+        )
     }
 
     fn register_request_with_claim(
@@ -2462,11 +2845,13 @@ impl StdioSession {
         mut claim: ActiveRequestClaim,
         client_id: &Value,
         client_progress_token: Option<&Value>,
+        is_events_stream: bool,
+        session_id: Option<String>,
     ) -> Result<
         (
             u64,
             RequestGuard,
-            mpsc::UnboundedReceiver<QueuedNotif>,
+            NotifQueueRx,
             oneshot::Receiver<RespDelivery>,
         ),
         SendLineErr,
@@ -2475,18 +2860,27 @@ impl StdioSession {
         if !self.alive.load(Ordering::Acquire) {
             return Err(SendLineErr::Closed);
         }
-        if waiters.len() >= MAX_IN_FLIGHT_PER_SESSION {
+        if waiters.len() >= self.limits.max_in_flight_per_session.max(1) {
             return Err(SendLineErr::Full);
         }
         let wire_id = self.next_wire_id.fetch_add(1, Ordering::Relaxed);
-        let (notif_tx, notif_rx) = mpsc::unbounded_channel();
+        let (notif_tx, notif_rx) = notif_channel();
         let (resp_tx, resp_rx) = oneshot::channel();
+        let stop = Arc::new(RequestStopOwner::new(
+            Arc::clone(self),
+            session_id,
+            wire_id,
+            is_events_stream,
+            notif_tx.queue(),
+        ));
         let entry = InFlightEntry::new(
             wire_id,
             client_id,
             client_progress_token,
+            is_events_stream,
             notif_tx,
             resp_tx,
+            Arc::downgrade(&stop),
             &self.budget,
         )?;
         // Adopt the pre-incremented active_requests count without dipping to zero.
@@ -2494,11 +2888,7 @@ impl StdioSession {
         waiters.push(entry);
         drop(waiters);
 
-        let guard = RequestGuard {
-            session: Arc::clone(self),
-            wire_id,
-            state: GuardState::Armed,
-        };
+        let guard = RequestGuard { stop };
         Ok((wire_id, guard, notif_rx, resp_rx))
     }
 
@@ -2637,104 +3027,374 @@ impl Drop for ActiveRequestClaim {
     }
 }
 
-enum GuardState {
-    Armed,
+enum StopOwnerState {
+    Armed { ephemeral: Option<EphemeralGuard> },
     Completed,
     Disarmed,
+    Stopping,
+}
+
+struct ActiveRequestDrop(Arc<StdioSession>);
+
+impl Drop for ActiveRequestDrop {
+    fn drop(&mut self) {
+        self.0.active_requests.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
+struct RequestStopOwner {
+    session: Arc<StdioSession>,
+    session_id: Option<String>,
+    wire_id: u64,
+    is_events_stream: bool,
+    notif_queue: Arc<NotifQueue>,
+    state: Mutex<StopOwnerState>,
+}
+
+impl RequestStopOwner {
+    fn new(
+        session: Arc<StdioSession>,
+        session_id: Option<String>,
+        wire_id: u64,
+        is_events_stream: bool,
+        notif_queue: Arc<NotifQueue>,
+    ) -> Self {
+        Self {
+            session,
+            session_id,
+            wire_id,
+            is_events_stream,
+            notif_queue,
+            state: Mutex::new(StopOwnerState::Armed { ephemeral: None }),
+        }
+    }
+
+    fn attach_ephemeral(&self, ephemeral: EphemeralGuard) {
+        let mut state = self.state.lock().unwrap_or_else(|p| p.into_inner());
+        if let StopOwnerState::Armed {
+            ephemeral: ref mut slot,
+        } = *state
+        {
+            *slot = Some(ephemeral);
+        } else {
+            drop(state);
+            drop(ephemeral);
+        }
+    }
+
+    fn mark_completed(&self) {
+        let ephemeral = {
+            let mut state = self.state.lock().unwrap_or_else(|p| p.into_inner());
+            match std::mem::replace(&mut *state, StopOwnerState::Completed) {
+                StopOwnerState::Armed { ephemeral } => ephemeral,
+                other => {
+                    *state = other;
+                    return;
+                }
+            }
+        };
+        self.session.active_requests.fetch_sub(1, Ordering::AcqRel);
+        drop(ephemeral);
+    }
+
+    fn disarm(&self) {
+        let ephemeral = {
+            let mut state = self.state.lock().unwrap_or_else(|p| p.into_inner());
+            match std::mem::replace(&mut *state, StopOwnerState::Disarmed) {
+                StopOwnerState::Armed { ephemeral } => ephemeral,
+                other => {
+                    *state = other;
+                    return;
+                }
+            }
+        };
+        let removed = {
+            let mut waiters = self
+                .session
+                .in_flight
+                .lock()
+                .unwrap_or_else(|p| p.into_inner());
+            waiters
+                .iter()
+                .position(|w| w.wire_id == self.wire_id)
+                .map(|pos| waiters.remove(pos))
+        };
+        drop(removed);
+        self.session.active_requests.fetch_sub(1, Ordering::AcqRel);
+        drop(ephemeral);
+    }
+
+    // Used when stdout already delivered a malformed or oversized completion for this request.
+    fn fail_without_cancel(&self, reason: &str) {
+        self.notif_queue.fail(reason);
+        self.disarm();
+    }
+
+    fn stop(&self, reason: &str, fail_body: Option<&str>) {
+        if let Some(err_msg) = fail_body {
+            self.notif_queue.fail(err_msg);
+        }
+        let ephemeral = {
+            let mut state = self.state.lock().unwrap_or_else(|p| p.into_inner());
+            match std::mem::replace(&mut *state, StopOwnerState::Stopping) {
+                StopOwnerState::Armed { ephemeral } => ephemeral,
+                other => {
+                    *state = other;
+                    return;
+                }
+            }
+        };
+        if fail_body.is_none() {
+            self.notif_queue.close_and_drain();
+        }
+
+        let cancel = json!({
+            "jsonrpc": "2.0",
+            "method": "notifications/cancelled",
+            "params": {
+                "requestId": self.wire_id,
+                "reason": reason
+            }
+        });
+
+        if let Some(mut ephemeral) = ephemeral {
+            let removed = {
+                let mut waiters = self
+                    .session
+                    .in_flight
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner());
+                waiters
+                    .iter()
+                    .position(|w| w.wire_id == self.wire_id)
+                    .map(|pos| waiters.remove(pos))
+            };
+            drop(removed);
+            self.session.active_requests.fetch_sub(1, Ordering::AcqRel);
+            if self.session.alive.load(Ordering::Acquire) {
+                let _ = self.session.send_cancel_line(&cancel);
+            }
+            let _ = ephemeral.begin_reap();
+            drop(ephemeral);
+            return;
+        }
+
+        let settled = Arc::new(StopSettlement::new());
+        let (entered_stopping, old_state) = {
+            let mut waiters = self
+                .session
+                .in_flight
+                .lock()
+                .unwrap_or_else(|p| p.into_inner());
+            if let Some(pos) = waiters.iter().position(|w| w.wire_id == self.wire_id) {
+                if !self.session.alive.load(Ordering::Acquire) {
+                    (false, Some(waiters.remove(pos).state))
+                } else {
+                    let prev = std::mem::replace(
+                        &mut waiters[pos].state,
+                        InFlightState::Stopping(StoppingInFlight {
+                            is_events_stream: self.is_events_stream,
+                            settled: Arc::clone(&settled),
+                        }),
+                    );
+                    (true, Some(prev))
+                }
+            } else {
+                (false, None)
+            }
+        };
+        drop(old_state);
+        if !entered_stopping {
+            self.session.active_requests.fetch_sub(1, Ordering::AcqRel);
+            return;
+        }
+
+        let Ok(mut line_bytes) = serde_json::to_vec(&cancel) else {
+            remove_stopping_entry(&self.session.in_flight, self.wire_id);
+            self.session.active_requests.fetch_sub(1, Ordering::AcqRel);
+            return;
+        };
+        line_bytes.push(b'\n');
+        let (flushed_tx, flushed_rx) = oneshot::channel();
+        let line = StdinLine {
+            bytes: Bytes::from(line_bytes),
+            flushed: Some(flushed_tx),
+        };
+        let tx_opt = self
+            .session
+            .stdin_tx
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .clone();
+
+        enum SendStart {
+            Flushing(oneshot::Receiver<()>),
+            NeedSend(mpsc::Sender<StdinLine>, StdinLine, oneshot::Receiver<()>),
+            Closed,
+        }
+
+        let start = match tx_opt {
+            None => SendStart::Closed,
+            Some(tx) => match tx.try_send(line) {
+                Ok(()) => SendStart::Flushing(flushed_rx),
+                Err(TrySendError::Full(unsent)) => SendStart::NeedSend(tx, unsent, flushed_rx),
+                Err(TrySendError::Closed(_)) => SendStart::Closed,
+            },
+        };
+
+        let Ok(handle) = tokio::runtime::Handle::try_current() else {
+            remove_stopping_entry(&self.session.in_flight, self.wire_id);
+            self.session.active_requests.fetch_sub(1, Ordering::AcqRel);
+            return;
+        };
+
+        let session = Arc::clone(&self.session);
+        let session_id = self.session_id.clone();
+        let wire_id = self.wire_id;
+        let deadline = tokio::time::Instant::now() + session.limits.stdin_write_timeout;
+
+        handle.spawn(async move {
+            let _active_drop = ActiveRequestDrop(Arc::clone(&session));
+            let receipt_rx = match start {
+                SendStart::Flushing(rx) => Some(rx),
+                SendStart::NeedSend(tx, unsent, rx) => {
+                    let admitted = tokio::select! {
+                        biased;
+                        () = settled.wait_settled() => return,
+                        res = tokio::time::timeout_at(deadline, tx.send(unsent)) => res,
+                    };
+                    match admitted {
+                        Ok(Ok(())) => Some(rx),
+                        Ok(Err(_)) | Err(_) => None,
+                    }
+                }
+                SendStart::Closed => None,
+            };
+
+            if let Some(rx) = receipt_rx {
+                let flushed = tokio::select! {
+                    biased;
+                    () = settled.wait_settled() => return,
+                    res = tokio::time::timeout_at(deadline, rx) => res,
+                };
+                if matches!(flushed, Ok(Ok(()))) {
+                    let _ = settled.try_decide_receipt();
+                    remove_stopping_entry(&session.in_flight, wire_id);
+                    return;
+                }
+            }
+
+            if settled.try_decide_retire() != StopOutcome::RetireChild {
+                return;
+            }
+            remove_stopping_entry(&session.in_flight, wire_id);
+            retire_shared_session(&session, session_id.as_deref()).await;
+        });
+    }
+}
+
+fn remove_stopping_entry(in_flight: &Mutex<Vec<InFlightEntry>>, wire_id: u64) {
+    let removed = {
+        let mut waiters = in_flight.lock().unwrap_or_else(|p| p.into_inner());
+        waiters
+            .iter()
+            .position(|w| w.wire_id == wire_id && matches!(w.state, InFlightState::Stopping(_)))
+            .map(|pos| waiters.remove(pos))
+    };
+    drop(removed);
+}
+
+async fn retire_shared_session(session: &Arc<StdioSession>, session_id: Option<&str>) {
+    if let Some(inner) = session.weak_inner.upgrade() {
+        let removed_count = {
+            let mut tbl = inner.table.lock().unwrap_or_else(|p| p.into_inner());
+            let key = session_id
+                .filter(|sid| {
+                    tbl.sessions
+                        .get(*sid)
+                        .is_some_and(|cur| cur.uid == session.uid)
+                })
+                .map(str::to_owned)
+                .or_else(|| {
+                    tbl.sessions
+                        .iter()
+                        .find(|(_, cur)| cur.uid == session.uid)
+                        .map(|(k, _)| k.clone())
+                });
+            if let Some(k) = key {
+                tbl.sessions.remove(&k);
+                tbl.terminating_slots += 1;
+                1
+            } else {
+                0
+            }
+        };
+        let _ = reap_sessions(&inner, vec![Arc::clone(session)], removed_count, None).await;
+    } else {
+        session.terminate().await;
+    }
 }
 
 struct RequestGuard {
-    session: Arc<StdioSession>,
-    wire_id: u64,
-    state: GuardState,
+    stop: Arc<RequestStopOwner>,
 }
 
 impl RequestGuard {
     fn mark_completed(&mut self) {
-        if matches!(self.state, GuardState::Armed) {
-            self.state = GuardState::Completed;
-            self.session.active_requests.fetch_sub(1, Ordering::AcqRel);
-        }
+        self.stop.mark_completed();
     }
 
     fn disarm(&mut self) {
-        if matches!(self.state, GuardState::Armed) {
-            self.state = GuardState::Disarmed;
-            let mut waiters = self
-                .session
-                .in_flight
-                .lock()
-                .unwrap_or_else(|p| p.into_inner());
-            waiters.retain(|w| w.wire_id != self.wire_id);
-            drop(waiters);
-            self.session.active_requests.fetch_sub(1, Ordering::AcqRel);
-        }
+        self.stop.disarm();
     }
 
     fn cancel(&mut self, reason: &str) {
-        if !matches!(self.state, GuardState::Armed) {
-            return;
-        }
-        self.state = GuardState::Disarmed;
-        {
-            let mut waiters = self
-                .session
-                .in_flight
-                .lock()
-                .unwrap_or_else(|p| p.into_inner());
-            waiters.retain(|w| w.wire_id != self.wire_id);
-        }
-        self.session.active_requests.fetch_sub(1, Ordering::AcqRel);
+        self.stop.stop(reason, None);
+    }
 
-        if self.session.alive.load(Ordering::Acquire) {
-            let cancel = json!({
-                "jsonrpc": "2.0",
-                "method": "notifications/cancelled",
-                "params": {
-                    "requestId": self.wire_id,
-                    "reason": reason
-                }
-            });
-            let _ = self.session.send_cancel_line(&cancel);
-        }
+    fn into_stop(self) -> Arc<RequestStopOwner> {
+        let stop = Arc::clone(&self.stop);
+        std::mem::forget(self);
+        stop
     }
 }
 
 impl Drop for RequestGuard {
     fn drop(&mut self) {
-        self.cancel("client disconnected");
+        self.stop.stop("client disconnected", None);
     }
 }
 
 struct StdioSseStreamBody {
-    notif_rx: mpsc::UnboundedReceiver<QueuedNotif>,
+    notif_rx: NotifQueueRx,
     resp_rx: Option<oneshot::Receiver<RespDelivery>>,
     pending_resp: Option<RespDelivery>,
     active_resp_cursor: Option<LeasedFrameCursor>,
     active_resp_is_error: bool,
     notif_done: bool,
-    guard: Arc<Mutex<RequestGuard>>,
+    stop: Arc<RequestStopOwner>,
     session: Arc<StdioSession>,
     idle_timeout: Duration,
     idle_sleep: Pin<Box<tokio::time::Sleep>>,
     last_frame_ms: Arc<AtomicU64>,
     stream_done: CancellationToken,
     timed_out_fut: Mutex<Pin<Box<dyn Future<Output = ()> + Send>>>,
-    ephemeral: Arc<Mutex<Option<EphemeralGuard>>>,
     finished: bool,
 }
 
 impl StdioSseStreamBody {
     fn new(
-        notif_rx: mpsc::UnboundedReceiver<QueuedNotif>,
+        notif_rx: NotifQueueRx,
         resp_rx: oneshot::Receiver<RespDelivery>,
         guard: RequestGuard,
         session: Arc<StdioSession>,
         idle_timeout: Duration,
         ephemeral: Option<EphemeralGuard>,
     ) -> Self {
-        let guard_arc = Arc::new(Mutex::new(guard));
-        let ephem_arc = Arc::new(Mutex::new(ephemeral));
+        let stop = guard.into_stop();
+        if let Some(ephem) = ephemeral {
+            stop.attach_ephemeral(ephem);
+        }
         let last_frame_ms = Arc::new(AtomicU64::new(elapsed_ms(session.epoch)));
         let stream_done = CancellationToken::new();
         let timed_out = CancellationToken::new();
@@ -2742,8 +3402,7 @@ impl StdioSseStreamBody {
             as Pin<Box<dyn Future<Output = ()> + Send>>);
 
         if let Ok(handle) = tokio::runtime::Handle::try_current() {
-            let wd_guard = Arc::clone(&guard_arc);
-            let wd_ephem = Arc::clone(&ephem_arc);
+            let wd_stop = Arc::clone(&stop);
             let wd_last = Arc::clone(&last_frame_ms);
             let wd_done = stream_done.clone();
             let wd_timed_out = timed_out;
@@ -2756,14 +3415,7 @@ impl StdioSseStreamBody {
                     let now = elapsed_ms(epoch);
                     let elapsed = now.saturating_sub(last);
                     if elapsed >= timeout_ms {
-                        wd_guard
-                            .lock()
-                            .unwrap_or_else(|p| p.into_inner())
-                            .cancel("request timed out");
-                        let ephem_opt = wd_ephem.lock().unwrap_or_else(|p| p.into_inner()).take();
-                        if let Some(mut ephem) = ephem_opt {
-                            ephem.terminate_now().await;
-                        }
+                        wd_stop.stop("request timed out", None);
                         wd_timed_out.cancel();
                         break;
                     }
@@ -2783,14 +3435,13 @@ impl StdioSseStreamBody {
             active_resp_cursor: None,
             active_resp_is_error: false,
             notif_done: false,
-            guard: guard_arc,
+            stop,
             session,
             idle_timeout,
             idle_sleep: Box::pin(tokio::time::sleep(idle_timeout)),
             last_frame_ms,
             stream_done,
             timed_out_fut,
-            ephemeral: ephem_arc,
             finished: false,
         }
     }
@@ -2801,15 +3452,7 @@ impl StdioSseStreamBody {
         self.pending_resp = None;
         self.stream_done.cancel();
         self.session.touch_client();
-        self.guard
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .mark_completed();
-        let _ = self
-            .ephemeral
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .take();
+        self.stop.mark_completed();
     }
 
     fn finish_disarmed(&mut self) {
@@ -2817,15 +3460,14 @@ impl StdioSseStreamBody {
         self.active_resp_cursor = None;
         self.pending_resp = None;
         self.stream_done.cancel();
-        self.guard
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .disarm();
-        let _ = self
-            .ephemeral
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .take();
+        self.stop.disarm();
+    }
+
+    fn finish_failed(&mut self) {
+        self.finished = true;
+        self.active_resp_cursor = None;
+        self.pending_resp = None;
+        self.stream_done.cancel();
     }
 
     fn finish_timed_out(&mut self) {
@@ -2833,18 +3475,11 @@ impl StdioSseStreamBody {
         let had_resp =
             self.active_resp_cursor.take().is_some() || self.pending_resp.take().is_some();
         self.stream_done.cancel();
-        let mut g = self.guard.lock().unwrap_or_else(|p| p.into_inner());
         if had_resp {
-            g.disarm();
+            self.stop.disarm();
         } else {
-            g.cancel("request timed out");
+            self.stop.stop("request timed out", None);
         }
-        drop(g);
-        let _ = self
-            .ephemeral
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .take();
     }
 }
 
@@ -2853,18 +3488,11 @@ impl Drop for StdioSseStreamBody {
         let had_resp =
             self.active_resp_cursor.take().is_some() || self.pending_resp.take().is_some();
         self.stream_done.cancel();
-        let mut g = self.guard.lock().unwrap_or_else(|p| p.into_inner());
         if had_resp {
-            g.disarm();
+            self.stop.disarm();
         } else {
-            g.cancel("client disconnected");
+            self.stop.stop("client disconnected", None);
         }
-        drop(g);
-        let _ = self
-            .ephemeral
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .take();
     }
 }
 
@@ -2880,6 +3508,11 @@ impl Body for StdioSseStreamBody {
         loop {
             if this.finished {
                 return Poll::Ready(None);
+            }
+
+            if let Some(reason) = this.notif_rx.take_failure() {
+                this.finish_failed();
+                return Poll::Ready(Some(Err(io::Error::other(reason))));
             }
 
             let timed_out_pin = this
@@ -2916,8 +3549,12 @@ impl Body for StdioSseStreamBody {
             }
 
             if !this.notif_done {
-                match this.notif_rx.poll_recv(cx) {
-                    Poll::Ready(Some(queued)) => {
+                match this.notif_rx.poll_pop(cx) {
+                    Poll::Ready(Err(reason)) => {
+                        this.finish_failed();
+                        return Poll::Ready(Some(Err(io::Error::other(reason))));
+                    }
+                    Poll::Ready(Ok(Some(queued))) => {
                         this.session.touch_client();
                         this.last_frame_ms
                             .store(elapsed_ms(this.session.epoch), Ordering::Release);
@@ -2927,11 +3564,11 @@ impl Body for StdioSseStreamBody {
                         let frame = match queued.into_sse(&this.session.budget) {
                             Ok(bytes) => bytes,
                             Err(_) => {
-                                this.guard
-                                    .lock()
-                                    .unwrap_or_else(|p| p.into_inner())
-                                    .cancel("process active byte budget exceeded");
-                                this.finish_disarmed();
+                                this.stop.stop(
+                                    "process active byte budget exceeded",
+                                    Some("process active byte budget exceeded"),
+                                );
+                                this.finish_failed();
                                 return Poll::Ready(Some(Err(io::Error::other(
                                     "process active byte budget exceeded",
                                 ))));
@@ -2939,7 +3576,7 @@ impl Body for StdioSseStreamBody {
                         };
                         return Poll::Ready(Some(Ok(Frame::data(frame))));
                     }
-                    Poll::Ready(None) => {
+                    Poll::Ready(Ok(None)) => {
                         this.notif_done = true;
                     }
                     Poll::Pending => {}
@@ -2975,6 +3612,10 @@ impl Body for StdioSseStreamBody {
             }
 
             if this.notif_done {
+                if let Some(reason) = this.notif_rx.take_failure() {
+                    this.finish_failed();
+                    return Poll::Ready(Some(Err(io::Error::other(reason))));
+                }
                 if let Some(delivery) = this.pending_resp.take() {
                     let (json_bytes, lease, is_err) = match delivery {
                         RespDelivery::Ok { json_bytes, lease } => (json_bytes, lease, false),
@@ -3030,26 +3671,11 @@ impl Body for StdioSseStreamBody {
 
 fn enqueue_notif(
     notif_budget: &Arc<ByteBudget>,
-    tx: &mpsc::UnboundedSender<QueuedNotif>,
+    tx: &NotifQueue,
     line: String,
     process_lease: Option<ByteLease>,
 ) {
-    if tx.is_closed() {
-        drop(line);
-        drop(process_lease);
-        return;
-    }
-    let cost = line.capacity().max(1);
-    let Some(lease) = ByteBudget::try_acquire(notif_budget, cost) else {
-        drop(line);
-        drop(process_lease);
-        return;
-    };
-    let _ = tx.send(QueuedNotif {
-        line,
-        _lease: lease,
-        _process_lease: process_lease,
-    });
+    let _ = tx.enqueue(notif_budget, line, process_lease);
 }
 
 fn encode_notification(value: &Value, budget: &Arc<ByteBudget>) -> Option<(String, ByteLease)> {
@@ -3061,6 +3687,23 @@ fn encode_notification(value: &Value, budget: &Arc<ByteBudget>) -> Option<(Strin
                 lease,
             )
         })
+}
+
+fn is_events_push_notification(method: &str) -> bool {
+    matches!(
+        method,
+        "notifications/events/active"
+            | "notifications/events/event"
+            | "notifications/events/heartbeat"
+            | "notifications/events/error"
+            | "notifications/events/terminated"
+    )
+}
+
+fn is_valid_final_response(obj: &serde_json::Map<String, Value>) -> bool {
+    let has_result = obj.contains_key("result");
+    let has_error = obj.contains_key("error");
+    (has_result && !has_error) || (!has_result && obj.get("error").is_some_and(Value::is_object))
 }
 
 fn dispatch_large_response_line(
@@ -3076,6 +3719,52 @@ fn dispatch_large_response_line(
     let Some(wire_id) = top_id.wire_id else {
         return;
     };
+
+    enum LargeWaiter {
+        EventsLive(Box<LiveInFlight>),
+        EventsStopping(Arc<StopSettlement>),
+        Other,
+    }
+
+    // Events completions never bypass structured validation via raw splice.
+    let events_match = {
+        let mut waiters = in_flight.lock().unwrap_or_else(|p| p.into_inner());
+        match waiters.iter().position(|w| w.wire_id == wire_id) {
+            Some(pos) if waiters[pos].is_events_stream() => match waiters.remove(pos).state {
+                InFlightState::Live(live) => Some(LargeWaiter::EventsLive(live)),
+                InFlightState::Stopping(stopping) => {
+                    Some(LargeWaiter::EventsStopping(stopping.settled))
+                }
+            },
+            Some(_) => Some(LargeWaiter::Other),
+            None => None,
+        }
+    };
+    match events_match {
+        None => return,
+        Some(LargeWaiter::EventsLive(live)) => {
+            drop(outcome);
+            let stop = live.stop.upgrade();
+            let queue = live.notif_tx.queue();
+            drop(live);
+            if let Some(stop) = stop {
+                stop.fail_without_cancel("events/stream completion exceeds control line limit");
+            } else {
+                queue.fail("events/stream completion exceeds control line limit");
+            }
+            return;
+        }
+        Some(LargeWaiter::EventsStopping(settled)) => {
+            drop(outcome);
+            settled.observe_final_response();
+            return;
+        }
+        Some(LargeWaiter::Other) => {}
+    }
+
+    if outcome.discarded {
+        return;
+    }
     let Ok(text) = std::str::from_utf8(&outcome.raw) else {
         return;
     };
@@ -3095,19 +3784,27 @@ fn dispatch_large_response_line(
             .position(|w| w.wire_id == wire_id)
             .map(|pos| waiters.remove(pos))
     };
-    let Some(mut entry) = entry else {
+    let Some(entry) = entry else {
         return;
     };
+    let mut live = match entry.state {
+        InFlightState::Live(live) => *live,
+        InFlightState::Stopping(stopping) => {
+            drop(outcome);
+            stopping.settled.observe_final_response();
+            return;
+        }
+    };
     // Reuse the already charged error workspace for the temporary encoded ID.
-    serde_json::to_writer(&mut entry.error_buffer.bytes, &entry.client_id)
+    serde_json::to_writer(&mut live.error_buffer.bytes, &live.client_id)
         .expect("valid ID fits its reserved encoding workspace");
     outcome.raw.truncate(trimmed_len);
     let old_id_len = top_id.end - top_id.start;
-    let final_len = trimmed_len - old_id_len + entry.error_buffer.bytes.len();
+    let final_len = trimmed_len - old_id_len + live.error_buffer.bytes.len();
     if outcome.reserve(final_len, final_len).is_err() {
         drop(outcome);
         send_request_error(
-            entry,
+            live,
             StatusCode::SERVICE_UNAVAILABLE,
             "process active byte budget exceeded".to_owned(),
         );
@@ -3115,9 +3812,9 @@ fn dispatch_large_response_line(
     }
     outcome.raw.splice(
         top_id.start..top_id.end,
-        entry.error_buffer.bytes.iter().copied(),
+        live.error_buffer.bytes.iter().copied(),
     );
-    let _ = entry.resp_tx.send(RespDelivery::Ok {
+    let _ = live.resp_tx.send(RespDelivery::Ok {
         json_bytes: outcome.raw,
         lease: outcome.lease,
     });
@@ -3164,36 +3861,138 @@ fn dispatch_stdout_message(
         let Some(wire_id) = obj.get("id").and_then(Value::as_u64) else {
             return Ok(());
         };
-        let entry = {
+        let valid_final = is_valid_final_response(obj);
+        enum RemovedWaiter {
+            Live(Box<LiveInFlight>),
+            Stopping(Arc<StopSettlement>),
+        }
+        let removed = {
             let mut waiters = in_flight.lock().unwrap_or_else(|p| p.into_inner());
-            waiters
-                .iter()
-                .position(|w| w.wire_id == wire_id)
-                .map(|pos| waiters.remove(pos))
+            if let Some(pos) = waiters.iter().position(|w| w.wire_id == wire_id) {
+                match &waiters[pos].state {
+                    InFlightState::Live(_) => {
+                        let InFlightState::Live(live) = waiters.remove(pos).state else {
+                            unreachable!();
+                        };
+                        Some(RemovedWaiter::Live(live))
+                    }
+                    InFlightState::Stopping(_) if valid_final => {
+                        let InFlightState::Stopping(stopping) = waiters.remove(pos).state else {
+                            unreachable!();
+                        };
+                        Some(RemovedWaiter::Stopping(stopping.settled))
+                    }
+                    InFlightState::Stopping(_) => None,
+                }
+            } else {
+                None
+            }
         };
-        let Some(entry) = entry else {
+        let Some(removed) = removed else {
             return Ok(());
         };
-        let mut entry = entry;
+        let mut live = match removed {
+            RemovedWaiter::Stopping(settled) => {
+                settled.observe_final_response();
+                return Ok(());
+            }
+            RemovedWaiter::Live(live) => *live,
+        };
+        if live.is_events_stream {
+            let is_rpc_error =
+                !obj.contains_key("result") && obj.get("error").is_some_and(Value::is_object);
+            let is_valid_complete = obj.contains_key("result")
+                && !obj.contains_key("error")
+                && obj
+                    .get("result")
+                    .and_then(Value::as_object)
+                    .is_some_and(|res| {
+                        res.get("resultType").and_then(Value::as_str) == Some("complete")
+                            && res
+                                .get("_meta")
+                                .and_then(Value::as_object)
+                                .and_then(|meta| meta.get(SUBSCRIPTION_ID_META_KEY))
+                                .and_then(Value::as_u64)
+                                == Some(wire_id)
+                    });
+            if !is_rpc_error && !is_valid_complete {
+                drop(val);
+                let stop = live.stop.upgrade();
+                let queue = live.notif_tx.queue();
+                drop(live);
+                if let Some(stop) = stop {
+                    stop.fail_without_cancel("malformed events/stream completion");
+                } else {
+                    queue.fail("malformed events/stream completion");
+                }
+                return Ok(());
+            }
+            if is_valid_complete {
+                let Ok(sub_id_copy) = LeasedJson::copy(&live.client_id, budget, 0) else {
+                    drop(val);
+                    let stop = live.stop.upgrade();
+                    let queue = live.notif_tx.queue();
+                    drop(live);
+                    if let Some(stop) = stop {
+                        stop.fail_without_cancel("process active byte budget exceeded");
+                    } else {
+                        queue.fail("process active byte budget exceeded");
+                    }
+                    return Ok(());
+                };
+                if let Some(meta) = val
+                    .get_mut("result")
+                    .and_then(Value::as_object_mut)
+                    .and_then(|res| res.get_mut("_meta"))
+                    .and_then(Value::as_object_mut)
+                {
+                    meta.insert(SUBSCRIPTION_ID_META_KEY.to_owned(), sub_id_copy.value);
+                }
+            }
+            if let Some(map) = val.as_object_mut() {
+                map.insert("id".to_owned(), std::mem::take(&mut live.client_id));
+            }
+            match encode_json_leased(&val, b"", budget) {
+                Ok((out, lease)) => {
+                    drop(val);
+                    let _ = live.resp_tx.send(RespDelivery::Ok {
+                        json_bytes: out,
+                        lease: Some(lease),
+                    });
+                }
+                Err(_) => {
+                    drop(val);
+                    let stop = live.stop.upgrade();
+                    let queue = live.notif_tx.queue();
+                    drop(live);
+                    if let Some(stop) = stop {
+                        stop.fail_without_cancel("process active byte budget exceeded");
+                    } else {
+                        queue.fail("process active byte budget exceeded");
+                    }
+                }
+            }
+            return Ok(());
+        }
         if let Some(map) = val.as_object_mut() {
-            map.insert("id".to_owned(), std::mem::take(&mut entry.client_id));
+            map.insert("id".to_owned(), std::mem::take(&mut live.client_id));
         }
         match encode_json_leased(&val, b"", budget) {
             Ok((out, lease)) => {
                 drop(val);
-                let _ = entry.resp_tx.send(RespDelivery::Ok {
+                let _ = live.resp_tx.send(RespDelivery::Ok {
                     json_bytes: out,
                     lease: Some(lease),
                 });
             }
             Err(_) => {
-                entry.client_id = val
+                live.client_id = val
                     .as_object_mut()
                     .and_then(|map| map.remove("id"))
                     .unwrap_or(Value::Null);
                 drop(val);
                 send_request_error(
-                    entry,
+                    live,
                     StatusCode::SERVICE_UNAVAILABLE,
                     "process active byte budget exceeded".to_owned(),
                 );
@@ -3201,6 +4000,65 @@ fn dispatch_stdout_message(
         }
         return Ok(());
     }
+
+    if let Some(method) = method_opt
+        && is_events_push_notification(method)
+    {
+        let Some(sub_wire_id) = obj
+            .get("params")
+            .and_then(|p| p.get("_meta"))
+            .and_then(|m| m.get(SUBSCRIPTION_ID_META_KEY))
+            .and_then(Value::as_u64)
+        else {
+            return Ok(());
+        };
+        let matched = {
+            let waiters = in_flight.lock().unwrap_or_else(|p| p.into_inner());
+            waiters
+                .iter()
+                .find(|w| w.wire_id == sub_wire_id)
+                .and_then(InFlightEntry::as_live)
+                .filter(|live| live.is_events_stream && !live.notif_tx.is_closed())
+                .map(|live| {
+                    let copied = LeasedJson::copy(&live.client_id, budget, 0).ok();
+                    (copied, live.notif_tx.queue(), live.stop.upgrade())
+                })
+        };
+        let Some((copied_id, queue, stop)) = matched else {
+            return Ok(());
+        };
+        let fail_stream = |reason: &str| {
+            if let Some(ref stop) = stop {
+                stop.stop(reason, Some(reason));
+            } else {
+                queue.fail(reason);
+            }
+        };
+        let Some(client_id) = copied_id else {
+            drop(val);
+            fail_stream("process active byte budget exceeded");
+            return Ok(());
+        };
+        if let Some(meta) = val
+            .get_mut("params")
+            .and_then(Value::as_object_mut)
+            .and_then(|p| p.get_mut("_meta"))
+            .and_then(Value::as_object_mut)
+        {
+            meta.insert(SUBSCRIPTION_ID_META_KEY.to_owned(), client_id.value);
+        }
+        let Some((out, lease)) = encode_notification(&val, budget) else {
+            drop(val);
+            fail_stream("process active byte budget exceeded");
+            return Ok(());
+        };
+        drop(val);
+        if let Err(SendLineErr::Overloaded) = queue.enqueue(notif_budget, out, Some(lease)) {
+            fail_stream("events notification queue budget exceeded");
+        }
+        return Ok(());
+    }
+
     let is_progress = method_opt == Some("notifications/progress");
     if let Some(rel_wire_id) = obj
         .get("params")
@@ -3213,13 +4071,14 @@ fn dispatch_stdout_message(
             waiters
                 .iter()
                 .find(|w| w.wire_id == rel_wire_id)
-                .and_then(|w| {
-                    let client_id = LeasedJson::copy(&w.client_id, budget, 0).ok()?;
-                    let progress = match &w.client_progress_token {
+                .and_then(InFlightEntry::as_live)
+                .and_then(|live| {
+                    let client_id = LeasedJson::copy(&live.client_id, budget, 0).ok()?;
+                    let progress = match &live.client_progress_token {
                         Some(value) => Some(LeasedJson::copy(value, budget, 0).ok()?),
                         None => None,
                     };
-                    Some((client_id, progress, w.notif_tx.clone()))
+                    Some((client_id, progress, live.notif_tx.queue()))
                 })
         };
         if let Some((client_id, mut client_ptok, notif_tx)) = matched {
@@ -3263,12 +4122,16 @@ fn dispatch_stdout_message(
         };
         let matched = {
             let waiters = in_flight.lock().unwrap_or_else(|p| p.into_inner());
-            waiters.iter().find(|w| w.wire_id == wire_id).and_then(|w| {
-                let original = w.client_progress_token.as_ref()?;
-                LeasedJson::copy(original, budget, 0)
-                    .ok()
-                    .map(|orig| (orig, w.notif_tx.clone()))
-            })
+            waiters
+                .iter()
+                .find(|w| w.wire_id == wire_id)
+                .and_then(InFlightEntry::as_live)
+                .and_then(|live| {
+                    let original = live.client_progress_token.as_ref()?;
+                    LeasedJson::copy(original, budget, 0)
+                        .ok()
+                        .map(|orig| (orig, live.notif_tx.queue()))
+                })
         };
         if let Some((orig_ptok, notif_tx)) = matched {
             if let Some(params) = val.get_mut("params").and_then(Value::as_object_mut) {
@@ -3284,12 +4147,13 @@ fn dispatch_stdout_message(
         return Ok(());
     }
 
-    let targets: Vec<mpsc::UnboundedSender<QueuedNotif>> = {
+    let targets: Vec<Arc<NotifQueue>> = {
         let waiters = in_flight.lock().unwrap_or_else(|p| p.into_inner());
         waiters
             .iter()
-            .filter(|w| !w.notif_tx.is_closed())
-            .map(|w| w.notif_tx.clone())
+            .filter_map(InFlightEntry::as_live)
+            .filter(|live| !live.notif_tx.is_closed())
+            .map(|live| live.notif_tx.queue())
             .collect()
     };
     for tx in targets {
@@ -3425,11 +4289,13 @@ fn accept_contains(headers: &HeaderMap, target: &str) -> bool {
                 return false;
             }
             !parts.any(|param| {
-                let p = param.trim();
-                p.strip_prefix("q=")
-                    .or_else(|| p.strip_prefix("Q="))
-                    .and_then(|q| q.trim().parse::<f32>().ok())
-                    .is_some_and(|q| q <= 0.0)
+                let Some((key, value)) = param.split_once('=') else {
+                    return false;
+                };
+                if !key.trim().eq_ignore_ascii_case("q") {
+                    return false;
+                }
+                !matches!(value.trim().parse::<f32>(), Ok(q) if q > 0.0)
             })
         })
 }
@@ -3461,7 +4327,7 @@ fn single_rpc_reply(
     builder.body(body).expect("valid RPC reply")
 }
 
-fn send_request_error(entry: InFlightEntry, status: StatusCode, message: String) {
+fn send_request_error(entry: LiveInFlight, status: StatusCode, message: String) {
     let (json_bytes, lease) = entry.error_buffer.finish(&entry.client_id, &message);
     let _ = entry.resp_tx.send(RespDelivery::HardError {
         status,
@@ -3562,10 +4428,19 @@ struct TopIdSpan {
     wire_id: Option<u64>,
 }
 
+fn is_events_waiter(in_flight: &Mutex<Vec<InFlightEntry>>, wire_id: u64) -> bool {
+    in_flight
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .iter()
+        .any(|w| w.wire_id == wire_id && w.is_events_stream())
+}
+
 struct ReadLineOutcome {
     // Keep the allocation and its lease together across reads and cancellation.
     raw: Vec<u8>,
     len: usize,
+    discarded: bool,
     saw_method: bool,
     id_count: usize,
     top_id: Option<TopIdSpan>,
@@ -3577,6 +4452,7 @@ impl ReadLineOutcome {
         Self {
             raw: Vec::new(),
             len: 0,
+            discarded: false,
             saw_method: false,
             id_count: 0,
             top_id: None,
@@ -3597,8 +4473,18 @@ impl ReadLineOutcome {
         }
     }
 
+    fn discard_buffer(&mut self) {
+        self.discarded = true;
+        self.raw = Vec::new();
+        if let Some(lease) = self.lease.as_mut() {
+            lease.shrink_to(0);
+        }
+    }
+
     fn finish(mut self, scanner: &TopLevelJsonScanner) -> Self {
-        self.len = self.raw.len();
+        if !self.discarded {
+            self.len = self.raw.len();
+        }
         self.saw_method = scanner.saw_method;
         self.id_count = scanner.id_count;
         self.top_id = scanner.top_id;
@@ -3623,7 +4509,9 @@ fn fail_session_waiters(
         std::mem::take(&mut *waiters)
     };
     for entry in drained {
-        send_request_error(entry, status, message.clone());
+        if let InFlightState::Live(live) = entry.state {
+            send_request_error(*live, status, message.clone());
+        }
     }
 }
 
@@ -3926,13 +4814,15 @@ async fn read_stdout_line<R: tokio::io::AsyncBufRead + Unpin>(
         .min(limits.max_stdout_line_bytes);
     let mut scanner = TopLevelJsonScanner::new();
     let mut speculative = false;
+    let mut total_len = 0usize;
 
     loop {
         let available = reader.fill_buf().await.map_err(|_| ReadStdoutErr::Io)?;
         if available.is_empty() {
-            if speculative && !out.raw.is_empty() {
+            if speculative && total_len > 0 {
                 return Ok(ReadLineOutcome::empty(budget));
             }
+            out.len = total_len;
             return Ok(out.finish(&scanner));
         }
 
@@ -3944,8 +4834,10 @@ async fn read_stdout_line<R: tokio::io::AsyncBufRead + Unpin>(
                 let take = newline.map_or(window.len(), |pos| pos + 1);
                 out.reserve(out.raw.len() + take, control_limit)?;
                 out.raw.extend_from_slice(&window[..take]);
+                total_len += take;
                 reader.consume(take);
                 if newline.is_some() {
+                    out.len = total_len;
                     return Ok(out.finish(&scanner));
                 }
                 continue;
@@ -3967,14 +4859,18 @@ async fn read_stdout_line<R: tokio::io::AsyncBufRead + Unpin>(
                     HardRejectError::ControlMessageTooLarge(limits.max_control_line_bytes),
                 ));
             }
+            if scanner.id_count == 1
+                && let Some(wire_id) = scanner.top_id.and_then(|s| s.wire_id)
+                && is_events_waiter(in_flight, wire_id)
+            {
+                out.discard_buffer();
+            }
             speculative = true;
         }
 
         let newline = available.iter().position(|&b| b == b'\n');
         let take = newline.map_or(available.len(), |pos| pos + 1);
-        let Some(new_len) = out
-            .raw
-            .len()
+        let Some(new_len) = total_len
             .checked_add(take)
             .filter(|&n| n <= limits.max_stdout_line_bytes)
         else {
@@ -3982,17 +4878,28 @@ async fn read_stdout_line<R: tokio::io::AsyncBufRead + Unpin>(
                 limits.max_stdout_line_bytes,
             )));
         };
-        out.reserve(new_len, limits.max_stdout_line_bytes)?;
-        scanner.feed(&available[..take]);
-        out.raw.extend_from_slice(&available[..take]);
-        reader.consume(take);
-        if newline.is_some() {
-            return Ok(out.finish(&scanner));
+        if !out.discarded {
+            out.reserve(new_len, limits.max_stdout_line_bytes)?;
+            out.raw.extend_from_slice(&available[..take]);
         }
+        scanner.feed(&available[..take]);
+        total_len = new_len;
+        reader.consume(take);
         if scanner.saw_method {
             return Err(ReadStdoutErr::Hard(
                 HardRejectError::ControlMessageTooLarge(limits.max_control_line_bytes),
             ));
+        }
+        if !out.discarded
+            && scanner.id_count == 1
+            && let Some(wire_id) = scanner.top_id.and_then(|s| s.wire_id)
+            && is_events_waiter(in_flight, wire_id)
+        {
+            out.discard_buffer();
+        }
+        if newline.is_some() {
+            out.len = total_len;
+            return Ok(out.finish(&scanner));
         }
     }
 }
@@ -4012,6 +4919,7 @@ mod tests {
             grant_id: "g".to_owned(),
             weak_inner: Weak::new(),
             budget: Arc::clone(budget),
+            limits: StdioLimits::default(),
             writer_cancel: CancellationToken::new(),
             stdin_tx: Arc::new(Mutex::new(None)),
             in_flight: Arc::new(Mutex::new(Vec::new())),
@@ -4416,10 +5324,13 @@ with open(sys.argv[1], "w", encoding="utf-8") as log:
         let (_, mut guard, _notifications, mut response) =
             session.register_request(&id, None).unwrap();
         let entry = session.in_flight.lock().unwrap().pop().unwrap();
+        let InFlightState::Live(live) = entry.state else {
+            panic!("expected live entry");
+        };
         let occupied = budget.try_acquire(budget.limit() - budget.used()).unwrap();
         assert_eq!(budget.used(), budget.limit());
         send_request_error(
-            entry,
+            *live,
             StatusCode::SERVICE_UNAVAILABLE,
             "process active byte budget exceeded".to_owned(),
         );
@@ -4477,7 +5388,7 @@ with open(sys.argv[1], "w", encoding="utf-8") as log:
         let notif_budget = ByteBudget::new(4096);
         let session = request_test_session(&budget);
         let parsed = LeasedJson::parse(NORMAL_REQUEST, &budget).unwrap();
-        let (wire_id, mut guard, mut notifications, _response) = session
+        let (wire_id, mut guard, notifications, _response) = session
             .register_request(&parsed.value["id"], extract_progress_token(&parsed.value))
             .unwrap();
         drop(parsed);
@@ -4670,9 +5581,11 @@ with open(sys.argv[1], "w", encoding="utf-8") as log:
         assert_eq!(json_encoded_len(&id).unwrap(), 32);
         for final_len in [AVAILABLE, AVAILABLE + 1] {
             let budget = ByteBudget::new(2 * AVAILABLE + 4096);
-            let (notif_tx, _notif_rx) = mpsc::unbounded_channel();
+            let (notif_tx, _notif_rx) = notif_channel();
             let (resp_tx, mut resp_rx) = oneshot::channel();
-            let entry = InFlightEntry::new(2, &id, None, notif_tx, resp_tx, &budget).unwrap();
+            let entry =
+                InFlightEntry::new(2, &id, None, false, notif_tx, resp_tx, Weak::new(), &budget)
+                    .unwrap();
             let in_flight = Mutex::new(vec![entry]);
             let line_len = final_len - 30; // Drop LF, then replace one digit with 32 bytes.
             let mut lease = budget.try_acquire(0).unwrap();
@@ -4691,6 +5604,7 @@ with open(sys.argv[1], "w", encoding="utf-8") as log:
             let outcome = ReadLineOutcome {
                 len: raw.len(),
                 raw,
+                discarded: false,
                 lease: Some(lease),
                 saw_method: false,
                 id_count: 1,
@@ -4819,6 +5733,7 @@ with open(sys.argv[1], "w", encoding="utf-8") as log:
             grant_id: "g".to_owned(),
             weak_inner: Weak::new(),
             budget: ByteBudget::new(4096),
+            limits: StdioLimits::default(),
             writer_cancel: CancellationToken::new(),
             stdin_tx: Arc::new(Mutex::new(None)),
             in_flight: Arc::new(Mutex::new(Vec::new())),
@@ -4834,7 +5749,7 @@ with open(sys.argv[1], "w", encoding="utf-8") as log:
             epoch: now,
         });
 
-        let (notif_tx, notif_rx) = mpsc::unbounded_channel();
+        let (notif_tx, notif_rx) = notif_channel();
         let (resp_tx, resp_rx) = oneshot::channel::<RespDelivery>();
         drop(resp_tx);
 
@@ -4842,9 +5757,13 @@ with open(sys.argv[1], "w", encoding="utf-8") as log:
             notif_rx,
             resp_rx,
             RequestGuard {
-                session: Arc::clone(&session),
-                wire_id: 1,
-                state: GuardState::Armed,
+                stop: Arc::new(RequestStopOwner::new(
+                    Arc::clone(&session),
+                    None,
+                    1,
+                    false,
+                    notif_tx.queue(),
+                )),
             },
             Arc::clone(&session),
             Duration::from_secs(30),
@@ -4857,7 +5776,7 @@ with open(sys.argv[1], "w", encoding="utf-8") as log:
         assert!(Pin::new(&mut body).poll_frame(&mut cx).is_pending());
         enqueue_notif(
             &notif_budget,
-            &notif_tx,
+            &notif_tx.queue(),
             r#"{"jsonrpc":"2.0","method":"notifications/progress"}"#.to_owned(),
             None,
         );
@@ -5030,15 +5949,17 @@ with open(sys.argv[1], "w", encoding="utf-8") as log:
             max_control_line_bytes: 1024,
             ..StdioLimits::default()
         };
-        let (notif_tx, _notif_rx) = mpsc::unbounded_channel();
+        let (notif_tx, _notif_rx) = notif_channel();
         let (resp_tx, resp_rx) = oneshot::channel();
         let in_flight = Mutex::new(vec![
             InFlightEntry::new(
                 1,
                 &json!("client"),
                 None,
+                false,
                 notif_tx,
                 resp_tx,
+                Weak::new(),
                 &ByteBudget::new(4096),
             )
             .unwrap(),
@@ -5074,15 +5995,17 @@ with open(sys.argv[1], "w", encoding="utf-8") as log:
         };
         let in_flight: Mutex<Vec<InFlightEntry>> = Mutex::new(Vec::new());
         let push_waiter = |wire_id: u64, client_id: Value| {
-            let (notif_tx, _notif_rx) = mpsc::unbounded_channel();
+            let (notif_tx, _notif_rx) = notif_channel();
             let (resp_tx, resp_rx) = oneshot::channel();
             in_flight.lock().unwrap().push(
                 InFlightEntry::new(
                     wire_id,
                     &client_id,
                     None,
+                    false,
                     notif_tx,
                     resp_tx,
+                    Weak::new(),
                     &ByteBudget::new(4096),
                 )
                 .unwrap(),
@@ -5232,15 +6155,15 @@ with open(sys.argv[1], "w", encoding="utf-8") as log:
         };
         let capacity = make_line().capacity();
         let budget = ByteBudget::new(capacity);
-        let (tx, mut rx) = mpsc::unbounded_channel();
+        let (tx, rx) = notif_channel();
 
         let occupied = ByteBudget::try_acquire(&budget, 1).unwrap();
-        enqueue_notif(&budget, &tx, make_line(), None);
+        enqueue_notif(&budget, &tx.queue(), make_line(), None);
         assert_eq!(budget.used(), 1);
         assert!(rx.try_recv().is_err());
         drop(occupied);
 
-        enqueue_notif(&budget, &tx, make_line(), None);
+        enqueue_notif(&budget, &tx.queue(), make_line(), None);
         assert_eq!(budget.used(), capacity);
         let queued = rx.try_recv().unwrap();
         assert_eq!(
@@ -5248,7 +6171,7 @@ with open(sys.argv[1], "w", encoding="utf-8") as log:
             capacity,
             "the dequeued entry still owns its string"
         );
-        enqueue_notif(&budget, &tx, "x".into(), None);
+        enqueue_notif(&budget, &tx.queue(), "x".into(), None);
         assert!(rx.try_recv().is_err());
         drop(queued);
         assert_eq!(budget.used(), 0);
@@ -5261,31 +6184,51 @@ with open(sys.argv[1], "w", encoding="utf-8") as log:
         let alive = AtomicBool::new(true);
 
         // Register 2 open SSE waiters + 1 closed JSON waiter.
-        let (tx1, mut rx1) = mpsc::unbounded_channel();
+        let (tx1, rx1) = notif_channel();
         let (rtx1, _rrx1) = oneshot::channel();
-        let (tx2, rx2) = mpsc::unbounded_channel();
+        let (tx2, rx2) = notif_channel();
         let (rtx2, _rrx2) = oneshot::channel();
-        let (tx_closed, rx_closed) = mpsc::unbounded_channel();
+        let (tx_closed, rx_closed) = notif_channel();
         drop(rx_closed);
         let (rtx3, _rrx3) = oneshot::channel();
 
         {
             let mut w = in_flight.lock().unwrap();
             w.push(
-                InFlightEntry::new(1, &json!("sse-1"), None, tx1, rtx1, &ByteBudget::new(4096))
-                    .unwrap(),
+                InFlightEntry::new(
+                    1,
+                    &json!("sse-1"),
+                    None,
+                    false,
+                    tx1,
+                    rtx1,
+                    Weak::new(),
+                    &ByteBudget::new(4096),
+                )
+                .unwrap(),
             );
             w.push(
-                InFlightEntry::new(2, &json!("sse-2"), None, tx2, rtx2, &ByteBudget::new(4096))
-                    .unwrap(),
+                InFlightEntry::new(
+                    2,
+                    &json!("sse-2"),
+                    None,
+                    false,
+                    tx2,
+                    rtx2,
+                    Weak::new(),
+                    &ByteBudget::new(4096),
+                )
+                .unwrap(),
             );
             w.push(
                 InFlightEntry::new(
                     3,
                     &json!("json-closed"),
                     None,
+                    false,
                     tx_closed,
                     rtx3,
+                    Weak::new(),
                     &ByteBudget::new(4096),
                 )
                 .unwrap(),
@@ -5717,5 +6660,731 @@ time.sleep(120)
         assert!(tbl.live_sessions.is_empty());
         assert_eq!(tbl.reserved_slots, 0);
         assert_eq!(tbl.terminating_slots, 0);
+    }
+
+    #[tokio::test]
+    async fn events_stream_accept_negotiation_and_406_before_dispatch() {
+        let accepts = |raw: Option<&str>| {
+            let mut headers = HeaderMap::new();
+            if let Some(value) = raw {
+                headers.insert(header::ACCEPT, value.parse().unwrap());
+            }
+            client_accepts_sse(&headers)
+        };
+        assert!(accepts(Some("text/event-stream")));
+        assert!(accepts(Some("application/json, text/event-stream; q=0.5")));
+        assert!(accepts(Some("text/event-stream; charset=utf-8; q=1.0")));
+        assert!(!accepts(None));
+        assert!(!accepts(Some("application/json")));
+        assert!(!accepts(Some("*/*")));
+        assert!(!accepts(Some("text/*")));
+        assert!(!accepts(Some("text/event-stream; q=0")));
+        assert!(!accepts(Some("text/event-stream; q = 0.000")));
+        assert!(!accepts(Some("text/event-stream; Q=0")));
+        assert!(!accepts(Some("text/event-stream; q=NaN")));
+        assert!(!accepts(Some("text/event-stream; q=-0.5")));
+        assert!(!accepts(Some("text/event-stream; q=invalid")));
+
+        let budget = ByteBudget::new(8192);
+        let up = StdioUpstream::with_limits(
+            StdioUpstreamSettings {
+                command: "nonexistent-should-not-spawn".to_owned(),
+                args: Vec::new(),
+                env: std::collections::BTreeMap::new(),
+                cwd: None,
+                max_sessions: 1,
+                session_idle_secs: 30,
+            },
+            Arc::clone(&budget),
+            StdioLimits::default(),
+        )
+        .unwrap();
+        let token = VerifiedToken {
+            grant_id: "g".to_owned(),
+            client_id: "c".to_owned(),
+            pool_slot: 0,
+            scopes: vec!["mcp".to_owned()],
+            resource: "https://mcp.example.com/mcp".to_owned(),
+        };
+        let payload = json!({
+            "jsonrpc": "2.0",
+            "id": "sub-1",
+            "method": "events/stream",
+            "params": {}
+        });
+
+        // Sessionless rejects before acquiring a slot or spawning a child.
+        for bad_accept in ["application/json", "text/event-stream; q=0"] {
+            let mut headers = HeaderMap::new();
+            headers.insert(header::ACCEPT, bad_accept.parse().unwrap());
+            let reply = up
+                .handle_sessionless(
+                    &headers,
+                    &token,
+                    "2026-07-28",
+                    &payload,
+                    Some("events/stream"),
+                    Some(&payload["id"]),
+                )
+                .await;
+            assert_eq!(reply.status(), StatusCode::NOT_ACCEPTABLE, "{bad_accept}");
+            drop(reply);
+            let tbl = up.inner.table.lock().unwrap();
+            assert_eq!(tbl.used_slots(), 0);
+            assert!(tbl.live_sessions.is_empty());
+        }
+
+        // Sessionful rejects before registering in-flight or writing stdin.
+        let session = request_test_session(&budget);
+        let (tx, mut rx) = mpsc::channel(4);
+        *session.stdin_tx.lock().unwrap() = Some(tx);
+        up.inner
+            .table
+            .lock()
+            .unwrap()
+            .sessions
+            .insert("sid-1".to_owned(), Arc::clone(&session));
+        let mut headers = HeaderMap::new();
+        headers.insert(header::ACCEPT, "text/event-stream; q=0".parse().unwrap());
+        let reply = up
+            .handle_in_session(
+                "sid-1",
+                &headers,
+                &token,
+                &payload,
+                Some("events/stream"),
+                Some(&payload["id"]),
+            )
+            .await;
+        assert_eq!(reply.status(), StatusCode::NOT_ACCEPTABLE);
+        drop(reply);
+        assert!(session.in_flight.lock().unwrap().is_empty());
+        assert_eq!(session.active_requests.load(Ordering::Acquire), 0);
+        assert!(rx.try_recv().is_err());
+
+        up.inner.table.lock().unwrap().sessions.clear();
+        up.shutdown().await;
+        assert_eq!(budget.used(), 0);
+    }
+
+    #[tokio::test]
+    async fn events_routing_rewrites_ids_preserves_types_and_isolates_invalid_notices() {
+        let budget = ByteBudget::new(64 * 1024);
+        let notif_budget = ByteBudget::new(64 * 1024);
+        let session = request_test_session(&budget);
+
+        let (w_num, g_num, rx_num, resp_num) = session
+            .register_request_opts(&json!(42), None, true, Some("sid".into()))
+            .unwrap();
+        let (w_str, g_str, rx_str, resp_str) = session
+            .register_request_opts(&json!("42"), None, true, Some("sid".into()))
+            .unwrap();
+        let (w_ord, mut g_ord, rx_ord, _resp_ord) = session
+            .register_request_opts(&json!("ord"), None, false, Some("sid".into()))
+            .unwrap();
+
+        let dispatch = |msg: Value| {
+            dispatch_stdout_message(
+                &session.in_flight,
+                &session.stdin_tx,
+                &session.alive,
+                &notif_budget,
+                &budget,
+                msg,
+            )
+            .unwrap();
+        };
+
+        // All five push notices route only to their matching Events waiter with exact original ID types.
+        for method in [
+            "notifications/events/active",
+            "notifications/events/event",
+            "notifications/events/heartbeat",
+            "notifications/events/error",
+            "notifications/events/terminated",
+        ] {
+            dispatch(json!({
+                "jsonrpc": "2.0",
+                "method": method,
+                "params": { "_meta": { SUBSCRIPTION_ID_META_KEY: w_num }, "seq": 1 }
+            }));
+            dispatch(json!({
+                "jsonrpc": "2.0",
+                "method": method,
+                "params": { "_meta": { SUBSCRIPTION_ID_META_KEY: w_str }, "seq": 2 }
+            }));
+        }
+
+        // Missing, string-typed, unknown, and non-Events-wire-id push notices are ignored.
+        dispatch(json!({
+            "jsonrpc": "2.0",
+            "method": "notifications/events/event",
+            "params": { "seq": 99 }
+        }));
+        dispatch(json!({
+            "jsonrpc": "2.0",
+            "method": "notifications/events/event",
+            "params": { "_meta": { SUBSCRIPTION_ID_META_KEY: w_num.to_string() } }
+        }));
+        dispatch(json!({
+            "jsonrpc": "2.0",
+            "method": "notifications/events/event",
+            "params": { "_meta": { SUBSCRIPTION_ID_META_KEY: 9999 } }
+        }));
+        dispatch(json!({
+            "jsonrpc": "2.0",
+            "method": "notifications/events/event",
+            "params": { "_meta": { SUBSCRIPTION_ID_META_KEY: w_ord } }
+        }));
+
+        // Ordinary waiter must not have received any Events push notices.
+        assert!(rx_ord.try_recv().is_err());
+
+        // notifications/events/list_changed keeps generic broadcast behavior.
+        dispatch(json!({
+            "jsonrpc": "2.0",
+            "method": "notifications/events/list_changed",
+            "params": {}
+        }));
+        let ord_list_changed: Value =
+            serde_json::from_str(&rx_ord.try_recv().unwrap().line).unwrap();
+        assert_eq!(
+            ord_list_changed["method"],
+            "notifications/events/list_changed"
+        );
+
+        // Valid completion for numeric waiter rewrites both top-level id and subscriptionId.
+        dispatch(json!({
+            "jsonrpc": "2.0",
+            "id": w_num,
+            "result": {
+                "resultType": "complete",
+                "_meta": { SUBSCRIPTION_ID_META_KEY: w_num }
+            }
+        }));
+        let mut body_num = StdioSseStreamBody::new(
+            rx_num,
+            resp_num,
+            g_num,
+            Arc::clone(&session),
+            Duration::from_secs(30),
+            None,
+        );
+        let mut raw_num = Vec::new();
+        while let Some(frame) = body_num.frame().await {
+            raw_num.extend_from_slice(&frame.unwrap().into_data().unwrap());
+        }
+        let frames_num: Vec<Value> = std::str::from_utf8(&raw_num)
+            .unwrap()
+            .split("\n\n")
+            .filter(|chunk| !chunk.is_empty())
+            .map(|chunk| serde_json::from_str(chunk.strip_prefix("data: ").unwrap()).unwrap())
+            .collect();
+        assert_eq!(frames_num.len(), 7);
+        for frame in &frames_num[..5] {
+            assert_eq!(
+                frame["params"]["_meta"][SUBSCRIPTION_ID_META_KEY],
+                json!(42)
+            );
+            assert!(frame["params"]["_meta"][SUBSCRIPTION_ID_META_KEY].is_u64());
+        }
+        assert_eq!(frames_num[5]["method"], "notifications/events/list_changed");
+        assert_eq!(frames_num[6]["id"], json!(42));
+        assert!(frames_num[6]["id"].is_u64());
+        assert_eq!(
+            frames_num[6]["result"]["_meta"][SUBSCRIPTION_ID_META_KEY],
+            json!(42)
+        );
+        assert!(frames_num[6]["result"]["_meta"][SUBSCRIPTION_ID_META_KEY].is_u64());
+
+        // JSON-RPC error response for string waiter restores exact string id.
+        dispatch(json!({
+            "jsonrpc": "2.0",
+            "id": w_str,
+            "error": { "code": -32000, "message": "upstream failed" }
+        }));
+        let mut body_str = StdioSseStreamBody::new(
+            rx_str,
+            resp_str,
+            g_str,
+            Arc::clone(&session),
+            Duration::from_secs(30),
+            None,
+        );
+        let mut raw_str = Vec::new();
+        while let Some(frame) = body_str.frame().await {
+            raw_str.extend_from_slice(&frame.unwrap().into_data().unwrap());
+        }
+        let frames_str: Vec<Value> = std::str::from_utf8(&raw_str)
+            .unwrap()
+            .split("\n\n")
+            .filter(|chunk| !chunk.is_empty())
+            .map(|chunk| serde_json::from_str(chunk.strip_prefix("data: ").unwrap()).unwrap())
+            .collect();
+        assert_eq!(frames_str.len(), 7);
+        for frame in &frames_str[..5] {
+            assert_eq!(
+                frame["params"]["_meta"][SUBSCRIPTION_ID_META_KEY],
+                json!("42")
+            );
+            assert!(frame["params"]["_meta"][SUBSCRIPTION_ID_META_KEY].is_string());
+        }
+        assert_eq!(frames_str[6]["id"], json!("42"));
+        assert!(frames_str[6]["id"].is_string());
+        assert_eq!(frames_str[6]["error"]["message"], "upstream failed");
+
+        // Malformed completions fail the stream without leaking child ID.
+        for bad_result in [
+            json!({"_meta": { SUBSCRIPTION_ID_META_KEY: 1 }}),
+            json!({"resultType": "partial", "_meta": { SUBSCRIPTION_ID_META_KEY: 1 }}),
+            json!({"resultType": "complete"}),
+            json!({"resultType": "complete", "_meta": { SUBSCRIPTION_ID_META_KEY: 9999 }}),
+            json!({"resultType": "complete", "_meta": { SUBSCRIPTION_ID_META_KEY: "1" }}),
+        ] {
+            let (wid, guard, rx, resp) = session
+                .register_request_opts(&json!("bad"), None, true, Some("sid".into()))
+                .unwrap();
+            let mut result = bad_result;
+            if let Some(meta) = result.get_mut("_meta").and_then(Value::as_object_mut)
+                && meta.get(SUBSCRIPTION_ID_META_KEY) == Some(&json!(1))
+            {
+                meta.insert(SUBSCRIPTION_ID_META_KEY.to_owned(), json!(wid));
+            }
+            dispatch(json!({ "jsonrpc": "2.0", "id": wid, "result": result }));
+            let mut body = StdioSseStreamBody::new(
+                rx,
+                resp,
+                guard,
+                Arc::clone(&session),
+                Duration::from_secs(30),
+                None,
+            );
+            let err = body.frame().await.expect("must yield error").unwrap_err();
+            assert_eq!(err.kind(), io::ErrorKind::Other);
+        }
+
+        g_ord.disarm();
+        drop(rx_ord);
+        assert_eq!(session.active_requests.load(Ordering::Acquire), 0);
+        assert_eq!(notif_budget.used(), 0);
+        assert_eq!(budget.used(), 0);
+    }
+
+    #[tokio::test]
+    async fn events_oversized_completion_never_bypasses_into_raw_splice() {
+        let budget = ByteBudget::new(8 * 1024);
+        let limits = StdioLimits {
+            max_control_line_bytes: 256,
+            max_stdout_line_bytes: 64 * 1024,
+            ..StdioLimits::default()
+        };
+        let session = request_test_session(&budget);
+
+        // Register Events waiter (id-first oversized), Events waiter (id-last oversized), and ordinary sibling.
+        let (w_first, g_first, rx_first, resp_first) = session
+            .register_request_opts(&json!("ev-first"), None, true, Some("sid".into()))
+            .unwrap();
+        let (w_last, g_last, rx_last, resp_last) = session
+            .register_request_opts(&json!("ev-last"), None, true, Some("sid".into()))
+            .unwrap();
+        let (w_ord, mut g_ord, _rx_ord, resp_ord) = session
+            .register_request_opts(&json!("ord-big"), None, false, Some("sid".into()))
+            .unwrap();
+
+        // 1. id-first oversized Events completion > budget (12 KiB > 8 KiB budget) is discarded while scanning.
+        let line_first = format!(
+            "{{\"jsonrpc\":\"2.0\",\"id\":{w_first},\"result\":{{\"resultType\":\"complete\",\"_meta\":{{\"{SUBSCRIPTION_ID_META_KEY}\":{w_first}}},\"pad\":\"{}\"}}}}\n",
+            "A".repeat(12 * 1024)
+        );
+        let mut reader = BufReader::new(line_first.as_bytes());
+        let outcome = read_stdout_line(&mut reader, &session.in_flight, &budget, limits)
+            .await
+            .unwrap();
+        assert!(outcome.discarded);
+        assert!(outcome.len > limits.max_control_line_bytes);
+        dispatch_large_response_line(outcome, &session.in_flight);
+        let mut body_first = StdioSseStreamBody::new(
+            rx_first,
+            resp_first,
+            g_first,
+            Arc::clone(&session),
+            Duration::from_secs(30),
+            None,
+        );
+        assert!(body_first.frame().await.unwrap().is_err());
+
+        // 2. id-last oversized Events completion (fits budget, > control limit) is rejected without raw splice.
+        let line_last = format!(
+            "{{\"jsonrpc\":\"2.0\",\"result\":{{\"resultType\":\"complete\",\"_meta\":{{\"{SUBSCRIPTION_ID_META_KEY}\":{w_last}}},\"pad\":\"{}\"}},\"id\":{w_last}}}\n",
+            "B".repeat(1024)
+        );
+        let mut reader = BufReader::new(line_last.as_bytes());
+        let outcome = read_stdout_line(&mut reader, &session.in_flight, &budget, limits)
+            .await
+            .unwrap();
+        assert!(outcome.len > limits.max_control_line_bytes);
+        dispatch_large_response_line(outcome, &session.in_flight);
+        let mut body_last = StdioSseStreamBody::new(
+            rx_last,
+            resp_last,
+            g_last,
+            Arc::clone(&session),
+            Duration::from_secs(30),
+            None,
+        );
+        assert!(body_last.frame().await.unwrap().is_err());
+
+        // 3. Ordinary sibling still uses the raw splice path cleanly.
+        let line_ord = format!(
+            "{{\"jsonrpc\":\"2.0\",\"id\":{w_ord},\"result\":\"{}\"}}\n",
+            "C".repeat(1024)
+        );
+        let mut reader = BufReader::new(line_ord.as_bytes());
+        let outcome = read_stdout_line(&mut reader, &session.in_flight, &budget, limits)
+            .await
+            .unwrap();
+        dispatch_large_response_line(outcome, &session.in_flight);
+        g_ord.mark_completed();
+        let RespDelivery::Ok { json_bytes, lease } = resp_ord.await.unwrap() else {
+            panic!("ordinary sibling must succeed");
+        };
+        let parsed: Value = serde_json::from_slice(&json_bytes).unwrap();
+        assert_eq!(parsed["id"], "ord-big");
+        drop(json_bytes);
+        drop(lease);
+        drop(body_first);
+        drop(body_last);
+        assert_eq!(session.active_requests.load(Ordering::Acquire), 0);
+        assert_eq!(budget.used(), 0);
+    }
+
+    #[tokio::test]
+    async fn events_delivery_failure_drains_unpolled_body_and_zeros_budgets() {
+        let budget = ByteBudget::new(32 * 1024);
+        let session = request_test_session(&budget);
+        let (tx, mut stdin_rx) = mpsc::channel(4);
+        *session.stdin_tx.lock().unwrap() = Some(tx);
+
+        let (w_ev, g_ev, rx_ev, resp_ev) = session
+            .register_request_opts(&json!("ev-1"), None, true, Some("sid".into()))
+            .unwrap();
+        let (w_sib, mut g_sib, rx_sib, _resp_sib) = session
+            .register_request_opts(&json!("ev-2"), None, true, Some("sid".into()))
+            .unwrap();
+
+        let make_event = |wid: u64, cursor: usize| {
+            json!({
+                "jsonrpc": "2.0",
+                "method": "notifications/events/event",
+                "params": {
+                    "_meta": { SUBSCRIPTION_ID_META_KEY: wid },
+                    "cursor": cursor,
+                    "data": "x".repeat(120)
+                }
+            })
+        };
+        let sample_len = json_encoded_len(&make_event(w_ev, 1)).unwrap();
+        // Fit one queued frame, fail the second queued frame.
+        let notif_budget = ByteBudget::new(sample_len + 16);
+
+        let mut body_ev = StdioSseStreamBody::new(
+            rx_ev,
+            resp_ev,
+            g_ev,
+            Arc::clone(&session),
+            Duration::from_secs(30),
+            None,
+        );
+
+        // Frame 1 is polled and held by HTTP transport.
+        dispatch_stdout_message(
+            &session.in_flight,
+            &session.stdin_tx,
+            &session.alive,
+            &notif_budget,
+            &budget,
+            make_event(w_ev, 1),
+        )
+        .unwrap();
+        let held_by_transport = body_ev.frame().await.unwrap().unwrap().into_data().unwrap();
+        assert_eq!(notif_budget.used(), 0);
+        let transport_bytes = held_by_transport.len();
+
+        // Frame 2 sits queued in gateway while client is slow/unpolled.
+        dispatch_stdout_message(
+            &session.in_flight,
+            &session.stdin_tx,
+            &session.alive,
+            &notif_budget,
+            &budget,
+            make_event(w_ev, 2),
+        )
+        .unwrap();
+        assert!(notif_budget.used() > 0);
+
+        // Frame 3 exceeds notif_budget and fails the stream without waiting for another body poll.
+        dispatch_stdout_message(
+            &session.in_flight,
+            &session.stdin_tx,
+            &session.alive,
+            &notif_budget,
+            &budget,
+            make_event(w_ev, 3),
+        )
+        .unwrap();
+        assert_eq!(
+            notif_budget.used(),
+            0,
+            "unsent gateway-owned frame 2 must be discarded immediately"
+        );
+        assert!(
+            budget.used() >= transport_bytes,
+            "frame 1 handed to transport stays leased"
+        );
+
+        // Entry is now in Stopping; later cursor is ignored, and a late final reply settles Stopping.
+        assert!(
+            session
+                .in_flight
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|w| w.wire_id == w_ev && matches!(w.state, InFlightState::Stopping(_)))
+        );
+        dispatch_stdout_message(
+            &session.in_flight,
+            &session.stdin_tx,
+            &session.alive,
+            &notif_budget,
+            &budget,
+            make_event(w_ev, 4),
+        )
+        .unwrap();
+        dispatch_stdout_message(
+            &session.in_flight,
+            &session.stdin_tx,
+            &session.alive,
+            &notif_budget,
+            &budget,
+            json!({
+                "jsonrpc": "2.0",
+                "id": w_ev,
+                "result": { "resultType": "complete", "_meta": { SUBSCRIPTION_ID_META_KEY: w_ev } }
+            }),
+        )
+        .unwrap();
+        assert!(
+            !session
+                .in_flight
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|w| w.wire_id == w_ev)
+        );
+
+        // Sibling remains live and receives its event.
+        dispatch_stdout_message(
+            &session.in_flight,
+            &session.stdin_tx,
+            &session.alive,
+            &notif_budget,
+            &budget,
+            make_event(w_sib, 1),
+        )
+        .unwrap();
+        let sib_frame = rx_sib.try_recv().unwrap();
+        drop(sib_frame);
+
+        // Polling the failed body returns a transport error despite the late final reply.
+        assert!(body_ev.frame().await.unwrap().is_err());
+
+        // Drain cancel line from stdin queue and clean up sibling + transport frame.
+        let cancel_line = stdin_rx.recv().await.unwrap();
+        let cancel_json: Value = serde_json::from_slice(&cancel_line.bytes).unwrap();
+        assert_eq!(cancel_json["method"], "notifications/cancelled");
+        assert_eq!(cancel_json["params"]["requestId"], w_ev);
+        drop(cancel_line);
+
+        g_sib.disarm();
+        drop(rx_sib);
+        drop(body_ev);
+        drop(held_by_transport);
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while session.active_requests.load(Ordering::Acquire) != 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(notif_budget.used(), 0);
+        assert_eq!(budget.used(), 0);
+    }
+
+    #[tokio::test]
+    async fn stopping_entry_counts_toward_cap_and_settles_via_receipt_response_or_retires() {
+        // Case A: delayed queue capacity -> flush receipt settles stop, child and sibling stay live.
+        {
+            let budget = ByteBudget::new(16 * 1024);
+            let mut session = request_test_session(&budget);
+            let limits = StdioLimits {
+                stdin_write_timeout: Duration::from_millis(500),
+                stdin_channel_capacity: 1,
+                max_in_flight_per_session: 2,
+                ..StdioLimits::default()
+            };
+            Arc::get_mut(&mut session).unwrap().limits = limits;
+            let (tx, mut rx) = mpsc::channel(1);
+            *session.stdin_tx.lock().unwrap() = Some(tx);
+
+            let (w1, mut g1, _n1, _r1) = session
+                .register_request_opts(&json!(1), None, true, Some("sid".into()))
+                .unwrap();
+            let (_w2, mut g2, _n2, _r2) = session
+                .register_request_opts(&json!(2), None, true, Some("sid".into()))
+                .unwrap();
+
+            // Fill the 1-slot stdin queue so cancel waits for admission.
+            session
+                .send_raw_line(StdinLine {
+                    bytes: Bytes::from_static(b"{}\n"),
+                    flushed: None,
+                })
+                .unwrap();
+            g1.cancel("client disconnected");
+
+            // Stopping entry still counts toward max_in_flight_per_session (2).
+            assert!(matches!(
+                session.register_request_opts(&json!(3), None, false, Some("sid".into())),
+                Err(SendLineErr::Full)
+            ));
+
+            // Free queue capacity and acknowledge flush receipt.
+            let _filler = rx.recv().await.unwrap();
+            let cancel = tokio::time::timeout(Duration::from_secs(1), rx.recv())
+                .await
+                .unwrap()
+                .unwrap();
+            let cancel_json: Value = serde_json::from_slice(&cancel.bytes).unwrap();
+            assert_eq!(cancel_json["params"]["requestId"], w1);
+            cancel.flushed.unwrap().send(()).unwrap();
+
+            tokio::time::timeout(Duration::from_secs(1), async {
+                while session.in_flight.lock().unwrap().len() != 1 {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .unwrap();
+            assert!(session.alive.load(Ordering::Acquire));
+            g2.disarm();
+            assert_eq!(session.active_requests.load(Ordering::Acquire), 0);
+            assert_eq!(budget.used(), 0);
+        }
+
+        // Case B: valid final response arrives while cancel waits on full queue -> no retirement.
+        {
+            let budget = ByteBudget::new(16 * 1024);
+            let mut session = request_test_session(&budget);
+            Arc::get_mut(&mut session).unwrap().limits = StdioLimits {
+                stdin_write_timeout: Duration::from_millis(80),
+                stdin_channel_capacity: 1,
+                ..StdioLimits::default()
+            };
+            let (tx, _rx_blocked) = mpsc::channel(1);
+            *session.stdin_tx.lock().unwrap() = Some(tx);
+            let (w1, mut g1, _n1, mut r1) = session
+                .register_request_opts(&json!(1), None, true, Some("sid".into()))
+                .unwrap();
+            session
+                .send_raw_line(StdinLine {
+                    bytes: Bytes::from_static(b"{}\n"),
+                    flushed: None,
+                })
+                .unwrap();
+            g1.cancel("client disconnected");
+
+            dispatch_stdout_message(
+                &session.in_flight,
+                &session.stdin_tx,
+                &session.alive,
+                &ByteBudget::new(4096),
+                &budget,
+                json!({
+                    "jsonrpc": "2.0",
+                    "id": w1,
+                    "result": { "resultType": "complete", "_meta": { SUBSCRIPTION_ID_META_KEY: w1 } }
+                }),
+            )
+            .unwrap();
+            // Wait past stdin_write_timeout; child must NOT be retired and response must NOT leak.
+            tokio::time::sleep(Duration::from_millis(120)).await;
+            assert!(session.alive.load(Ordering::Acquire));
+            assert!(r1.try_recv().is_err());
+            assert!(session.in_flight.lock().unwrap().is_empty());
+            assert_eq!(session.active_requests.load(Ordering::Acquire), 0);
+            assert_eq!(budget.used(), 0);
+        }
+
+        // Case C: permanently stalled writer past deadline retires and reaps the shared session.
+        {
+            let budget = ByteBudget::new(16 * 1024);
+            let limits = StdioLimits {
+                stdin_write_timeout: Duration::from_millis(60),
+                stdin_channel_capacity: 1,
+                ..StdioLimits::default()
+            };
+            let up = StdioUpstream::with_limits(
+                StdioUpstreamSettings {
+                    command: "unused".to_owned(),
+                    args: Vec::new(),
+                    env: std::collections::BTreeMap::new(),
+                    cwd: None,
+                    max_sessions: 1,
+                    session_idle_secs: 30,
+                },
+                Arc::clone(&budget),
+                limits,
+            )
+            .unwrap();
+            let mut session = request_test_session(&budget);
+            {
+                let s = Arc::get_mut(&mut session).unwrap();
+                s.weak_inner = Arc::downgrade(&up.inner);
+                s.limits = limits;
+            }
+            let (tx, _rx_stalled) = mpsc::channel(1);
+            *session.stdin_tx.lock().unwrap() = Some(tx);
+            {
+                let mut tbl = up.inner.table.lock().unwrap();
+                tbl.sessions
+                    .insert("sid-stalled".to_owned(), Arc::clone(&session));
+                tbl.live_sessions.push(Arc::clone(&session));
+            }
+            let (_w1, mut g1, _n1, _r1) = session
+                .register_request_opts(&json!(1), None, true, Some("sid-stalled".into()))
+                .unwrap();
+            session
+                .send_raw_line(StdinLine {
+                    bytes: Bytes::from_static(b"{}\n"),
+                    flushed: None,
+                })
+                .unwrap();
+            g1.cancel("client disconnected");
+
+            tokio::time::timeout(Duration::from_secs(2), async {
+                while session.alive.load(Ordering::Acquire)
+                    || up.inner.table.lock().unwrap().used_slots() != 0
+                {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("stalled writer must trigger tracked session retirement at deadline");
+            assert!(up.inner.table.lock().unwrap().sessions.is_empty());
+            assert!(up.inner.table.lock().unwrap().live_sessions.is_empty());
+            assert_eq!(session.active_requests.load(Ordering::Acquire), 0);
+            up.shutdown().await;
+            assert_eq!(budget.used(), 0);
+        }
     }
 }
