@@ -160,6 +160,114 @@ pub fn sha256_b64(input: &str) -> String {
     URL_SAFE_NO_PAD.encode(digest)
 }
 
+pub fn sha256_bytes(input: &str) -> [u8; 32] {
+    Sha256::digest(input.as_bytes()).into()
+}
+
+pub fn constant_time_sha256_eq(candidate: &str, expected_digest: &[u8; 32]) -> bool {
+    let mut candidate_digest: [u8; 32] = Sha256::digest(candidate.as_bytes()).into();
+    let matched = bool::from(candidate_digest.ct_eq(expected_digest));
+    zeroize_bytes(&mut candidate_digest);
+    matched
+}
+
+pub fn compute_auth_ref(resource_url: &str, grant_id: &str) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(resource_url.as_bytes());
+    hasher.update([0u8]);
+    hasher.update(grant_id.as_bytes());
+    format!("aref_{}", URL_SAFE_NO_PAD.encode(hasher.finalize()))
+}
+
+const AEAD_VERSION: u8 = 1;
+const AEAD_NONCE_LEN: usize = 16;
+const AEAD_TAG_LEN: usize = 32;
+
+pub struct Crypto {
+    enc_key: [u8; KEY_LEN],
+    mac_key: [u8; KEY_LEN],
+}
+
+impl Drop for Crypto {
+    fn drop(&mut self) {
+        zeroize_bytes(&mut self.enc_key);
+        zeroize_bytes(&mut self.mac_key);
+    }
+}
+
+impl Crypto {
+    pub fn new_random() -> Result<Self, String> {
+        let mut master = [0u8; KEY_LEN];
+        getrandom::fill(&mut master).map_err(|e| format!("random source failed: {e}"))?;
+        let enc_key = hmac_sha256(&master, b"oauth2-mcp-gateway/aead/enc/v1");
+        let mac_key = hmac_sha256(&master, b"oauth2-mcp-gateway/aead/mac/v1");
+        zeroize_bytes(&mut master);
+        Ok(Self { enc_key, mac_key })
+    }
+
+    pub fn seal(&self, aad: &[u8], plaintext: &[u8]) -> Result<String, String> {
+        let mut nonce = [0u8; AEAD_NONCE_LEN];
+        getrandom::fill(&mut nonce).map_err(|e| format!("random source failed: {e}"))?;
+        let mut ciphertext = plaintext.to_vec();
+        self.apply_keystream(&nonce, &mut ciphertext);
+        let tag = self.compute_tag(aad, &nonce, &ciphertext);
+
+        let mut wire = Vec::with_capacity(1 + AEAD_NONCE_LEN + ciphertext.len() + AEAD_TAG_LEN);
+        wire.push(AEAD_VERSION);
+        wire.extend_from_slice(&nonce);
+        wire.extend_from_slice(&ciphertext);
+        wire.extend_from_slice(&tag);
+        Ok(URL_SAFE_NO_PAD.encode(&wire))
+    }
+
+    pub fn open(&self, aad: &[u8], token_b64: &str) -> Option<Vec<u8>> {
+        let wire = URL_SAFE_NO_PAD.decode(token_b64).ok()?;
+        if wire.len() < 1 + AEAD_NONCE_LEN + AEAD_TAG_LEN || wire[0] != AEAD_VERSION {
+            return None;
+        }
+        let nonce = &wire[1..1 + AEAD_NONCE_LEN];
+        let tag_offset = wire.len() - AEAD_TAG_LEN;
+        let ciphertext = &wire[1 + AEAD_NONCE_LEN..tag_offset];
+        let presented_tag = &wire[tag_offset..];
+
+        let mut expected_tag = self.compute_tag(aad, nonce, ciphertext);
+        let valid = bool::from(presented_tag.ct_eq(&expected_tag));
+        zeroize_bytes(&mut expected_tag);
+        if !valid {
+            return None;
+        }
+
+        let mut plaintext = ciphertext.to_vec();
+        self.apply_keystream(nonce, &mut plaintext);
+        Some(plaintext)
+    }
+
+    fn apply_keystream(&self, nonce: &[u8], buf: &mut [u8]) {
+        let prf = HmacPrecomputed::new(&self.enc_key);
+        let mut block_input = [0u8; AEAD_NONCE_LEN + 8];
+        block_input[..AEAD_NONCE_LEN].copy_from_slice(nonce);
+        for (counter, chunk) in buf.chunks_mut(32).enumerate() {
+            block_input[AEAD_NONCE_LEN..].copy_from_slice(&(counter as u64).to_be_bytes());
+            let mut keystream = prf.mac(&block_input);
+            for (b, k) in chunk.iter_mut().zip(keystream.iter()) {
+                *b ^= *k;
+            }
+            zeroize_bytes(&mut keystream);
+        }
+        zeroize_bytes(&mut block_input);
+    }
+
+    fn compute_tag(&self, aad: &[u8], nonce: &[u8], ciphertext: &[u8]) -> [u8; AEAD_TAG_LEN] {
+        let mut msg = Vec::with_capacity(8 + aad.len() + nonce.len() + 8 + ciphertext.len());
+        msg.extend_from_slice(&(aad.len() as u64).to_be_bytes());
+        msg.extend_from_slice(aad);
+        msg.extend_from_slice(nonce);
+        msg.extend_from_slice(&(ciphertext.len() as u64).to_be_bytes());
+        msg.extend_from_slice(ciphertext);
+        hmac_sha256(&self.mac_key, &msg)
+    }
+}
+
 pub fn hmac_sha256(key: &[u8], data: &[u8]) -> [u8; 32] {
     HmacPrecomputed::new(key).mac(data)
 }
@@ -322,5 +430,47 @@ mod tests {
         assert!(is_valid_s256_challenge(challenge));
         assert!(verify_pkce_s256(verifier, challenge));
         assert!(!verify_pkce_s256("short", challenge));
+    }
+
+    #[test]
+    fn crypto_aead_and_auth_ref_roundtrip_and_reject_tampering() {
+        let crypto = Crypto::new_random().unwrap();
+        let aad = b"https://mcp.example.com\0nonce-123";
+        let plaintext = b"{\"client_id\":\"cli_1\",\"scopes\":[\"mcp\"]}";
+        let sealed_a = crypto.seal(aad, plaintext).unwrap();
+        let sealed_b = crypto.seal(aad, plaintext).unwrap();
+        assert_ne!(sealed_a, sealed_b);
+        assert_eq!(crypto.open(aad, &sealed_a).unwrap(), plaintext);
+        assert!(
+            crypto
+                .open(b"https://mcp.example.com\0nonce-999", &sealed_a)
+                .is_none()
+        );
+
+        let mut raw = URL_SAFE_NO_PAD.decode(&sealed_a).unwrap();
+        let mid = 20;
+        raw[mid] ^= 0x01;
+        let tampered_ct = URL_SAFE_NO_PAD.encode(&raw);
+        assert!(crypto.open(aad, &tampered_ct).is_none());
+
+        let other_crypto = Crypto::new_random().unwrap();
+        assert!(other_crypto.open(aad, &sealed_a).is_none());
+
+        let aref = compute_auth_ref("https://mcp.example.com/mcp", "grt_abc");
+        assert!(aref.starts_with("aref_"));
+        assert_eq!(
+            aref,
+            format!(
+                "aref_{}",
+                sha256_b64("https://mcp.example.com/mcp\0grt_abc")
+            )
+        );
+
+        let expected = sha256_bytes("0123456789abcdef_secret");
+        assert!(constant_time_sha256_eq(
+            "0123456789abcdef_secret",
+            &expected
+        ));
+        assert!(!constant_time_sha256_eq("wrong", &expected));
     }
 }

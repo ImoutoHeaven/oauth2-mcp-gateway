@@ -1,7 +1,8 @@
-use crate::config::{GatewayConfig, RefreshReusePolicy, is_loopback_host};
+use crate::config::{GatewayConfig, IpNet, RefreshReusePolicy, is_loopback_host};
 use crate::crypto::{
-    constant_time_eq_str, hmac_sha256, is_valid_s256_challenge, random_token_b64, sha256_b64,
-    verify_pkce_s256, zeroize_bytes, zeroize_string,
+    Crypto, compute_auth_ref, constant_time_eq_str, constant_time_sha256_eq, hmac_sha256,
+    is_valid_s256_challenge, random_token_b64, sha256_b64, verify_pkce_s256, zeroize_bytes,
+    zeroize_string,
 };
 use crate::store::{
     AccessTokenRecord, GraceRefreshRecord, GrantRecord, MAX_GRACE_REFRESHES, PersistedState,
@@ -11,7 +12,7 @@ use crate::types::{
     AuthChallenge, HttpReply, VerifiedToken, bytes_body, empty_body, hex_nibble, json_reply,
     method_not_allowed, text_reply,
 };
-use crate::upstream_http::{ContentLengthCheck, check_content_length_limit};
+use crate::upstream_http::{ContentLengthCheck, check_content_length_limit, close_empty_reply};
 use base64::Engine;
 use base64::engine::general_purpose::{STANDARD, STANDARD_NO_PAD, URL_SAFE_NO_PAD};
 use bytes::Bytes;
@@ -19,37 +20,41 @@ use http::{HeaderMap, Method, Request, Response, StatusCode, header};
 use http_body::Body;
 use http_body_util::{BodyExt, LengthLimitError, Limited};
 use hyper::body::Incoming;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::future::Future;
-use std::net::{IpAddr, Ipv4Addr};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
+use tokio::sync::Semaphore;
 use url::Url;
 
 const MAX_POST_BODY_BYTES: usize = 64 * 1024;
+const MAX_CHECK_BODY_BYTES: usize = 4 * 1024;
 const OAUTH_BODY_TIMEOUT: Duration = Duration::from_secs(10);
+const CHECK_BODY_TIMEOUT: Duration = Duration::from_secs(5);
 const MAX_REDIRECT_URIS: usize = 16;
 const MAX_CLIENT_NAME_CHARS: usize = 256;
 const MAX_STATE_BYTES: usize = 1024;
 const PENDING_AUTH_TTL_SECS: u64 = 300;
-const MAX_PENDING_AUTHS: usize = 512;
-const MAX_PENDING_AUTHS_PER_IP: usize = 32;
-const MAX_AR_ATTEMPTS: u8 = 3;
+const MAX_CONSUMED_AUTH_NONCES: usize = 4096;
 const AUTH_CODE_TTL_SECS: u64 = 300;
 const MAX_AUTH_CODES: usize = 256;
 const CONSUMED_CODE_TTL_SECS: u64 = 300;
 const MAX_CONSUMED_CODES: usize = 1024;
 const PW_FAIL_WINDOW: Duration = Duration::from_secs(15 * 60);
 const PW_MAX_FAILURES: usize = 10;
-const PW_GLOBAL_PACE_DELAY: Duration = Duration::from_millis(100);
+const PW_VERIFY_CONCURRENCY: usize = 4;
 const MAX_PW_FAILURE_IPS: usize = 4096;
+const LOOPBACK_PW_BUCKET_CAPACITY: f64 = 10.0;
+const LOOPBACK_PW_BUCKET_REFILL_PER_SEC: f64 = 0.5;
 const MAX_ACCESS_TOKENS_PER_GRANT: usize = 64;
 const MAX_GRACE_CACHE: usize = 1024;
 const MAX_ACTIVE_GRANTS: usize = 4096;
 
-const AUTH_PAGE_CSP: &str = "default-src 'none'; style-src 'unsafe-inline'; form-action 'self'";
+const AUTH_PAGE_CSP: &str =
+    "default-src 'none'; style-src 'unsafe-inline'; form-action 'self'; frame-ancestors 'none'";
 
 type EarlyReply = Box<HttpReply>;
 type RevokeHook = Arc<dyn Fn(&str) + Send + Sync>;
@@ -61,30 +66,68 @@ pub struct OAuthEngine {
 struct EngineCore {
     config: Arc<GatewayConfig>,
     store: StateStore,
+    crypto: Crypto,
     inner: Mutex<EngineState>,
     persist_lock: Arc<tokio::sync::Mutex<()>>,
-    pw_verify_gate: tokio::sync::Mutex<()>,
+    pw_verify_sem: Arc<Semaphore>,
     on_revoke: Option<RevokeHook>,
     #[cfg(test)]
     register_persist_barrier: Mutex<Option<tests::RegisterPersistBarrier>>,
+}
+
+struct LoopbackTokenBucket {
+    tokens: f64,
+    last_refill: Instant,
+}
+
+impl LoopbackTokenBucket {
+    fn new() -> Self {
+        Self {
+            tokens: LOOPBACK_PW_BUCKET_CAPACITY,
+            last_refill: Instant::now(),
+        }
+    }
+
+    fn refill(&mut self, now: Instant) {
+        let elapsed = now
+            .saturating_duration_since(self.last_refill)
+            .as_secs_f64();
+        if elapsed > 0.0 {
+            self.tokens = (self.tokens + elapsed * LOOPBACK_PW_BUCKET_REFILL_PER_SEC)
+                .min(LOOPBACK_PW_BUCKET_CAPACITY);
+            self.last_refill = now;
+        }
+    }
+
+    fn has_budget(&mut self, now: Instant) -> bool {
+        self.refill(now);
+        self.tokens >= 1.0
+    }
+
+    fn record_failure(&mut self, now: Instant) {
+        self.refill(now);
+        self.tokens = (self.tokens - 1.0).max(0.0);
+    }
 }
 
 struct EngineState {
     persisted: PersistedState,
     access_index: HashMap<String, String>,
     grant_index: HashMap<String, usize>,
-    pending_auths: VecDeque<PendingAuthRequest>,
+    aref_index: HashMap<String, usize>,
+    consumed_auth_nonces: VecDeque<(String, u64)>,
     auth_codes: VecDeque<AuthCodeEntry>,
     consumed_codes: VecDeque<ConsumedCodeEntry>,
     grace_cache: HashMap<String, GraceCacheEntry>,
     pw_failures: HashMap<IpAddr, VecDeque<Instant>>,
+    loopback_pw_bucket: LoopbackTokenBucket,
     rr_cursor: usize,
 }
 
-#[derive(Clone)]
-struct PendingAuthRequest {
-    ar_id: String,
-    csrf_token: String,
+#[derive(Clone, Serialize, Deserialize)]
+struct SealedAuthForm {
+    nonce_id: String,
+    cookie_csrf: String,
     client_id: String,
     client_name: Option<String>,
     redirect_uri: String,
@@ -92,9 +135,24 @@ struct PendingAuthRequest {
     resource: String,
     state: Option<String>,
     code_challenge: String,
-    peer_ip: IpAddr,
-    attempts: u8,
     expires_at: u64,
+}
+
+struct AuthorizeFormView<'a> {
+    ar_id: &'a str,
+    csrf_token: &'a str,
+    client_id: &'a str,
+    client_name: Option<&'a str>,
+    redirect_uri: &'a str,
+    scopes: &'a [String],
+    resource: &'a str,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CheckRequest {
+    #[serde(rename = "ref")]
+    auth_ref: String,
 }
 
 struct AuthCodeEntry {
@@ -167,8 +225,11 @@ impl EngineState {
     fn sync_indexes(&mut self) {
         self.access_index.clear();
         self.grant_index.clear();
+        self.aref_index.clear();
         for (idx, grant) in self.persisted.grants.iter().enumerate() {
             self.grant_index.insert(grant.grant_id.clone(), idx);
+            self.aref_index
+                .insert(compute_auth_ref(&grant.resource, &grant.grant_id), idx);
             for at in &grant.access_tokens {
                 self.access_index
                     .insert(at.token_sha256.clone(), grant.grant_id.clone());
@@ -183,7 +244,8 @@ impl EngineState {
     }
 
     fn prune_ephemeral(&mut self, now: u64) {
-        self.pending_auths.retain(|entry| entry.expires_at > now);
+        self.consumed_auth_nonces
+            .retain(|(_, expires_at)| *expires_at > now);
         self.auth_codes.retain(|entry| entry.expires_at > now);
         self.consumed_codes.retain(|entry| entry.expires_at > now);
         self.grace_cache
@@ -201,15 +263,36 @@ impl EngineState {
         });
     }
 
-    fn ip_pw_failures(&self, ip: &IpAddr) -> usize {
-        self.pw_failures.get(ip).map_or(0, VecDeque::len)
+    fn is_auth_nonce_consumed(&self, nonce_id: &str) -> bool {
+        self.consumed_auth_nonces
+            .iter()
+            .any(|(id, _)| constant_time_eq_str(id, nonce_id))
     }
 
-    fn total_pw_failures(&self) -> usize {
-        self.pw_failures.values().map(VecDeque::len).sum()
+    fn record_consumed_auth_nonce(&mut self, nonce_id: String, expires_at: u64) {
+        if self.is_auth_nonce_consumed(&nonce_id) {
+            return;
+        }
+        while self.consumed_auth_nonces.len() >= MAX_CONSUMED_AUTH_NONCES {
+            self.consumed_auth_nonces.pop_front();
+        }
+        self.consumed_auth_nonces.push_back((nonce_id, expires_at));
     }
 
-    fn record_pw_failure(&mut self, ip: IpAddr) {
+    fn has_pw_budget(&mut self, ip: IpAddr, use_loopback_bucket: bool) -> bool {
+        if use_loopback_bucket {
+            self.loopback_pw_bucket.has_budget(Instant::now())
+        } else {
+            self.pw_failures.get(&ip).map_or(0, VecDeque::len) < PW_MAX_FAILURES
+        }
+    }
+
+    fn record_pw_failure(&mut self, ip: IpAddr, use_loopback_bucket: bool) {
+        let now = Instant::now();
+        if use_loopback_bucket {
+            self.loopback_pw_bucket.record_failure(now);
+            return;
+        }
         if self.pw_failures.len() >= MAX_PW_FAILURE_IPS
             && !self.pw_failures.contains_key(&ip)
             && let Some(oldest_ip) = self
@@ -220,10 +303,7 @@ impl EngineState {
         {
             self.pw_failures.remove(&oldest_ip);
         }
-        self.pw_failures
-            .entry(ip)
-            .or_default()
-            .push_back(Instant::now());
+        self.pw_failures.entry(ip).or_default().push_back(now);
     }
 
     fn insert_grace_cache(&mut self, grant_id: String, entry: GraceCacheEntry) {
@@ -309,16 +389,19 @@ impl OAuthEngine {
         on_revoke: Option<RevokeHook>,
     ) -> Result<Arc<Self>, String> {
         let now = unix_now();
+        let crypto = Crypto::new_random()?;
         let (store, persisted) = StateStore::open(config.state_path.clone(), now)?;
         let mut state = EngineState {
             persisted,
             access_index: HashMap::new(),
             grant_index: HashMap::new(),
-            pending_auths: VecDeque::new(),
+            aref_index: HashMap::new(),
+            consumed_auth_nonces: VecDeque::new(),
             auth_codes: VecDeque::new(),
             consumed_codes: VecDeque::new(),
             grace_cache: HashMap::new(),
             pw_failures: HashMap::new(),
+            loopback_pw_bucket: LoopbackTokenBucket::new(),
             rr_cursor: 0,
         };
         state.sync_indexes();
@@ -338,9 +421,10 @@ impl OAuthEngine {
             core: Arc::new(EngineCore {
                 config,
                 store,
+                crypto,
                 inner: Mutex::new(state),
                 persist_lock: Arc::new(tokio::sync::Mutex::new(())),
-                pw_verify_gate: tokio::sync::Mutex::new(()),
+                pw_verify_sem: Arc::new(Semaphore::new(PW_VERIFY_CONCURRENCY)),
                 on_revoke,
                 #[cfg(test)]
                 register_persist_barrier: Mutex::new(None),
@@ -437,10 +521,7 @@ impl OAuthEngine {
                 self.handle_register(req).await
             }
             "/oauth/authorize" => match *req.method() {
-                Method::GET => {
-                    let _persist_guard = self.core.persist_lock.lock().await;
-                    self.handle_authorize_get(&req, peer_ip)
-                }
+                Method::GET => self.handle_authorize_get(&req),
                 Method::POST => self.handle_authorize_post(req, peer_ip).await,
                 _ => method_not_allowed("GET, POST"),
             },
@@ -565,6 +646,152 @@ impl OAuthEngine {
             .header(header::CACHE_CONTROL, "no-store")
             .body(empty_body())
             .expect("valid auth challenge reply")
+    }
+
+    pub async fn handle_auth_check(
+        &self,
+        req: Request<Incoming>,
+        peer_ip: IpAddr,
+        expected_token_sha256: &[u8; 32],
+    ) -> HttpReply {
+        if !peer_ip.to_canonical().is_loopback() {
+            return close_empty_reply(StatusCode::FORBIDDEN);
+        }
+        if req.headers().contains_key(header::ORIGIN) {
+            return close_empty_reply(StatusCode::FORBIDDEN);
+        }
+        if req.uri().path() != "/authorization/check" || req.uri().query().is_some() {
+            return not_found_reply();
+        }
+        if req.method() != Method::POST {
+            return method_not_allowed("POST");
+        }
+        if !verify_check_bearer(req.headers(), expected_token_sha256) {
+            return Response::builder()
+                .status(StatusCode::UNAUTHORIZED)
+                .header(header::WWW_AUTHENTICATE, "Bearer")
+                .header(header::CONNECTION, "close")
+                .header(header::CACHE_CONTROL, "no-store")
+                .body(empty_body())
+                .expect("valid 401 check reply");
+        }
+        if !has_media_type(req.headers(), "application/json") {
+            return json_reply(
+                StatusCode::UNSUPPORTED_MEDIA_TYPE,
+                &json!({ "error": "Content-Type must be application/json" }),
+            );
+        }
+        let body = match read_limited_body_with(req, MAX_CHECK_BODY_BYTES, CHECK_BODY_TIMEOUT).await
+        {
+            Ok(bytes) => bytes,
+            Err(BodyReadError::TooLarge) => {
+                return with_connection_close(json_reply(
+                    StatusCode::PAYLOAD_TOO_LARGE,
+                    &json!({ "error": "request body exceeds 4 KiB limit" }),
+                ));
+            }
+            Err(BodyReadError::Timeout) => {
+                return with_connection_close(json_reply(
+                    StatusCode::REQUEST_TIMEOUT,
+                    &json!({ "error": "request body read timed out" }),
+                ));
+            }
+            Err(BodyReadError::InvalidContentLength | BodyReadError::ReadFailed) => {
+                return with_connection_close(json_reply(
+                    StatusCode::BAD_REQUEST,
+                    &json!({ "error": "invalid request body" }),
+                ));
+            }
+        };
+        let parsed: CheckRequest = match serde_json::from_slice(&body) {
+            Ok(req_obj) => req_obj,
+            Err(_) => {
+                return json_reply(
+                    StatusCode::BAD_REQUEST,
+                    &json!({ "error": "invalid check payload" }),
+                );
+            }
+        };
+        json_reply(StatusCode::OK, &self.check_authorization(&parsed.auth_ref))
+    }
+
+    pub fn check_authorization(&self, auth_ref: &str) -> serde_json::Value {
+        if !auth_ref.starts_with("aref_") || auth_ref.len() > 128 {
+            return json!({ "active": false });
+        }
+        let now = unix_now();
+        let expected_resource = self.core.config.mcp_resource_url();
+        let configured_scopes = &self.core.config.oauth.scopes;
+
+        let guard = self
+            .core
+            .inner
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let Some(&idx) = guard.aref_index.get(auth_ref) else {
+            return json!({ "active": false });
+        };
+        let Some(grant) = guard.persisted.grants.get(idx) else {
+            return json!({ "active": false });
+        };
+        if now >= grant.max_expires_at || grant.resource != expected_resource {
+            return json!({ "active": false });
+        }
+        let expected_aref = compute_auth_ref(&grant.resource, &grant.grant_id);
+        if !constant_time_eq_str(&expected_aref, auth_ref) {
+            return json!({ "active": false });
+        }
+
+        let live_refresh_exp = grant
+            .current_refresh
+            .as_ref()
+            .filter(|rt| rt.expires_at > now)
+            .map(|rt| rt.expires_at);
+        let max_access_exp = grant
+            .access_tokens
+            .iter()
+            .filter(|at| at.expires_at > now)
+            .map(|at| at.expires_at)
+            .max();
+        let max_token_exp = match (live_refresh_exp, max_access_exp) {
+            (Some(r), Some(a)) => r.max(a),
+            (Some(r), None) => r,
+            (None, Some(a)) => a,
+            (None, None) => return json!({ "active": false }),
+        };
+        let live_expires_at = max_token_exp.min(grant.max_expires_at);
+        if live_expires_at <= now {
+            return json!({ "active": false });
+        }
+
+        let mut effective_scopes = Vec::new();
+        if live_refresh_exp.is_some() {
+            for s in &grant.scopes {
+                if configured_scopes.contains(s) && !effective_scopes.contains(s) {
+                    effective_scopes.push(s.clone());
+                }
+            }
+        } else {
+            for at in grant.access_tokens.iter().filter(|at| at.expires_at > now) {
+                for s in &at.scopes {
+                    if configured_scopes.contains(s) && !effective_scopes.contains(s) {
+                        effective_scopes.push(s.clone());
+                    }
+                }
+            }
+        }
+
+        if effective_scopes.is_empty() {
+            return json!({ "active": false });
+        }
+
+        json!({
+            "active": true,
+            "principal": auth_ref,
+            "resource": grant.resource,
+            "scopes": effective_scopes,
+            "expiresAt": live_expires_at,
+        })
     }
 
     fn handle_prm(&self) -> HttpReply {
@@ -821,10 +1048,6 @@ impl OAuthEngine {
                                 .grants
                                 .iter()
                                 .any(|g| g.client_id == c.client_id)
-                                && !guard
-                                    .pending_auths
-                                    .iter()
-                                    .any(|p| p.client_id == c.client_id)
                                 && !guard.auth_codes.iter().any(|a| a.client_id == c.client_id)
                         })
                         .min_by_key(|(idx, c)| (c.issued_at, *idx))
@@ -890,7 +1113,7 @@ impl OAuthEngine {
         .await
     }
 
-    fn handle_authorize_get(&self, req: &Request<Incoming>, peer_ip: Option<IpAddr>) -> HttpReply {
+    fn handle_authorize_get(&self, req: &Request<Incoming>) -> HttpReply {
         let query = req.uri().query().unwrap_or("");
         let Ok(params) = parse_unique_form(query.as_bytes()) else {
             return html_status_reply(
@@ -908,12 +1131,11 @@ impl OAuthEngine {
 
         let now = unix_now();
         let client_meta = {
-            let mut guard = self
+            let guard = self
                 .core
                 .inner
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
-            guard.prune_ephemeral(now);
             guard
                 .persisted
                 .clients
@@ -925,7 +1147,7 @@ impl OAuthEngine {
         let Some(client) = client_meta else {
             return html_status_reply(StatusCode::BAD_REQUEST, "Unknown client_id");
         };
-        if !client.redirect_uris.iter().any(|u| u == redirect_uri)
+        if !matches_registered_redirect_uri(&client.redirect_uris, redirect_uri)
             || !is_allowed_redirect_uri(&self.core.config, redirect_uri)
         {
             return html_status_reply(StatusCode::BAD_REQUEST, "Unregistered redirect_uri");
@@ -978,9 +1200,11 @@ impl OAuthEngine {
             .filter(|c| challenge_method_ok && is_valid_s256_challenge(c))
             .cloned()
         else {
-            return html_status_reply(
-                StatusCode::BAD_REQUEST,
-                "PKCE S256 code_challenge is required",
+            return authorize_error_redirect(
+                &self.core.config,
+                redirect_uri,
+                "invalid_request",
+                state_param.as_deref(),
             );
         };
 
@@ -1029,56 +1253,46 @@ impl OAuthEngine {
             );
         };
 
-        let (Ok(ar_id), Ok(csrf_token)) = (random_token_b64(18), random_token_b64(24)) else {
+        let (Ok(nonce_id), Ok(cookie_csrf)) = (random_token_b64(18), random_token_b64(24)) else {
             return html_status_reply(StatusCode::INTERNAL_SERVER_ERROR, "Random source error");
         };
 
-        let ip_key = peer_ip.unwrap_or(IpAddr::V4(Ipv4Addr::UNSPECIFIED));
-        let pending = PendingAuthRequest {
-            ar_id: ar_id.clone(),
-            csrf_token: csrf_token.clone(),
-            client_id: client.client_id.clone(),
-            client_name: client.client_name.clone(),
+        let sealed_payload = SealedAuthForm {
+            nonce_id: nonce_id.clone(),
+            cookie_csrf: cookie_csrf.clone(),
+            client_id: client.client_id,
+            client_name: client.client_name,
             redirect_uri: redirect_uri.clone(),
             scopes,
             resource,
             state: state_param,
             code_challenge,
-            peer_ip: ip_key,
-            attempts: 0,
             expires_at: now.saturating_add(PENDING_AUTH_TTL_SECS),
         };
-
-        {
-            let mut guard = self
-                .core
-                .inner
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
-            guard.prune_ephemeral(now);
-            let ip_pending = guard
-                .pending_auths
-                .iter()
-                .filter(|p| p.peer_ip == ip_key)
-                .count();
-            if ip_pending >= MAX_PENDING_AUTHS_PER_IP
-                || guard.pending_auths.len() >= MAX_PENDING_AUTHS
-            {
-                return html_status_reply(
-                    StatusCode::TOO_MANY_REQUESTS,
-                    "Too many pending authorization requests",
-                );
-            }
-            guard.pending_auths.push_back(pending.clone());
-        }
+        let Ok(plaintext) = serde_json::to_vec(&sealed_payload) else {
+            return html_status_reply(StatusCode::INTERNAL_SERVER_ERROR, "Encoding error");
+        };
+        let aad = auth_form_aad(&self.core.config.public_url, &nonce_id);
+        let Ok(sealed_token) = self.core.crypto.seal(&aad, &plaintext) else {
+            return html_status_reply(StatusCode::INTERNAL_SERVER_ERROR, "Random source error");
+        };
 
         let cookie = build_ar_cookie(
             self.core.config.public_is_https,
-            &ar_id,
-            &csrf_token,
+            &nonce_id,
+            &cookie_csrf,
             PENDING_AUTH_TTL_SECS,
         );
-        authorize_form_reply(StatusCode::OK, &pending, None, Some(&cookie))
+        let view = AuthorizeFormView {
+            ar_id: &sealed_payload.nonce_id,
+            csrf_token: &sealed_token,
+            client_id: &sealed_payload.client_id,
+            client_name: sealed_payload.client_name.as_deref(),
+            redirect_uri: &sealed_payload.redirect_uri,
+            scopes: &sealed_payload.scopes,
+            resource: &sealed_payload.resource,
+        };
+        authorize_form_reply(StatusCode::OK, &view, None, Some(&cookie))
     }
 
     async fn handle_authorize_post(
@@ -1101,10 +1315,10 @@ impl OAuthEngine {
             return html_status_reply(StatusCode::BAD_REQUEST, "Invalid form submission");
         };
 
-        let Some(ar_id) = form.get("ar_id").filter(|v| !v.is_empty()) else {
+        let Some(ar_id) = form.get("ar_id").filter(|v| !v.is_empty()).cloned() else {
             return html_status_reply(StatusCode::BAD_REQUEST, "Missing authorization session");
         };
-        let Some(form_csrf) = form.get("csrf_token").filter(|v| !v.is_empty()) else {
+        let Some(form_csrf) = form.get("csrf_token").filter(|v| !v.is_empty()).cloned() else {
             return html_status_reply(StatusCode::FORBIDDEN, "Missing CSRF token");
         };
         let is_deny = match form.get("decision").map(String::as_str) {
@@ -1113,66 +1327,63 @@ impl OAuthEngine {
             Some(_) => return html_status_reply(StatusCode::BAD_REQUEST, "Invalid decision"),
         };
 
-        let ip_key = peer_ip.unwrap_or(IpAddr::V4(Ipv4Addr::UNSPECIFIED));
+        let (ip_key, use_loopback_bucket) =
+            resolve_rate_limit_ip(&req_headers, peer_ip, &self.core.config.trusted_proxies);
         let now = unix_now();
 
-        let pending_snapshot = {
+        {
             let mut guard = self
                 .core
                 .inner
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
             guard.prune_ephemeral(now);
-            if !is_deny && guard.ip_pw_failures(&ip_key) >= PW_MAX_FAILURES {
+            if !is_deny && !guard.has_pw_budget(ip_key, use_loopback_bucket) {
                 return html_status_reply(
                     StatusCode::TOO_MANY_REQUESTS,
                     "Too many failed attempts",
                 );
             }
-            guard
-                .pending_auths
-                .iter()
-                .find(|entry| entry.ar_id == *ar_id)
-                .cloned()
-        };
+            if guard.is_auth_nonce_consumed(&ar_id) {
+                return html_status_reply(
+                    StatusCode::BAD_REQUEST,
+                    "Authorization request already consumed",
+                );
+            }
+        }
 
-        let Some(pending) = pending_snapshot else {
+        let aad = auth_form_aad(&self.core.config.public_url, &ar_id);
+        let Some(mut plaintext) = self.core.crypto.open(&aad, &form_csrf) else {
+            return html_status_reply(StatusCode::FORBIDDEN, "CSRF validation failed");
+        };
+        let parsed_res = serde_json::from_slice::<SealedAuthForm>(&plaintext);
+        zeroize_bytes(&mut plaintext);
+        let Ok(mut pending) = parsed_res else {
+            return html_status_reply(StatusCode::FORBIDDEN, "CSRF validation failed");
+        };
+        if !constant_time_eq_str(&pending.nonce_id, &ar_id) {
+            zeroize_string(&mut pending.cookie_csrf);
+            return html_status_reply(StatusCode::FORBIDDEN, "CSRF validation failed");
+        }
+        if pending.expires_at <= now {
+            zeroize_string(&mut pending.cookie_csrf);
             return html_status_reply(
                 StatusCode::BAD_REQUEST,
                 "Authorization request expired or unknown",
             );
-        };
-
-        let cookie_name = ar_cookie_name(self.core.config.public_is_https, &pending.ar_id);
-        if !has_valid_csrf_cookie(&req_headers, &cookie_name, &pending.csrf_token)
-            || !constant_time_eq_str(form_csrf, &pending.csrf_token)
-        {
-            return html_status_reply(StatusCode::FORBIDDEN, "CSRF validation failed");
         }
 
+        let cookie_name = ar_cookie_name(self.core.config.public_is_https, &pending.nonce_id);
+        if !has_valid_csrf_cookie(&req_headers, &cookie_name, &pending.cookie_csrf) {
+            zeroize_string(&mut pending.cookie_csrf);
+            return html_status_reply(StatusCode::FORBIDDEN, "CSRF validation failed");
+        }
+        zeroize_string(&mut pending.cookie_csrf);
+
         if is_deny {
-            let consumed = {
-                let mut guard = self
-                    .core
-                    .inner
-                    .lock()
-                    .unwrap_or_else(|poisoned| poisoned.into_inner());
-                guard.prune_ephemeral(unix_now());
-                let Some(pos) = guard
-                    .pending_auths
-                    .iter()
-                    .position(|entry| entry.ar_id == pending.ar_id)
-                else {
-                    return html_status_reply(
-                        StatusCode::BAD_REQUEST,
-                        "Authorization request already consumed",
-                    );
-                };
-                guard.pending_auths.remove(pos).expect("position exists")
-            };
             let clear_cookie =
-                build_ar_cookie(self.core.config.public_is_https, &consumed.ar_id, "", 0);
-            let Ok(mut location) = Url::parse(&consumed.redirect_uri) else {
+                build_ar_cookie(self.core.config.public_is_https, &pending.nonce_id, "", 0);
+            let Ok(mut location) = Url::parse(&pending.redirect_uri) else {
                 return html_status_reply(
                     StatusCode::INTERNAL_SERVER_ERROR,
                     "Invalid redirect target",
@@ -1182,7 +1393,7 @@ impl OAuthEngine {
                 let mut pairs = location.query_pairs_mut();
                 pairs.append_pair("error", "access_denied");
                 pairs.append_pair("iss", &self.core.config.public_url);
-                if let Some(st) = &consumed.state {
+                if let Some(st) = &pending.state {
                     pairs.append_pair("state", st);
                 }
             }
@@ -1190,8 +1401,11 @@ impl OAuthEngine {
         }
 
         let mut password = form.remove("password").unwrap_or_default();
-        let _verify_guard = self.core.pw_verify_gate.lock().await;
-        let should_pace = {
+        let Ok(verify_permit) = Arc::clone(&self.core.pw_verify_sem).acquire_owned().await else {
+            zeroize_string(&mut password);
+            return html_status_reply(StatusCode::SERVICE_UNAVAILABLE, "Server shutting down");
+        };
+        {
             let mut guard = self
                 .core
                 .inner
@@ -1199,22 +1413,25 @@ impl OAuthEngine {
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
             let check_now = unix_now();
             guard.prune_ephemeral(check_now);
-            if guard.ip_pw_failures(&ip_key) >= PW_MAX_FAILURES {
+            if !guard.has_pw_budget(ip_key, use_loopback_bucket) {
                 zeroize_string(&mut password);
                 return html_status_reply(
                     StatusCode::TOO_MANY_REQUESTS,
                     "Too many failed attempts",
                 );
             }
-            peer_ip.is_some() && guard.total_pw_failures() >= PW_MAX_FAILURES
-        };
-
-        if should_pace {
-            tokio::time::sleep(PW_GLOBAL_PACE_DELAY).await;
+            if guard.is_auth_nonce_consumed(&pending.nonce_id) {
+                zeroize_string(&mut password);
+                return html_status_reply(
+                    StatusCode::BAD_REQUEST,
+                    "Authorization request already consumed",
+                );
+            }
         }
 
         let verifier = self.core.config.oauth.verifier.clone();
         let pw_valid = tokio::task::spawn_blocking(move || {
+            let _permit = verify_permit;
             let valid = verifier.verify(&password);
             zeroize_string(&mut password);
             valid
@@ -1224,7 +1441,6 @@ impl OAuthEngine {
 
         let finish_now = unix_now();
         if !pw_valid {
-            let mut burned = false;
             {
                 let mut guard = self
                     .core
@@ -1232,35 +1448,29 @@ impl OAuthEngine {
                     .lock()
                     .unwrap_or_else(|poisoned| poisoned.into_inner());
                 guard.prune_ephemeral(finish_now);
-                guard.record_pw_failure(ip_key);
-                if let Some(pos) = guard
-                    .pending_auths
-                    .iter()
-                    .position(|entry| entry.ar_id == pending.ar_id)
-                {
-                    guard.pending_auths[pos].attempts =
-                        guard.pending_auths[pos].attempts.saturating_add(1);
-                    if guard.pending_auths[pos].attempts >= MAX_AR_ATTEMPTS {
-                        guard.pending_auths.remove(pos);
-                        burned = true;
-                    }
-                }
+                guard.record_pw_failure(ip_key, use_loopback_bucket);
             }
-            if burned {
-                let clear_cookie =
-                    build_ar_cookie(self.core.config.public_is_https, &pending.ar_id, "", 0);
-                return authorize_form_reply(
-                    StatusCode::UNAUTHORIZED,
-                    &pending,
-                    Some("Maximum password attempts exceeded"),
-                    Some(&clear_cookie),
-                );
-            }
+            let view = AuthorizeFormView {
+                ar_id: &pending.nonce_id,
+                csrf_token: &form_csrf,
+                client_id: &pending.client_id,
+                client_name: pending.client_name.as_deref(),
+                redirect_uri: &pending.redirect_uri,
+                scopes: &pending.scopes,
+                resource: &pending.resource,
+            };
             return authorize_form_reply(
                 StatusCode::UNAUTHORIZED,
-                &pending,
+                &view,
                 Some("Incorrect password"),
                 None,
+            );
+        }
+
+        if pending.expires_at <= finish_now {
+            return html_status_reply(
+                StatusCode::BAD_REQUEST,
+                "Authorization request expired or unknown",
             );
         }
 
@@ -1269,29 +1479,23 @@ impl OAuthEngine {
         };
         let code_hash = sha256_b64(&raw_code);
 
-        let consumed = {
+        {
             let mut guard = self
                 .core
                 .inner
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
             guard.prune_ephemeral(finish_now);
-            let Some(pos) = guard
-                .pending_auths
-                .iter()
-                .position(|entry| entry.ar_id == pending.ar_id)
-            else {
+            if guard.is_auth_nonce_consumed(&pending.nonce_id) {
                 return html_status_reply(
                     StatusCode::BAD_REQUEST,
                     "Authorization request already consumed",
                 );
-            };
-            let entry = guard.pending_auths.remove(pos).expect("position exists");
-            let client_still_registered = guard
-                .persisted
-                .clients
-                .iter()
-                .any(|c| c.client_id == entry.client_id);
+            }
+            let client_still_registered = guard.persisted.clients.iter().any(|c| {
+                c.client_id == pending.client_id
+                    && matches_registered_redirect_uri(&c.redirect_uris, &pending.redirect_uri)
+            });
             if !client_still_registered {
                 return html_status_reply(
                     StatusCode::BAD_REQUEST,
@@ -1299,31 +1503,31 @@ impl OAuthEngine {
                 );
             }
 
+            guard.record_consumed_auth_nonce(pending.nonce_id.clone(), pending.expires_at);
             while guard.auth_codes.len() >= MAX_AUTH_CODES {
                 guard.auth_codes.pop_front();
             }
             guard.auth_codes.push_back(AuthCodeEntry {
                 code_sha256: code_hash,
-                client_id: entry.client_id.clone(),
-                redirect_uri: entry.redirect_uri.clone(),
-                scopes: entry.scopes.clone(),
-                resource: entry.resource.clone(),
-                code_challenge: entry.code_challenge.clone(),
+                client_id: pending.client_id.clone(),
+                redirect_uri: pending.redirect_uri.clone(),
+                scopes: pending.scopes.clone(),
+                resource: pending.resource.clone(),
+                code_challenge: pending.code_challenge.clone(),
                 expires_at: finish_now.saturating_add(AUTH_CODE_TTL_SECS),
             });
-            entry
-        };
+        }
 
         let clear_cookie =
-            build_ar_cookie(self.core.config.public_is_https, &consumed.ar_id, "", 0);
-        let Ok(mut location) = Url::parse(&consumed.redirect_uri) else {
+            build_ar_cookie(self.core.config.public_is_https, &pending.nonce_id, "", 0);
+        let Ok(mut location) = Url::parse(&pending.redirect_uri) else {
             return html_status_reply(StatusCode::INTERNAL_SERVER_ERROR, "Invalid redirect target");
         };
         {
             let mut pairs = location.query_pairs_mut();
             pairs.append_pair("code", &raw_code);
             pairs.append_pair("iss", &self.core.config.public_url);
-            if let Some(st) = &consumed.state {
+            if let Some(st) = &pending.state {
                 pairs.append_pair("state", st);
             }
         }
@@ -2530,6 +2734,9 @@ fn is_allowed_redirect_uri(config: &GatewayConfig, raw: &str) -> bool {
     if !is_canonical_host(raw_host, host) {
         return false;
     }
+    if extract_explicit_port(raw).is_some_and(|p| p == 0) {
+        return false;
+    }
     if is_loopback_host(host) {
         return matches!(parsed.scheme(), "http" | "https");
     }
@@ -2545,6 +2752,64 @@ fn is_allowed_redirect_uri(config: &GatewayConfig, raw: &str) -> bool {
         .allowed_redirect_hosts
         .iter()
         .any(|allowed| allowed == &lower_host)
+}
+
+fn extract_explicit_port(raw: &str) -> Option<u16> {
+    let (_, after_scheme) = raw.split_once("://")?;
+    let authority_end = after_scheme
+        .find(['/', '?', '#'])
+        .unwrap_or(after_scheme.len());
+    let authority = &after_scheme[..authority_end];
+    let port_str = if authority.starts_with('[') {
+        let close = authority.find(']')?;
+        authority[close + 1..].strip_prefix(':')?
+    } else {
+        authority.split_once(':')?.1
+    };
+    port_str.parse::<u16>().ok()
+}
+
+fn parse_http_literal_loopback_target(raw: &str) -> Option<(IpAddr, String, Option<String>)> {
+    let (raw_host, raw_path) = extract_raw_host_and_path(raw)?;
+    if !has_clean_url_path(raw_path) || extract_explicit_port(raw).is_some_and(|p| p == 0) {
+        return None;
+    }
+    let parsed = Url::parse(raw).ok()?;
+    if parsed.scheme() != "http"
+        || parsed.fragment().is_some()
+        || !parsed.username().is_empty()
+        || parsed.password().is_some()
+    {
+        return None;
+    }
+    let host_str = parsed.host_str()?;
+    if !is_canonical_host(raw_host, host_str) {
+        return None;
+    }
+    let ip = match parsed.host()? {
+        url::Host::Ipv4(v4) if v4 == Ipv4Addr::LOCALHOST => IpAddr::V4(v4),
+        url::Host::Ipv6(v6) if v6 == Ipv6Addr::LOCALHOST => IpAddr::V6(v6),
+        _ => return None,
+    };
+    let norm_path = if raw_path.is_empty() {
+        "/".to_owned()
+    } else {
+        raw_path.to_owned()
+    };
+    Some((ip, norm_path, parsed.query().map(str::to_owned)))
+}
+
+fn matches_registered_redirect_uri(registered_uris: &[String], candidate: &str) -> bool {
+    if registered_uris.iter().any(|u| u == candidate) {
+        return true;
+    }
+    let Some(cand_target) = parse_http_literal_loopback_target(candidate) else {
+        return false;
+    };
+    registered_uris
+        .iter()
+        .filter_map(|u| parse_http_literal_loopback_target(u))
+        .any(|reg_target| reg_target == cand_target)
 }
 
 fn normalize_resource(config: &GatewayConfig, raw: Option<&str>) -> Result<String, ()> {
@@ -2658,6 +2923,117 @@ fn build_ar_cookie(public_is_https: bool, ar_id: &str, csrf_token: &str, max_age
             "{name}={csrf_token}; Path=/oauth/authorize; Max-Age={max_age}; HttpOnly; SameSite=Lax"
         )
     }
+}
+
+fn auth_form_aad(public_url: &str, nonce_id: &str) -> Vec<u8> {
+    let mut aad = Vec::with_capacity(public_url.len() + 1 + nonce_id.len());
+    aad.extend_from_slice(public_url.as_bytes());
+    aad.push(0);
+    aad.extend_from_slice(nonce_id.as_bytes());
+    aad
+}
+
+fn is_trusted_proxy(trusted_proxies: &[IpNet], ip: IpAddr) -> bool {
+    trusted_proxies.iter().any(|net| net.contains(ip))
+}
+
+fn extract_single_real_ip(headers: &HeaderMap) -> Option<IpAddr> {
+    let mut iter = headers.get_all("x-real-ip").iter();
+    let raw_hdr = iter.next()?;
+    if iter.next().is_some() {
+        return None;
+    }
+    let trimmed = raw_hdr.to_str().ok()?.trim_ascii();
+    if trimmed.is_empty() {
+        return None;
+    }
+    trimmed.parse::<IpAddr>().ok().map(|ip| ip.to_canonical())
+}
+
+fn resolve_rate_limit_ip(
+    headers: &HeaderMap,
+    peer_ip: Option<IpAddr>,
+    trusted_proxies: &[IpNet],
+) -> (IpAddr, bool) {
+    let Some(raw_peer) = peer_ip else {
+        return (IpAddr::V4(Ipv4Addr::UNSPECIFIED), false);
+    };
+    let peer = raw_peer.to_canonical();
+    if trusted_proxies.is_empty() {
+        return (peer, peer.is_loopback());
+    }
+    if !is_trusted_proxy(trusted_proxies, peer) {
+        return (peer, false);
+    }
+
+    let xff_headers: Vec<&http::HeaderValue> = headers.get_all("x-forwarded-for").iter().collect();
+    if !xff_headers.is_empty() {
+        let mut rightmost_valid: Option<IpAddr> = None;
+        let mut malformed = false;
+        'outer: for hdr in xff_headers.into_iter().rev() {
+            let Ok(raw) = hdr.to_str() else {
+                malformed = true;
+                break;
+            };
+            for part in raw.rsplit(',') {
+                let trimmed = part.trim_ascii();
+                if trimmed.is_empty() {
+                    continue;
+                }
+                let Ok(parsed) = trimmed.parse::<IpAddr>() else {
+                    malformed = true;
+                    break 'outer;
+                };
+                let canonical = parsed.to_canonical();
+                rightmost_valid = Some(canonical);
+                if !is_trusted_proxy(trusted_proxies, canonical) {
+                    return (canonical, false);
+                }
+            }
+        }
+        if malformed {
+            let fallback = rightmost_valid.unwrap_or(peer);
+            return (fallback, false);
+        }
+        if let Some(real_ip) = extract_single_real_ip(headers)
+            && !is_trusted_proxy(trusted_proxies, real_ip)
+        {
+            return (real_ip, false);
+        }
+        if let Some(valid) = rightmost_valid {
+            return (valid, valid.is_loopback());
+        }
+    }
+
+    if let Some(real_ip) = extract_single_real_ip(headers) {
+        if !is_trusted_proxy(trusted_proxies, real_ip) {
+            return (real_ip, false);
+        }
+        return (real_ip, real_ip.is_loopback());
+    }
+
+    (peer, peer.is_loopback())
+}
+
+fn verify_check_bearer(headers: &HeaderMap, expected_token_sha256: &[u8; 32]) -> bool {
+    let mut iter = headers.get_all(header::AUTHORIZATION).iter();
+    let Some(raw_hdr) = iter.next() else {
+        return false;
+    };
+    if iter.next().is_some() {
+        return false;
+    }
+    let Ok(hdr_str) = raw_hdr.to_str() else {
+        return false;
+    };
+    let Some(rest) = strip_bearer_prefix(hdr_str.trim_ascii()) else {
+        return false;
+    };
+    let token = rest.trim_ascii();
+    if token.is_empty() || !token.bytes().all(|b| (0x21..=0x7E).contains(&b)) {
+        return false;
+    }
+    constant_time_sha256_eq(token, expected_token_sha256)
 }
 
 fn strip_bearer_prefix(header_val: &str) -> Option<&str> {
@@ -2800,17 +3176,25 @@ enum BodyReadError {
 }
 
 async fn read_limited_body(req: Request<Incoming>) -> Result<Bytes, BodyReadError> {
-    match check_content_length_limit(req.headers(), MAX_POST_BODY_BYTES as u64) {
+    read_limited_body_with(req, MAX_POST_BODY_BYTES, OAUTH_BODY_TIMEOUT).await
+}
+
+async fn read_limited_body_with(
+    req: Request<Incoming>,
+    max_bytes: usize,
+    timeout_dur: Duration,
+) -> Result<Bytes, BodyReadError> {
+    match check_content_length_limit(req.headers(), max_bytes as u64) {
         ContentLengthCheck::Ok => {}
         ContentLengthCheck::Invalid => return Err(BodyReadError::InvalidContentLength),
         ContentLengthCheck::TooLarge => return Err(BodyReadError::TooLarge),
     }
-    if req.body().size_hint().lower() > MAX_POST_BODY_BYTES as u64 {
+    if req.body().size_hint().lower() > max_bytes as u64 {
         return Err(BodyReadError::TooLarge);
     }
 
-    let limited = Limited::new(req.into_body(), MAX_POST_BODY_BYTES);
-    match tokio::time::timeout(OAUTH_BODY_TIMEOUT, limited.collect()).await {
+    let limited = Limited::new(req.into_body(), max_bytes);
+    match tokio::time::timeout(timeout_dur, limited.collect()).await {
         Ok(Ok(collected)) => Ok(collected.to_bytes()),
         Ok(Err(err)) if err.is::<LengthLimitError>() => Err(BodyReadError::TooLarge),
         Ok(Err(_)) => Err(BodyReadError::ReadFailed),
@@ -2949,16 +3333,13 @@ fn escape_html(input: &str) -> String {
     out
 }
 
-fn render_authorize_page(pending: &PendingAuthRequest, error_notice: Option<&str>) -> String {
-    let display_raw = pending
-        .client_name
-        .as_deref()
-        .unwrap_or(pending.client_id.as_str());
+fn render_authorize_page(pending: &AuthorizeFormView<'_>, error_notice: Option<&str>) -> String {
+    let display_raw = pending.client_name.unwrap_or(pending.client_id);
     let display = escape_html(display_raw);
-    let client_id = escape_html(&pending.client_id);
-    let resource = escape_html(&pending.resource);
-    let redirect_uri = escape_html(&pending.redirect_uri);
-    let callback_host = Url::parse(&pending.redirect_uri)
+    let client_id = escape_html(pending.client_id);
+    let resource = escape_html(pending.resource);
+    let redirect_uri = escape_html(pending.redirect_uri);
+    let callback_host = Url::parse(pending.redirect_uri)
         .ok()
         .and_then(|u| match (u.host_str(), u.port()) {
             (Some(h), Some(p)) => Some(escape_html(&format!("{h}:{p}"))),
@@ -2966,11 +3347,11 @@ fn render_authorize_page(pending: &PendingAuthRequest, error_notice: Option<&str
             _ => None,
         })
         .unwrap_or_default();
-    let ar_id = escape_html(&pending.ar_id);
-    let csrf_token = escape_html(&pending.csrf_token);
+    let ar_id = escape_html(pending.ar_id);
+    let csrf_token = escape_html(pending.csrf_token);
 
     let mut scope_chips = String::new();
-    for scope in &pending.scopes {
+    for scope in pending.scopes {
         scope_chips.push_str("<span class=\"chip\">");
         scope_chips.push_str(&escape_html(scope));
         scope_chips.push_str("</span>");
@@ -3042,7 +3423,7 @@ button{{padding:0.78rem 1.25rem;font-size:0.95rem;font-weight:600;border-radius:
 
 fn authorize_form_reply(
     status: StatusCode,
-    pending: &PendingAuthRequest,
+    pending: &AuthorizeFormView<'_>,
     error_notice: Option<&str>,
     cookie: Option<&str>,
 ) -> HttpReply {
@@ -3231,7 +3612,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn authorize_get_waits_for_client_eviction_commit() {
+    async fn authorize_get_is_stateless_and_post_rejects_evicted_client() {
         tokio::time::timeout(Duration::from_secs(10), async {
             let tmp = tempfile::TempDir::new().unwrap();
             let owner_hash =
@@ -3291,32 +3672,67 @@ mod tests {
                     ("code_challenge_method", "S256"),
                 ])
                 .finish();
+
             let req = Request::builder()
                 .uri(format!("/oauth/authorize?{query}"))
                 .body(Full::new(Bytes::new()))
                 .unwrap();
-            let (polled_tx, polled_rx) = oneshot::channel();
-            let authorization = tokio::spawn(dispatch(Arc::clone(&engine), req, Some(polled_tx)));
-            polled_rx.await.unwrap();
-            resume_tx.send(()).unwrap();
-
-            assert_eq!(registration.await.unwrap().0, StatusCode::CREATED);
-            let (status, _) = authorization.await.unwrap();
-            let state = engine.core.inner.lock().unwrap();
-            assert_eq!(state.persisted.clients.len(), 16);
+            // Stateless GET completes without waiting on persist_lock.
+            let (get_status, get_body) = dispatch(Arc::clone(&engine), req, None).await;
+            assert_eq!(get_status, StatusCode::OK);
             assert!(
-                state
-                    .persisted
-                    .clients
-                    .iter()
-                    .all(|client| client.client_id != clients[0])
+                engine
+                    .core
+                    .inner
+                    .lock()
+                    .unwrap()
+                    .consumed_auth_nonces
+                    .is_empty()
             );
-            let pending = state
-                .pending_auths
-                .iter()
-                .filter(|pending| pending.client_id == clients[0])
-                .count();
-            assert_eq!((status, pending), (StatusCode::BAD_REQUEST, 0));
+
+            let html = std::str::from_utf8(&get_body).unwrap();
+            let extract_val = |name: &str| -> String {
+                let needle = format!("name=\"{name}\" value=\"");
+                let start = html.find(&needle).unwrap() + needle.len();
+                let end = html[start..].find('"').unwrap() + start;
+                html[start..end].to_owned()
+            };
+            let ar_id = extract_val("ar_id");
+            let csrf_token = extract_val("csrf_token");
+            let aad = auth_form_aad("https://mcp.example.com", &ar_id);
+            let opened: SealedAuthForm =
+                serde_json::from_slice(&engine.core.crypto.open(&aad, &csrf_token).unwrap())
+                    .unwrap();
+            let cookie = format!("__Host-mcp_ar_{ar_id}={}", opened.cookie_csrf);
+
+            resume_tx.send(()).unwrap();
+            assert_eq!(registration.await.unwrap().0, StatusCode::CREATED);
+
+            let post_body = form_urlencoded::Serializer::new(String::new())
+                .extend_pairs([
+                    ("ar_id", ar_id.as_str()),
+                    ("csrf_token", csrf_token.as_str()),
+                    ("password", "owner-test-password"),
+                ])
+                .finish();
+            let post_req = Request::builder()
+                .method(Method::POST)
+                .uri("/oauth/authorize")
+                .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+                .header(header::COOKIE, cookie)
+                .body(Full::new(Bytes::from(post_body)))
+                .unwrap();
+            let (post_status, _) = dispatch(Arc::clone(&engine), post_req, None).await;
+            assert_eq!(post_status, StatusCode::BAD_REQUEST);
+            assert!(
+                engine
+                    .core
+                    .inner
+                    .lock()
+                    .unwrap()
+                    .consumed_auth_nonces
+                    .is_empty()
+            );
         })
         .await
         .expect("DCR and authorization requests settle");

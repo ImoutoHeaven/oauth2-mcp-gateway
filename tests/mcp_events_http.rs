@@ -66,6 +66,9 @@ async fn send_http(
     body: ReplyBody,
 ) -> (StatusCode, HeaderMap, Bytes) {
     let mut builder = Request::builder().method(method).uri(url);
+    if !headers.iter().any(|(k, _)| k.eq_ignore_ascii_case("host")) {
+        builder = builder.header(header::HOST, "mcp.example.com");
+    }
     for (k, v) in headers {
         builder = builder.header(*k, *v);
     }
@@ -570,6 +573,7 @@ async fn http_upstream_events_list_poll_and_sse_stream_passthrough() {
         let req = Request::builder()
             .method(Method::POST)
             .uri(&mcp_url)
+            .header(header::HOST, "mcp.example.com")
             .header(header::AUTHORIZATION, &bearer)
             .header(header::CONTENT_TYPE, "application/json")
             .header(header::ACCEPT, "text/event-stream, application/json")

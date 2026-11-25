@@ -68,6 +68,10 @@ async fn send_http(
     body: ReplyBody,
 ) -> (StatusCode, HeaderMap, Bytes) {
     let mut builder = Request::builder().method(method).uri(url);
+    let has_host = headers.iter().any(|(k, _)| k.eq_ignore_ascii_case("host"));
+    if !has_host {
+        builder = builder.header(header::HOST, "mcp.example.com");
+    }
     for (k, v) in headers {
         builder = builder.header(*k, *v);
     }
@@ -609,6 +613,7 @@ async fn e2e_http_oauth_flow_bearer_pool_sse_stripping_and_passthrough() {
             Request::builder()
                 .method(Method::GET)
                 .uri(format!("http://{gw_addr}/t/artifact-1"))
+                .header(header::HOST, "mcp.example.com")
                 .body(empty_body())
                 .unwrap(),
         )
@@ -1180,6 +1185,9 @@ async fn e2e_custom_resource_path_host_rebinding_discovery_cors_and_http_revocat
         "GET /healthz HTTP/1.1\r\nHost: evil.rebind:8080\r\n\r\n",
         "GET /healthz HTTP/1.1\r\nHost: mcp.example.com:8443\r\n\r\n",
         "GET /healthz HTTP/1.1\r\nHost: 127.0.0.1\r\nHost: mcp.example.com\r\n\r\n",
+        "GET /healthz HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n",
+        "GET /healthz HTTP/1.1\r\nHost: localhost:8080\r\n\r\n",
+        "GET /healthz HTTP/1.1\r\nHost: [::1]:8080\r\n\r\n",
     ] {
         let mut sock = TcpStream::connect(gw_addr).await.unwrap();
         sock.write_all(raw_bad_host.as_bytes()).await.unwrap();
@@ -1192,12 +1200,7 @@ async fn e2e_custom_resource_path_host_rebinding_discovery_cors_and_http_revocat
         );
     }
 
-    for good_host in [
-        "MCP.EXAMPLE.COM",
-        "mcp.example.com:443",
-        "localhost:8080",
-        "[::1]:8080",
-    ] {
+    for good_host in ["MCP.EXAMPLE.COM", "mcp.example.com:443"] {
         let mut sock = TcpStream::connect(gw_addr).await.unwrap();
         let req =
             format!("HEAD /healthz HTTP/1.1\r\nHost: {good_host}\r\nConnection: close\r\n\r\n");
@@ -1365,6 +1368,7 @@ async fn e2e_custom_resource_path_host_rebinding_discovery_cors_and_http_revocat
             Request::builder()
                 .method(Method::GET)
                 .uri(format!("http://{gw_addr}/bridge/mcp"))
+                .header(header::HOST, "mcp.example.com")
                 .header(header::AUTHORIZATION, format!("Bearer {token_1}"))
                 .header("mcp-session-id", &sid)
                 .header(header::ACCEPT, "text/event-stream")
@@ -1425,4 +1429,600 @@ async fn e2e_custom_resource_path_host_rebinding_discovery_cors_and_http_revocat
     gw_shutdown.cancel();
     gw_handle.await.unwrap().unwrap();
     up_cancel.cancel();
+}
+
+#[tokio::test]
+async fn e2e_auth_context_delegation_loopback_check_and_status_decoupling() {
+    #[derive(Clone, Debug, PartialEq, Eq)]
+    struct SeenUpstreamReq {
+        method: String,
+        path: String,
+        auth: Option<String>,
+        auth_ref: Option<String>,
+        auth_scope: Option<String>,
+        auth_extra: Option<String>,
+    }
+
+    let seen_reqs: Arc<Mutex<Vec<SeenUpstreamReq>>> = Arc::new(Mutex::new(Vec::new()));
+    let seen_up = Arc::clone(&seen_reqs);
+
+    let (up_addr, up_cancel) = spawn_http1_harness(move |req: Request<Incoming>| {
+        let seen = Arc::clone(&seen_up);
+        async move {
+            let method = req.method().as_str().to_owned();
+            let path = req.uri().path().to_owned();
+            let hdr_str = |name: &str| {
+                req.headers()
+                    .get(name)
+                    .and_then(|v| v.to_str().ok())
+                    .map(str::to_owned)
+            };
+            let mode = hdr_str("x-test-mode").unwrap_or_else(|| "ok".to_owned());
+            let record = SeenUpstreamReq {
+                method: method.clone(),
+                path: path.clone(),
+                auth: hdr_str("authorization"),
+                auth_ref: hdr_str("x-authorization-ref"),
+                auth_scope: hdr_str("x-authorization-scope"),
+                auth_extra: hdr_str("x-authorization-extra"),
+            };
+            seen.lock().unwrap().push(record.clone());
+            let _ = req.into_body().collect().await;
+
+            if path.starts_with("/t/") {
+                return Response::builder()
+                    .status(StatusCode::CREATED)
+                    .header(header::WWW_AUTHENTICATE, "Bearer realm=\"internal-passthru\"")
+                    .body(empty_body())
+                    .unwrap();
+            }
+
+            if method == "DELETE" {
+                return Response::builder()
+                    .status(StatusCode::NO_CONTENT)
+                    .body(empty_body())
+                    .unwrap();
+            }
+
+            match mode.as_str() {
+                "invalid_token" => Response::builder()
+                    .status(StatusCode::UNAUTHORIZED)
+                    .header(
+                        header::WWW_AUTHENTICATE,
+                        "Bearer resource_metadata=\"http://127.0.0.1:9999/.well-known/oauth-protected-resource/mcp\", error=\"invalid_token\", error_description=\"grant revoked\"",
+                    )
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(bytes_body(r#"{"error":"delegated_invalid"}"#))
+                    .unwrap(),
+                "bare_401" => Response::builder()
+                    .status(StatusCode::UNAUTHORIZED)
+                    .header(header::WWW_AUTHENTICATE, "Bearer")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(bytes_body(r#"{"error":"hop_mismatch"}"#))
+                    .unwrap(),
+                "insufficient_scope_subset" => Response::builder()
+                    .status(StatusCode::FORBIDDEN)
+                    .header(
+                        header::WWW_AUTHENTICATE,
+                        "Bearer error=\"insufficient_scope\", scope=\"hooks bogus bad\\\"tok\"",
+                    )
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(bytes_body(r#"{"error":"need_hooks"}"#))
+                    .unwrap(),
+                "insufficient_scope_fallback" => Response::builder()
+                    .status(StatusCode::FORBIDDEN)
+                    .header(
+                        header::WWW_AUTHENTICATE,
+                        "Bearer error=\"insufficient_scope\", scope=\"unconfigured_only\"",
+                    )
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(bytes_body(r#"{"error":"need_any"}"#))
+                    .unwrap(),
+                "plain_403" => Response::builder()
+                    .status(StatusCode::FORBIDDEN)
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(bytes_body(r#"{"error":"origin_blocked"}"#))
+                    .unwrap(),
+                "bare_bearer_403" => Response::builder()
+                    .status(StatusCode::FORBIDDEN)
+                    .header(header::WWW_AUTHENTICATE, "Bearer realm=\"internal\"")
+                    .body(bytes_body(r#"{"error":"unexpected"}"#))
+                    .unwrap(),
+                _ => Response::builder()
+                    .status(StatusCode::OK)
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .header(header::WWW_AUTHENTICATE, "Bearer realm=\"internal-leak\"")
+                    .header("mcp-session-id", "ac-sid-1")
+                    .body(bytes_body(
+                        json!({
+                            "jsonrpc": "2.0",
+                            "id": 1,
+                            "result": {
+                                "auth_ref": record.auth_ref,
+                                "auth_scope": record.auth_scope,
+                                "auth_extra": record.auth_extra,
+                            }
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            }
+        }
+    })
+    .await;
+
+    let gw_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let gw_addr = gw_listener.local_addr().unwrap();
+    let chk_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let chk_addr = chk_listener.local_addr().unwrap();
+
+    let check_token = "check-secret-token-0123456789";
+    let tmp = TempDir::new().unwrap();
+    let cfg_json = json!({
+        "listen": gw_addr.to_string(),
+        "public_url": PUBLIC_URL,
+        "state_path": tmp.path().join("state.json").to_string_lossy(),
+        "oauth": {
+            "owner_password_hash": fast_owner_hash(),
+            "scopes": ["mcp", "hooks"],
+        },
+        "upstream": {
+            "transport": "http",
+            "url": format!("http://{up_addr}/mcp"),
+            "bearer_tokens": ["hop-inbound-secret-token"],
+            "passthrough_prefixes": ["/t/"],
+            "auth_context": {
+                "check_listen": chk_addr.to_string(),
+                "check_token": check_token,
+            }
+        }
+    });
+    let cfg = Arc::new(GatewayConfig::from_json_str(&cfg_json.to_string(), tmp.path()).unwrap());
+    let gw_shutdown = tokio_util::sync::CancellationToken::new();
+    let gw_shutdown_run = gw_shutdown.clone();
+    let gw_handle = tokio::spawn(async move {
+        oauth2_mcp_gateway::server::serve_with_listeners(
+            gw_listener,
+            Some(chk_listener),
+            cfg,
+            gw_shutdown_run,
+        )
+        .await
+    });
+
+    let client = make_client();
+    let (client_id, a0, r0) = register_and_authorize_grant(
+        &client,
+        gw_addr,
+        "AuthContext Client",
+        "http://127.0.0.1:41001/cb",
+        "ac-1",
+    )
+    .await;
+
+    // 1. Passthrough strips forged x-authorization-* and upstream WWW-Authenticate without injecting tokens.
+    let (pt_st, pt_hdrs, _) = send_http(
+        &client,
+        Method::PUT,
+        &format!("http://{gw_addr}/t/upload-1"),
+        &[
+            ("x-authorization-ref", "aref_forged"),
+            ("x-authorization-scope", "admin"),
+            ("x-authorization-extra", "spoof"),
+        ],
+        bytes_body("payload"),
+    )
+    .await;
+    assert_eq!(pt_st, StatusCode::CREATED);
+    assert!(pt_hdrs.get(header::WWW_AUTHENTICATE).is_none());
+    {
+        let logs = seen_reqs.lock().unwrap();
+        let last = logs.last().unwrap();
+        assert_eq!(last.path, "/t/upload-1");
+        assert_eq!(last.auth, None);
+        assert_eq!(last.auth_ref, None);
+        assert_eq!(last.auth_scope, None);
+        assert_eq!(last.auth_extra, None);
+    }
+
+    // 2. /mcp strips forged x-authorization-* and injects gateway X-Authorization-Ref & X-Authorization-Scope.
+    let (mcp_st, mcp_hdrs, mcp_body) = send_http(
+        &client,
+        Method::POST,
+        &format!("http://{gw_addr}/mcp"),
+        &[
+            ("authorization", &format!("Bearer {a0}")),
+            ("content-type", "application/json"),
+            ("x-authorization-ref", "aref_forged"),
+            ("x-authorization-scope", "forged_scope"),
+            ("x-authorization-extra", "forged_extra"),
+        ],
+        bytes_body(r#"{"jsonrpc":"2.0","id":1,"method":"initialize"}"#),
+    )
+    .await;
+    assert_eq!(mcp_st, StatusCode::OK);
+    assert!(mcp_hdrs.get(header::WWW_AUTHENTICATE).is_none());
+    let mcp_json = parse_json(&mcp_body);
+    let injected_aref = mcp_json["result"]["auth_ref"].as_str().unwrap().to_owned();
+    assert!(injected_aref.starts_with("aref_"));
+    assert_ne!(injected_aref, "aref_forged");
+    assert_eq!(mcp_json["result"]["auth_scope"], "mcp hooks");
+    assert!(mcp_json["result"]["auth_extra"].is_null());
+
+    // Narrow access token scope via refresh while current_refresh keeps full grant scopes.
+    let (rf_st, _, rf_body) = send_http(
+        &client,
+        Method::POST,
+        &format!("http://{gw_addr}/oauth/token"),
+        &[("content-type", "application/x-www-form-urlencoded")],
+        bytes_body(form_encode(&[
+            ("grant_type", "refresh_token"),
+            ("client_id", &client_id),
+            ("refresh_token", &r0),
+            ("scope", "mcp"),
+        ])),
+    )
+    .await;
+    assert_eq!(rf_st, StatusCode::OK);
+    let a1 = parse_json(&rf_body)["access_token"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+
+    let (narrow_st, _, narrow_body) = send_http(
+        &client,
+        Method::POST,
+        &format!("http://{gw_addr}/mcp"),
+        &[
+            ("authorization", &format!("Bearer {a1}")),
+            ("mcp-session-id", "ac-sid-1"),
+            ("content-type", "application/json"),
+        ],
+        bytes_body(r#"{"jsonrpc":"2.0","id":2,"method":"ping"}"#),
+    )
+    .await;
+    assert_eq!(narrow_st, StatusCode::OK);
+    let narrow_json = parse_json(&narrow_body);
+    assert_eq!(narrow_json["result"]["auth_ref"], injected_aref);
+    assert_eq!(narrow_json["result"]["auth_scope"], "mcp");
+
+    // 3. Loopback check_listen protocol hardening and live grant introspection.
+    let send_check =
+        |method: Method, path: &str, hdrs: Vec<(&'static str, String)>, body: Vec<u8>| {
+            let client = client.clone();
+            let url = format!("http://{chk_addr}{path}");
+            async move {
+                let mut b = Request::builder().method(method).uri(url);
+                for (k, v) in &hdrs {
+                    b = b.header(*k, v.as_str());
+                }
+                let resp = client
+                    .request(b.body(bytes_body(body)).unwrap())
+                    .await
+                    .unwrap();
+                let st = resp.status();
+                let h = resp.headers().clone();
+                let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+                (st, h, bytes)
+            }
+        };
+
+    let check_auth_hdr = format!("Bearer {check_token}");
+    let (st_no_auth, h_no_auth, _) = send_check(
+        Method::POST,
+        "/authorization/check",
+        vec![("content-type", "application/json".into())],
+        br#"{"ref":"aref_test"}"#.to_vec(),
+    )
+    .await;
+    assert_eq!(st_no_auth, StatusCode::UNAUTHORIZED);
+    assert_eq!(h_no_auth[header::WWW_AUTHENTICATE], "Bearer");
+
+    let (st_oauth_tok, _, _) = send_check(
+        Method::POST,
+        "/authorization/check",
+        vec![
+            ("authorization", format!("Bearer {a1}")),
+            ("content-type", "application/json".into()),
+        ],
+        br#"{"ref":"aref_test"}"#.to_vec(),
+    )
+    .await;
+    assert_eq!(st_oauth_tok, StatusCode::UNAUTHORIZED);
+
+    let (st_origin, _, _) = send_check(
+        Method::POST,
+        "/authorization/check",
+        vec![
+            ("authorization", check_auth_hdr.clone()),
+            ("origin", PUBLIC_URL.into()),
+            ("content-type", "application/json".into()),
+        ],
+        br#"{"ref":"aref_test"}"#.to_vec(),
+    )
+    .await;
+    assert_eq!(st_origin, StatusCode::FORBIDDEN);
+
+    let (st_get, _, _) = send_check(
+        Method::GET,
+        "/authorization/check",
+        vec![("authorization", check_auth_hdr.clone())],
+        Vec::new(),
+    )
+    .await;
+    assert_eq!(st_get, StatusCode::METHOD_NOT_ALLOWED);
+
+    let (st_404, _, _) = send_check(
+        Method::POST,
+        "/other",
+        vec![
+            ("authorization", check_auth_hdr.clone()),
+            ("content-type", "application/json".into()),
+        ],
+        b"{}".to_vec(),
+    )
+    .await;
+    assert_eq!(st_404, StatusCode::NOT_FOUND);
+
+    let (st_415, _, _) = send_check(
+        Method::POST,
+        "/authorization/check",
+        vec![
+            ("authorization", check_auth_hdr.clone()),
+            ("content-type", "text/plain".into()),
+        ],
+        br#"{"ref":"aref_test"}"#.to_vec(),
+    )
+    .await;
+    assert_eq!(st_415, StatusCode::UNSUPPORTED_MEDIA_TYPE);
+
+    let (st_413, _, _) = send_check(
+        Method::POST,
+        "/authorization/check",
+        vec![
+            ("authorization", check_auth_hdr.clone()),
+            ("content-type", "application/json".into()),
+        ],
+        vec![b' '; 5000],
+    )
+    .await;
+    assert_eq!(st_413, StatusCode::PAYLOAD_TOO_LARGE);
+
+    let (st_unknown_field, _, _) = send_check(
+        Method::POST,
+        "/authorization/check",
+        vec![
+            ("authorization", check_auth_hdr.clone()),
+            ("content-type", "application/json".into()),
+        ],
+        br#"{"ref":"aref_test","extra":true}"#.to_vec(),
+    )
+    .await;
+    assert_eq!(st_unknown_field, StatusCode::BAD_REQUEST);
+
+    let (st_missing_ref, _, b_missing_ref) = send_check(
+        Method::POST,
+        "/authorization/check",
+        vec![
+            ("authorization", check_auth_hdr.clone()),
+            ("content-type", "application/json".into()),
+        ],
+        br#"{"ref":"aref_unknown"}"#.to_vec(),
+    )
+    .await;
+    assert_eq!(st_missing_ref, StatusCode::OK);
+    assert_eq!(parse_json(&b_missing_ref), json!({ "active": false }));
+
+    let (st_active, _, b_active) = send_check(
+        Method::POST,
+        "/authorization/check",
+        vec![
+            ("authorization", check_auth_hdr.clone()),
+            ("content-type", "application/json".into()),
+        ],
+        json!({ "ref": injected_aref }).to_string().into_bytes(),
+    )
+    .await;
+    assert_eq!(st_active, StatusCode::OK);
+    let active_json = parse_json(&b_active);
+    assert_eq!(active_json["active"], true);
+    assert_eq!(active_json["principal"], injected_aref);
+    assert_eq!(active_json["resource"], "https://mcp.example.com/mcp");
+    assert_eq!(active_json["scopes"], json!(["mcp", "hooks"]));
+    assert!(active_json["expiresAt"].as_u64().unwrap() > 0);
+
+    // 4. Orthogonal 401/403 status and WWW-Authenticate synthesis.
+    let expected_meta = "https://mcp.example.com/.well-known/oauth-protected-resource/mcp";
+
+    let (s_inv, h_inv, b_inv) = send_http(
+        &client,
+        Method::POST,
+        &format!("http://{gw_addr}/mcp"),
+        &[
+            ("authorization", &format!("Bearer {a1}")),
+            ("mcp-session-id", "ac-sid-1"),
+            ("content-type", "application/json"),
+            ("x-test-mode", "invalid_token"),
+        ],
+        bytes_body(r#"{"jsonrpc":"2.0","id":3,"method":"ping"}"#),
+    )
+    .await;
+    assert_eq!(s_inv, StatusCode::UNAUTHORIZED);
+    assert_eq!(
+        h_inv[header::WWW_AUTHENTICATE].to_str().unwrap(),
+        format!("Bearer resource_metadata=\"{expected_meta}\", error=\"invalid_token\"")
+    );
+    assert_eq!(parse_json(&b_inv)["error"], "delegated_invalid");
+
+    let (s_bare401, h_bare401, b_bare401) = send_http(
+        &client,
+        Method::POST,
+        &format!("http://{gw_addr}/mcp"),
+        &[
+            ("authorization", &format!("Bearer {a1}")),
+            ("mcp-session-id", "ac-sid-1"),
+            ("content-type", "application/json"),
+            ("x-test-mode", "bare_401"),
+        ],
+        bytes_body(r#"{"jsonrpc":"2.0","id":4,"method":"ping"}"#),
+    )
+    .await;
+    assert_eq!(s_bare401, StatusCode::BAD_GATEWAY);
+    assert!(h_bare401.get(header::WWW_AUTHENTICATE).is_none());
+    assert!(b_bare401.is_empty());
+
+    let (s_insuf, h_insuf, b_insuf) = send_http(
+        &client,
+        Method::POST,
+        &format!("http://{gw_addr}/mcp"),
+        &[
+            ("authorization", &format!("Bearer {a1}")),
+            ("mcp-session-id", "ac-sid-1"),
+            ("content-type", "application/json"),
+            ("x-test-mode", "insufficient_scope_subset"),
+        ],
+        bytes_body(r#"{"jsonrpc":"2.0","id":5,"method":"ping"}"#),
+    )
+    .await;
+    assert_eq!(s_insuf, StatusCode::FORBIDDEN);
+    assert_eq!(
+        h_insuf[header::WWW_AUTHENTICATE].to_str().unwrap(),
+        format!(
+            "Bearer resource_metadata=\"{expected_meta}\", error=\"insufficient_scope\", scope=\"hooks\""
+        )
+    );
+    assert_eq!(parse_json(&b_insuf)["error"], "need_hooks");
+
+    let (s_fb, h_fb, _) = send_http(
+        &client,
+        Method::POST,
+        &format!("http://{gw_addr}/mcp"),
+        &[
+            ("authorization", &format!("Bearer {a1}")),
+            ("mcp-session-id", "ac-sid-1"),
+            ("content-type", "application/json"),
+            ("x-test-mode", "insufficient_scope_fallback"),
+        ],
+        bytes_body(r#"{"jsonrpc":"2.0","id":6,"method":"ping"}"#),
+    )
+    .await;
+    assert_eq!(s_fb, StatusCode::FORBIDDEN);
+    assert_eq!(
+        h_fb[header::WWW_AUTHENTICATE].to_str().unwrap(),
+        format!(
+            "Bearer resource_metadata=\"{expected_meta}\", error=\"insufficient_scope\", scope=\"mcp hooks\""
+        )
+    );
+
+    let (s_plain403, h_plain403, b_plain403) = send_http(
+        &client,
+        Method::POST,
+        &format!("http://{gw_addr}/mcp"),
+        &[
+            ("authorization", &format!("Bearer {a1}")),
+            ("mcp-session-id", "ac-sid-1"),
+            ("content-type", "application/json"),
+            ("x-test-mode", "plain_403"),
+        ],
+        bytes_body(r#"{"jsonrpc":"2.0","id":7,"method":"ping"}"#),
+    )
+    .await;
+    assert_eq!(s_plain403, StatusCode::FORBIDDEN);
+    assert!(h_plain403.get(header::WWW_AUTHENTICATE).is_none());
+    assert_eq!(parse_json(&b_plain403)["error"], "origin_blocked");
+
+    let (s_bad403, _, b_bad403) = send_http(
+        &client,
+        Method::POST,
+        &format!("http://{gw_addr}/mcp"),
+        &[
+            ("authorization", &format!("Bearer {a1}")),
+            ("mcp-session-id", "ac-sid-1"),
+            ("content-type", "application/json"),
+            ("x-test-mode", "bare_bearer_403"),
+        ],
+        bytes_body(r#"{"jsonrpc":"2.0","id":8,"method":"ping"}"#),
+    )
+    .await;
+    assert_eq!(s_bad403, StatusCode::BAD_GATEWAY);
+    assert!(b_bad403.is_empty());
+
+    // 5. Revoke flips /authorization/check to active:false and forwards X-Authorization-* on DELETE.
+    let (rev_st, _, _) = send_http(
+        &client,
+        Method::POST,
+        &format!("http://{gw_addr}/oauth/revoke"),
+        &[("content-type", "application/x-www-form-urlencoded")],
+        bytes_body(form_encode(&[("client_id", &client_id), ("token", &a1)])),
+    )
+    .await;
+    assert_eq!(rev_st, StatusCode::OK);
+
+    let (st_revoked, _, b_revoked) = send_check(
+        Method::POST,
+        "/authorization/check",
+        vec![
+            ("authorization", check_auth_hdr),
+            ("content-type", "application/json".into()),
+        ],
+        json!({ "ref": injected_aref }).to_string().into_bytes(),
+    )
+    .await;
+    assert_eq!(st_revoked, StatusCode::OK);
+    assert_eq!(parse_json(&b_revoked), json!({ "active": false }));
+
+    for _ in 0..50 {
+        if seen_reqs
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|r| r.method == "DELETE")
+        {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    let del_rec = seen_reqs
+        .lock()
+        .unwrap()
+        .iter()
+        .find(|r| r.method == "DELETE")
+        .cloned()
+        .expect("expected revoke DELETE sent to upstream");
+    assert_eq!(
+        del_rec.auth.as_deref(),
+        Some("Bearer hop-inbound-secret-token")
+    );
+    assert_eq!(del_rec.auth_ref.as_deref(), Some(injected_aref.as_str()));
+    assert_eq!(del_rec.auth_scope.as_deref(), Some("mcp"));
+
+    gw_shutdown.cancel();
+    gw_handle.await.unwrap().unwrap();
+    up_cancel.cancel();
+}
+
+#[test]
+fn examples_gateway_http_and_stdio_pass_cli_check_subcommand() {
+    let bin = env!("CARGO_BIN_EXE_oauth2-mcp-gateway");
+    let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let owner_hash = fast_owner_hash();
+
+    for example_rel in ["examples/gateway-http.json", "examples/gateway-stdio.json"] {
+        let cfg_path = manifest_dir.join(example_rel);
+        let out = Command::new(bin)
+            .args(["check", "--config"])
+            .arg(&cfg_path)
+            .env("OWNER_PASSWORD_HASH", &owner_hash)
+            .env("UPSTREAM_BEARER_TOKEN_1", "example-pool-token-alpha")
+            .env("UPSTREAM_BEARER_TOKEN_2", "example-pool-token-beta")
+            .env("MCP_UPSTREAM_API_KEY", "example-stdio-api-key")
+            .output()
+            .expect("spawn oauth2-mcp-gateway check");
+        assert!(
+            out.status.success(),
+            "check failed for {}: {}",
+            example_rel,
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
 }

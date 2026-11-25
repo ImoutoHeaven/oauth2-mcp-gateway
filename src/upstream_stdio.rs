@@ -69,6 +69,10 @@ impl Default for StdioLimits {
     }
 }
 const SESSIONLESS_META_KEY: &str = "io.modelcontextprotocol/protocolVersion";
+const CLIENT_CAPS_META_KEY: &str = "io.modelcontextprotocol/clientCapabilities";
+const CLIENT_INFO_META_KEY: &str = "io.modelcontextprotocol/clientInfo";
+const SERVER_INFO_META_KEY: &str = "io.modelcontextprotocol/serverInfo";
+const SERVER_DISCOVER_METHOD: &str = "server/discover";
 const MIN_SESSIONLESS_PROTOCOL_VERSION: &str = "2026-07-28";
 const EVENTS_STREAM_METHOD: &str = "events/stream";
 const SUBSCRIPTION_ID_META_KEY: &str = "io.modelcontextprotocol/subscriptionId";
@@ -1221,6 +1225,12 @@ impl StdioUpstream {
                 .await;
         }
 
+        if method == Some(SERVER_DISCOVER_METHOD) {
+            return self
+                .handle_server_discover(&parts.headers, token, payload, obj, req_id)
+                .await;
+        }
+
         if let Some(proto_ver) = detect_sessionless_version(&parts.headers, obj) {
             return self
                 .handle_sessionless(&parts.headers, token, &proto_ver, payload, method, req_id)
@@ -1649,19 +1659,7 @@ impl StdioUpstream {
             }
         };
 
-        let synth_init = json!({
-            "jsonrpc": "2.0",
-            "id": 0,
-            "method": "initialize",
-            "params": {
-                "protocolVersion": protocol_version,
-                "capabilities": {},
-                "clientInfo": {
-                    "name": "oauth2-mcp-gateway",
-                    "version": env!("CARGO_PKG_VERSION")
-                }
-            }
-        });
+        let synth_init = build_synthetic_initialize(protocol_version, payload);
 
         let (init_wire_id, mut init_guard, init_notif_rx, init_resp_rx) =
             match session.register_request(err_id, None) {
@@ -1834,6 +1832,326 @@ impl StdioUpstream {
         let reply = single_rpc_reply(headers, None, resp_bytes, resp_lease);
         ephemeral.terminate_now().await;
         reply
+    }
+
+    async fn handle_server_discover(
+        &self,
+        headers: &HeaderMap,
+        token: &VerifiedToken,
+        payload: &Value,
+        obj: &serde_json::Map<String, Value>,
+        req_id: Option<&Value>,
+    ) -> HttpReply {
+        let Some(id) = req_id else {
+            return jsonrpc_error_reply(
+                &self.inner.budget,
+                StatusCode::BAD_REQUEST,
+                &Value::Null,
+                -32600,
+                "server/discover request requires an id",
+            );
+        };
+        if has_multiple_headers(headers, "mcp-protocol-version") {
+            return jsonrpc_error_reply(
+                &self.inner.budget,
+                StatusCode::BAD_REQUEST,
+                id,
+                -32600,
+                "duplicate MCP-Protocol-Version header",
+            );
+        }
+
+        let Some(meta) = obj
+            .get("params")
+            .and_then(Value::as_object)
+            .and_then(|p| p.get("_meta"))
+            .and_then(Value::as_object)
+        else {
+            return jsonrpc_error_reply(
+                &self.inner.budget,
+                StatusCode::BAD_REQUEST,
+                id,
+                -32602,
+                "server/discover requires params._meta object",
+            );
+        };
+
+        let Some(meta_ver) = meta
+            .get(SESSIONLESS_META_KEY)
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|v| supports_sessionless_version(v))
+        else {
+            return jsonrpc_error_reply(
+                &self.inner.budget,
+                StatusCode::BAD_REQUEST,
+                id,
+                -32602,
+                "server/discover requires valid io.modelcontextprotocol/protocolVersion in params._meta",
+            );
+        };
+
+        if meta
+            .get(CLIENT_CAPS_META_KEY)
+            .is_some_and(|v| !v.is_object())
+            || meta
+                .get("clientCapabilities")
+                .is_some_and(|v| !v.is_object())
+            || meta
+                .get(CLIENT_INFO_META_KEY)
+                .is_some_and(|v| !v.is_object())
+            || meta.get("clientInfo").is_some_and(|v| !v.is_object())
+        {
+            return jsonrpc_error_reply(
+                &self.inner.budget,
+                StatusCode::BAD_REQUEST,
+                id,
+                -32602,
+                "invalid client metadata in params._meta",
+            );
+        }
+
+        if let Some(hdr_ver) = extract_single_header(headers, "mcp-protocol-version")
+            && hdr_ver != meta_ver
+        {
+            return jsonrpc_error_reply(
+                &self.inner.budget,
+                StatusCode::BAD_REQUEST,
+                id,
+                -32602,
+                "MCP-Protocol-Version header does not match params._meta protocolVersion",
+            );
+        }
+
+        let start_epoch = {
+            let tbl = self.inner.table.lock().unwrap_or_else(|p| p.into_inner());
+            tbl.grant_epoch(&token.grant_id)
+        };
+
+        let Some(reservation) = acquire_slot(&self.inner, &token.grant_id).await else {
+            return jsonrpc_error_reply(
+                &self.inner.budget,
+                StatusCode::SERVICE_UNAVAILABLE,
+                id,
+                -32000,
+                "session limit reached",
+            );
+        };
+
+        let (session, mut ephemeral) = match StdioSession::spawn(
+            &self.inner,
+            token.grant_id.clone(),
+            start_epoch,
+            reservation,
+        )
+        .await
+        {
+            Ok(pair) => pair,
+            Err(err) => {
+                return jsonrpc_error_reply(
+                    &self.inner.budget,
+                    StatusCode::BAD_GATEWAY,
+                    id,
+                    -32000,
+                    &err,
+                );
+            }
+        };
+
+        let synth_init = build_synthetic_initialize(meta_ver, payload);
+        let (init_wire_id, mut init_guard, init_notif_rx, init_resp_rx) =
+            match session.register_request(id, None) {
+                Ok(registered) => registered,
+                Err(err) => {
+                    let (status, msg) = session
+                        .map_register_failure(err, "ephemeral child exited during initialize");
+                    ephemeral.terminate_now().await;
+                    return jsonrpc_error_reply(&self.inner.budget, status, id, -32000, &msg);
+                }
+            };
+        drop(init_notif_rx);
+        if let Err(err) = session.send_request_line(&synth_init, init_wire_id) {
+            init_guard.disarm();
+            let (status, msg) =
+                session.map_send_failure(err, "ephemeral child closed stdin during initialize");
+            ephemeral.terminate_now().await;
+            return jsonrpc_error_reply(&self.inner.budget, status, id, -32000, &msg);
+        }
+
+        let (init_bytes, init_lease) = match tokio::time::timeout(INIT_TIMEOUT, init_resp_rx).await
+        {
+            Ok(Ok(RespDelivery::Ok { json_bytes, lease })) => {
+                init_guard.mark_completed();
+                (json_bytes, lease)
+            }
+            Ok(Ok(RespDelivery::HardError {
+                status,
+                message: _message,
+                json_bytes,
+                lease,
+            })) => {
+                init_guard.disarm();
+                let reply = jsonrpc_error_bytes_reply(status, json_bytes, lease);
+                ephemeral.terminate_now().await;
+                return reply;
+            }
+            Ok(Err(_)) => {
+                init_guard.disarm();
+                let (status, msg) =
+                    session.map_dead_session_error("ephemeral child exited during initialize");
+                ephemeral.terminate_now().await;
+                return jsonrpc_error_reply(&self.inner.budget, status, id, -32000, &msg);
+            }
+            Err(_) => {
+                init_guard.disarm();
+                ephemeral.terminate_now().await;
+                return jsonrpc_error_reply(
+                    &self.inner.budget,
+                    StatusCode::GATEWAY_TIMEOUT,
+                    id,
+                    -32000,
+                    "ephemeral initialize timed out",
+                );
+            }
+        };
+
+        let init_outcome = classify_init_response(&init_bytes);
+        let init_val: Option<Value> = if init_outcome == InitOutcome::Ok {
+            serde_json::from_slice(&init_bytes).ok()
+        } else {
+            None
+        };
+        drop(init_bytes);
+        drop(init_lease);
+
+        let child_proto = match init_outcome {
+            InitOutcome::Malformed => {
+                ephemeral.terminate_now().await;
+                return jsonrpc_error_reply(
+                    &self.inner.budget,
+                    StatusCode::BAD_GATEWAY,
+                    id,
+                    -32000,
+                    "invalid initialize response from upstream",
+                );
+            }
+            InitOutcome::RpcError => None,
+            InitOutcome::Ok => init_val
+                .as_ref()
+                .and_then(|v| v.get("result"))
+                .and_then(|r| r.get("protocolVersion"))
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|v| supports_sessionless_version(v))
+                .map(str::to_owned),
+        };
+
+        let (Some(negotiated_proto), Some(init_val)) = (child_proto, init_val) else {
+            ephemeral.terminate_now().await;
+            let body = rpc_error_payload(id, -32601, "Method not found");
+            let Ok((encoded, lease)) = encode_json_leased(&body, b"", &self.inner.budget) else {
+                return request_overloaded_reply();
+            };
+            return single_rpc_reply(headers, None, encoded, Some(lease));
+        };
+
+        let initialized_note = json!({
+            "jsonrpc": "2.0",
+            "method": "notifications/initialized"
+        });
+        if let Err(err) = session.send_json_line(&initialized_note) {
+            let (status, msg) = session.map_send_failure(err, "ephemeral child closed stdin");
+            ephemeral.terminate_now().await;
+            return jsonrpc_error_reply(&self.inner.budget, status, id, -32000, &msg);
+        }
+
+        let discover_req = ensure_discover_client_caps(payload);
+        let (wire_id, mut guard, notif_rx, resp_rx) =
+            match session.register_request_opts(id, extract_progress_token(payload), false, None) {
+                Ok(registered) => registered,
+                Err(err) => {
+                    let (status, msg) =
+                        session.map_register_failure(err, "ephemeral child closed stdin");
+                    ephemeral.terminate_now().await;
+                    return jsonrpc_error_reply(&self.inner.budget, status, id, -32000, &msg);
+                }
+            };
+        drop(notif_rx);
+        if let Err(err) = session.send_request_line(&discover_req, wire_id) {
+            guard.disarm();
+            let (status, msg) = session.map_send_failure(err, "ephemeral child closed stdin");
+            ephemeral.terminate_now().await;
+            return jsonrpc_error_reply(&self.inner.budget, status, id, -32000, &msg);
+        }
+
+        let call_timeout = Duration::from_secs(self.inner.settings.session_idle_secs);
+        let (resp_bytes, resp_lease) = match tokio::time::timeout(call_timeout, resp_rx).await {
+            Ok(Ok(RespDelivery::Ok { json_bytes, lease })) => (json_bytes, lease),
+            Ok(Ok(RespDelivery::HardError {
+                status,
+                message: _message,
+                json_bytes,
+                lease,
+            })) => {
+                guard.disarm();
+                let reply = jsonrpc_error_bytes_reply(status, json_bytes, lease);
+                ephemeral.terminate_now().await;
+                return reply;
+            }
+            Ok(Err(_)) => {
+                guard.disarm();
+                let (status, msg) =
+                    session.map_dead_session_error("ephemeral child exited before responding");
+                ephemeral.terminate_now().await;
+                return jsonrpc_error_reply(&self.inner.budget, status, id, -32000, &msg);
+            }
+            Err(_) => {
+                guard.cancel("request timed out");
+                ephemeral.terminate_now().await;
+                return jsonrpc_error_reply(
+                    &self.inner.budget,
+                    StatusCode::GATEWAY_TIMEOUT,
+                    id,
+                    -32000,
+                    "ephemeral request timed out",
+                );
+            }
+        };
+
+        guard.mark_completed();
+        ephemeral.terminate_now().await;
+
+        if let Ok(mut parsed_resp) = serde_json::from_slice::<Value>(&resp_bytes) {
+            if parsed_resp.get("result").is_some_and(Value::is_object) {
+                normalize_discover_response(&mut parsed_resp, &negotiated_proto, &init_val);
+                drop(resp_bytes);
+                drop(resp_lease);
+                let Ok((encoded, lease)) =
+                    encode_json_leased(&parsed_resp, b"", &self.inner.budget)
+                else {
+                    return request_overloaded_reply();
+                };
+                return single_rpc_reply(headers, None, encoded, Some(lease));
+            }
+            if parsed_resp
+                .get("error")
+                .and_then(|e| e.get("code"))
+                .and_then(Value::as_i64)
+                == Some(-32601)
+            {
+                let synthesized = synthesize_discover_from_init(id, &negotiated_proto, &init_val);
+                drop(resp_bytes);
+                drop(resp_lease);
+                let Ok((encoded, lease)) =
+                    encode_json_leased(&synthesized, b"", &self.inner.budget)
+                else {
+                    return request_overloaded_reply();
+                };
+                return single_rpc_reply(headers, None, encoded, Some(lease));
+            }
+        }
+
+        single_rpc_reply(headers, None, resp_bytes, resp_lease)
     }
 }
 
@@ -4223,6 +4541,126 @@ fn extract_progress_token(payload: &Value) -> Option<&Value> {
         .and_then(|p| p.get("_meta"))
         .and_then(|m| m.get("progressToken"))
         .filter(|v| !v.is_null())
+}
+
+fn build_synthetic_initialize(protocol_version: &str, payload: &Value) -> Value {
+    let meta = payload
+        .get("params")
+        .and_then(Value::as_object)
+        .and_then(|p| p.get("_meta"))
+        .and_then(Value::as_object);
+
+    let capabilities = meta
+        .and_then(|m| {
+            m.get(CLIENT_CAPS_META_KEY)
+                .or_else(|| m.get("clientCapabilities"))
+        })
+        .filter(|v| v.is_object())
+        .cloned()
+        .unwrap_or_else(|| json!({}));
+
+    let client_info = meta
+        .and_then(|m| m.get(CLIENT_INFO_META_KEY).or_else(|| m.get("clientInfo")))
+        .filter(|v| v.is_object())
+        .cloned()
+        .unwrap_or_else(|| {
+            json!({
+                "name": "oauth2-mcp-gateway",
+                "version": env!("CARGO_PKG_VERSION")
+            })
+        });
+
+    json!({
+        "jsonrpc": "2.0",
+        "id": 0,
+        "method": "initialize",
+        "params": {
+            "protocolVersion": protocol_version,
+            "capabilities": capabilities,
+            "clientInfo": client_info
+        }
+    })
+}
+
+fn ensure_discover_client_caps(payload: &Value) -> Value {
+    let mut cloned = payload.clone();
+    if let Some(meta) = cloned
+        .get_mut("params")
+        .and_then(Value::as_object_mut)
+        .and_then(|p| p.get_mut("_meta"))
+        .and_then(Value::as_object_mut)
+        && !meta.contains_key(CLIENT_CAPS_META_KEY)
+    {
+        let caps = meta
+            .get("clientCapabilities")
+            .filter(|v| v.is_object())
+            .cloned()
+            .unwrap_or_else(|| json!({}));
+        meta.insert(CLIENT_CAPS_META_KEY.to_owned(), caps);
+    }
+    cloned
+}
+
+fn normalize_discover_response(resp: &mut Value, negotiated_proto: &str, init_val: &Value) {
+    let init_res = init_val.get("result").and_then(Value::as_object);
+    let Some(res_obj) = resp.get_mut("result").and_then(Value::as_object_mut) else {
+        return;
+    };
+    res_obj
+        .entry("resultType".to_owned())
+        .or_insert_with(|| json!("complete"));
+    res_obj
+        .entry("supportedVersions".to_owned())
+        .or_insert_with(|| json!([negotiated_proto]));
+    res_obj.entry("capabilities".to_owned()).or_insert_with(|| {
+        init_res
+            .and_then(|r| r.get("capabilities"))
+            .filter(|v| v.is_object())
+            .cloned()
+            .unwrap_or_else(|| json!({}))
+    });
+    res_obj
+        .entry("ttlMs".to_owned())
+        .or_insert_with(|| json!(0));
+    res_obj
+        .entry("cacheScope".to_owned())
+        .or_insert_with(|| json!("private"));
+    if let Some(instr) = init_res
+        .and_then(|r| r.get("instructions"))
+        .filter(|v| v.is_string())
+    {
+        res_obj
+            .entry("instructions".to_owned())
+            .or_insert_with(|| instr.clone());
+    }
+    if let Some(server_info) = init_res
+        .and_then(|r| r.get("serverInfo"))
+        .filter(|v| v.is_object())
+    {
+        let meta_entry = res_obj
+            .entry("_meta".to_owned())
+            .or_insert_with(|| json!({}));
+        if let Some(meta_obj) = meta_entry.as_object_mut() {
+            meta_obj
+                .entry(SERVER_INFO_META_KEY.to_owned())
+                .or_insert_with(|| server_info.clone());
+        }
+    }
+}
+
+fn synthesize_discover_from_init(id: &Value, negotiated_proto: &str, init_val: &Value) -> Value {
+    let mut resp = json!({
+        "jsonrpc": "2.0",
+        "id": id,
+        "result": {
+            "resultType": "complete",
+            "supportedVersions": [negotiated_proto],
+            "ttlMs": 0,
+            "cacheScope": "private"
+        }
+    });
+    normalize_discover_response(&mut resp, negotiated_proto, init_val);
+    resp
 }
 
 fn supports_sessionless_version(ver: &str) -> bool {

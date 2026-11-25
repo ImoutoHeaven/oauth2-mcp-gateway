@@ -1,0 +1,209 @@
+oauth2-mcp-gateway
+Copyright (c) oauth2-mcp-gateway contributors
+Licensed under the Apache License, Version 2.0 (see LICENSE).
+
+Binary releases of oauth2-mcp-gateway statically link third-party Rust crates.
+Crates dual-licensed under Apache-2.0 (such as "MIT OR Apache-2.0",
+"Apache-2.0 OR MIT", and "Apache-2.0 OR ISC OR MIT") are used under the Apache
+License, Version 2.0 in LICENSE. Additional notices and license terms for
+statically linked dependencies follow below.
+
+================================================================================
+1. ring 0.17.14 (https://github.com/briansmith/ring)
+   rustls-webpki 0.103.17 (https://github.com/rustls/webpki)
+   untrusted 0.9.0 (https://github.com/briansmith/untrusted)
+================================================================================
+
+ring 0.17.14 incorporates code licensed under the ISC license, BoringSSL and
+OpenSSL derived code licensed under the Apache License, Version 2.0 (see
+LICENSE) and the ISC license, fiat-crypto code licensed under the Apache
+License, Version 2.0, and once_cell polyfill code licensed under the Apache
+License, Version 2.0 or MIT license:
+
+  Copyright 2015-2025 Brian Smith.
+  Copyright 2014-2015 The BoringSSL Authors.
+  Copyright 1995-2020 The OpenSSL Project Authors. All Rights Reserved.
+  Copyright 2015-2020 the fiat-crypto authors.
+  Copyright (c) 2014-2019, Google Inc.
+  Copyright (c) 2014-2015, Intel Corporation. All Rights Reserved.
+  Copyright (c) 2015-2020, CloudFlare, Inc. / CloudFlare Ltd.
+  Copyright (c) 2022, ARM Inc.
+  Copyright (c) 2002, Oracle and/or its affiliates. All rights reserved.
+
+rustls-webpki 0.103.17 and untrusted 0.9.0 are licensed under the ISC license:
+
+  Copyright 2015 Brian Smith.
+  Copyright 2015-2016 Brian Smith.
+
+ISC License:
+
+Permission to use, copy, modify, and/or distribute this software for any
+purpose with or without fee is hereby granted, provided that the above
+copyright notice and this permission notice appear in all copies.
+
+THE SOFTWARE IS PROVIDED "AS IS" AND THE AUTHORS DISCLAIM ALL WARRANTIES
+WITH REGARD TO THIS SOFTWARE INCLUDING ALL IMPLIED WARRANTIES OF
+MERCHANTABILITY AND FITNESS. IN NO EVENT SHALL THE AUTHORS BE LIABLE FOR
+ANY SPECIAL, DIRECT, INDIRECT, OR CONSEQUENTIAL DAMAGES OR ANY DAMAGES
+WHATSOEVER RESULTING FROM LOSS OF USE, DATA OR PROFITS, WHETHER IN AN
+ACTION OF CONTRACT, NEGLIGENCE OR OTHER TORTIOUS ACTION, ARISING OUT OF
+OR IN CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
+
+================================================================================
+2. subtle 2.6.1 (https://github.com/dalek-cryptography/subtle)
+================================================================================
+
+BSD 3-Clause License:
+
+Copyright (c) 2016-2017 Isis Agora Lovecruft, Henry de Valence. All rights reserved.
+Copyright (c) 2016-2024 Isis Agora Lovecruft. All rights reserved.
+
+Redistribution and use in source and binary forms, with or without
+modification, are permitted provided that the following conditions are
+met:
+
+1. Redistributions of source code must retain the above copyright
+notice, this list of conditions and the following disclaimer.
+
+2. Redistributions in binary form must reproduce the above copyright
+notice, this list of conditions and the following disclaimer in the
+documentation and/or other materials provided with the distribution.
+
+3. Neither the name of the copyright holder nor the names of its
+contributors may be used to endorse or promote products derived from
+this software without specific prior written permission.
+
+THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS
+IS" AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED
+TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A
+PARTICULAR PURPOSE ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT
+HOLDER OR CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL,
+SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED
+TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE, DATA, OR
+PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY THEORY OF
+LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING
+NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS
+SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+
+================================================================================
+3. ICU4X and Unicode components (https://github.com/unicode-org/icu4x)
+   icu_collections 2.4.0, icu_locale_core 2.4.0, icu_normalizer 2.4.0,
+   icu_normalizer_data 2.4.0, icu_properties 2.4.0, icu_properties_data 2.4.0,
+   icu_provider 2.4.0, litemap 0.8.3, potential_utf 0.1.6, tinystr 0.8.5,
+   writeable 0.6.4, yoke 0.8.4, zerofrom 0.1.8, zerotrie 0.2.5, zerovec 0.11.9
+   (and build-time unicode-ident 1.0.27)
+================================================================================
+
+UNICODE LICENSE V3
+
+COPYRIGHT AND PERMISSION NOTICE
+
+Copyright (c) 2020-2024 Unicode, Inc.
+
+NOTICE TO USER: Carefully read the following legal agreement. BY
+DOWNLOADING, INSTALLING, COPYING OR OTHERWISE USING DATA FILES, AND/OR
+SOFTWARE, YOU UNEQUIVOCALLY ACCEPT, AND AGREE TO BE BOUND BY, ALL OF THE
+TERMS AND CONDITIONS OF THIS AGREEMENT. IF YOU DO NOT AGREE, DO NOT
+DOWNLOAD, INSTALL, COPY, DISTRIBUTE OR USE THE DATA FILES OR SOFTWARE.
+
+Permission is hereby granted, free of charge, to any person obtaining a
+copy of data files and any associated documentation (the "Data Files") or
+software and any associated documentation (the "Software") to deal in the
+Data Files or Software without restriction, including without limitation
+the rights to use, copy, modify, merge, publish, distribute, sublicense,
+and/or sell copies of the Data Files or Software, and to permit persons to
+whom the Data Files or Software are furnished to do so, provided that
+either (a) this copyright and permission notice appear with all copies of
+the Data Files or Software, or (b) this copyright and permission notice
+appear in associated Documentation.
+
+THE DATA FILES AND SOFTWARE ARE PROVIDED "AS IS", WITHOUT WARRANTY OF ANY
+KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF
+MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT OF
+THIRD PARTY RIGHTS.
+
+IN NO EVENT SHALL THE COPYRIGHT HOLDER OR HOLDERS INCLUDED IN THIS NOTICE
+BE LIABLE FOR ANY CLAIM, OR ANY SPECIAL INDIRECT OR CONSEQUENTIAL DAMAGES,
+OR ANY DAMAGES WHATSOEVER RESULTING FROM LOSS OF USE, DATA OR PROFITS,
+WHETHER IN AN ACTION OF CONTRACT, NEGLIGENCE OR OTHER TORTIOUS ACTION,
+ARISING OUT OF OR IN CONNECTION WITH THE USE OR PERFORMANCE OF THE DATA
+FILES OR SOFTWARE.
+
+Except as contained in this notice, the name of a copyright holder shall
+not be used in advertising or otherwise to promote the sale, use or other
+dealings in these Data Files or Software without prior written
+authorization of the copyright holder.
+
+SPDX-License-Identifier: Unicode-3.0
+
+Portions of ICU4X may have been adapted from ICU4C and/or ICU4J.
+ICU 1.8.1 to ICU 57.1 (c) 1995-2016 International Business Machines Corporation and others.
+
+================================================================================
+4. atomic-waker 1.1.2 (https://github.com/smol-rs/atomic-waker)
+================================================================================
+
+Used under the Apache License, Version 2.0 (see LICENSE). Includes code from:
+  Copyright (c) 2016 Alex Crichton
+  Copyright (c) 2017 The Tokio Authors
+
+================================================================================
+5. MIT-licensed crates
+================================================================================
+
+The following statically linked crates are distributed under the MIT License:
+
+- bytes 1.12.2 (https://github.com/tokio-rs/bytes)
+  Copyright (c) 2018 Carl Lerche
+- http-body 1.1.0, http-body-util 0.1.5 (https://github.com/hyperium/http-body)
+  Copyright (c) 2019-2026 Sean McArthur & Hyper Contributors
+- hyper 1.12.0 (https://github.com/hyperium/hyper)
+  Copyright (c) 2014-2026 Sean McArthur
+- hyper-util 0.1.21 (https://github.com/hyperium/hyper-util)
+  Copyright (c) 2023-2025 Sean McArthur
+- memchr 2.8.3 (https://github.com/BurntSushi/memchr, Unlicense OR MIT)
+  Copyright (c) 2015 Andrew Gallant
+- mio 1.2.5 (https://github.com/tokio-rs/mio)
+  Copyright (c) 2014 Carl Lerche and other MIO contributors
+- schannel 0.1.30 (https://github.com/steffengy/schannel-rs, Windows builds)
+  Copyright (c) 2015 steffengy
+- slab 0.4.12 (https://github.com/tokio-rs/slab)
+  Copyright (c) 2019 Carl Lerche
+- strsim 0.11.1 (https://github.com/rapidfuzz/strsim-rs)
+  Copyright (c) 2015 Danny Guo
+  Copyright (c) 2016 Titus Wormer <tituswormer@gmail.com>
+  Copyright (c) 2018 Akash Kurdekar
+- tokio 1.54.1, tokio-util 0.7.20 (https://github.com/tokio-rs/tokio)
+  Copyright (c) Tokio Contributors
+- tower-service 0.3.3 (https://github.com/tower-rs/tower)
+  Copyright (c) 2019 Tower Contributors
+- tracing 0.1.44, tracing-core 0.1.36 (https://github.com/tokio-rs/tracing)
+  Copyright (c) 2019 Tokio Contributors
+- try-lock 0.2.5 (https://github.com/seanmonstar/try-lock)
+  Copyright (c) 2018-2023 Sean McArthur
+  Copyright (c) 2016 Alex Crichton
+- want 0.3.2 (https://github.com/seanmonstar/want)
+  Copyright (c) 2018-2019 Sean McArthur
+- zmij 1.0.23 (https://github.com/dtolnay/zmij, port of https://github.com/vitaut/zmij)
+  Copyright (c) David Tolnay
+  Copyright (c) Victor Zverovich
+
+MIT License:
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.

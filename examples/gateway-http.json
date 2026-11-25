@@ -2,6 +2,7 @@
   "listen": "127.0.0.1:8080",
   "public_url": "https://mcp.example.com",
   "state_path": "/var/lib/oauth2-mcp-gateway/state.json",
+  "trusted_proxies": ["127.0.0.1", "::1"],
   "oauth": {
     "owner_password_hash": "${OWNER_PASSWORD_HASH}",
     "scopes": ["mcp"],
@@ -16,6 +17,10 @@
       "${UPSTREAM_BEARER_TOKEN_1}",
       "${UPSTREAM_BEARER_TOKEN_2}"
     ],
+    "auth_context": {
+      "check_listen": "127.0.0.1:8083",
+      "check_token": "replace-with-a-shared-check-token"
+    },
     "passthrough_prefixes": ["/t/"],
     "request_timeout_secs": 300
   }

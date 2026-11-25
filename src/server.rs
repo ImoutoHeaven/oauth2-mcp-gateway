@@ -1,4 +1,5 @@
 use crate::config::{GatewayConfig, UpstreamSettings, is_loopback_host};
+use crate::crypto::{sha256_bytes, zeroize_bytes};
 use crate::oauth::OAuthEngine;
 use crate::types::{HttpReply, ReplyBody, empty_body, json_reply, method_not_allowed};
 use crate::upstream_http::{HttpUpstream, close_empty_reply, is_safe_request_path};
@@ -14,7 +15,7 @@ use hyper_util::rt::{TokioIo, TokioTimer};
 use serde_json::json;
 use std::convert::Infallible;
 use std::io;
-use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
+use std::net::{Ipv4Addr, Ipv6Addr};
 use std::pin::Pin;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
@@ -27,10 +28,20 @@ use tokio_util::sync::CancellationToken;
 use url::{Host, Url};
 
 const MAX_CONCURRENT_CONNECTIONS: usize = 256;
+const MAX_CHECK_CONNECTIONS: usize = 64;
 const HEADER_READ_TIMEOUT: Duration = Duration::from_secs(10);
+const CHECK_HEADER_READ_TIMEOUT: Duration = Duration::from_secs(5);
 const IDLE_KEEPALIVE_TIMEOUT: Duration = Duration::from_secs(60);
 const SHUTDOWN_DRAIN_TIMEOUT: Duration = Duration::from_secs(5);
 const ERROR_LOG_INTERVAL: Duration = Duration::from_secs(5);
+
+struct CheckTokenDigest([u8; 32]);
+
+impl Drop for CheckTokenDigest {
+    fn drop(&mut self) {
+        zeroize_bytes(&mut self.0);
+    }
+}
 
 struct RateLimitedLog {
     last_logged: Option<Instant>,
@@ -97,7 +108,7 @@ struct HostPolicy {
 }
 
 impl HostPolicy {
-    fn from_config(config: &GatewayConfig, local_addr: Option<SocketAddr>) -> Result<Self, String> {
+    fn from_config(config: &GatewayConfig) -> Result<Self, String> {
         let parsed =
             Url::parse(&config.public_url).map_err(|e| format!("invalid public_url: {e}"))?;
         let public_host = parsed
@@ -106,8 +117,7 @@ impl HostPolicy {
             .to_ascii_lowercase();
         let public_default_port = if config.public_is_https { 443 } else { 80 };
         let public_port = parsed.port().unwrap_or(public_default_port);
-        let allow_loopback =
-            config.listen.ip().is_loopback() || local_addr.is_some_and(|a| a.ip().is_loopback());
+        let allow_loopback = is_loopback_host(&public_host);
         Ok(Self {
             public_host,
             public_port,
@@ -309,14 +319,35 @@ pub async fn serve_with_listener(
     config: Arc<GatewayConfig>,
     shutdown: CancellationToken,
 ) -> Result<(), String> {
-    let host_policy = Arc::new(HostPolicy::from_config(
-        &config,
-        listener.local_addr().ok(),
-    )?);
+    let check_listener = match &config.upstream {
+        UpstreamSettings::Http(settings) => match &settings.auth_context {
+            Some(ac) => Some(
+                TcpListener::bind(ac.check_listen)
+                    .await
+                    .map_err(|e| format!("cannot bind {}: {e}", ac.check_listen))?,
+            ),
+            None => None,
+        },
+        UpstreamSettings::Stdio(_) => None,
+    };
+    serve_with_listeners(listener, check_listener, config, shutdown).await
+}
+
+pub async fn serve_with_listeners(
+    listener: TcpListener,
+    check_listener: Option<TcpListener>,
+    config: Arc<GatewayConfig>,
+    shutdown: CancellationToken,
+) -> Result<(), String> {
+    let host_policy = Arc::new(HostPolicy::from_config(&config)?);
     let upstream = match &config.upstream {
-        UpstreamSettings::Http(settings) => {
-            UpstreamRuntime::Http(Arc::new(HttpUpstream::new(settings.clone())?))
-        }
+        UpstreamSettings::Http(settings) => UpstreamRuntime::Http(Arc::new(
+            HttpUpstream::new(settings.clone())?.with_oauth_context(
+                &config.public_url,
+                &config.resource_path,
+                config.oauth.scopes.clone(),
+            ),
+        )),
         UpstreamSettings::Stdio(settings) => {
             UpstreamRuntime::Stdio(Arc::new(StdioUpstream::new(settings.clone())?))
         }
@@ -339,6 +370,24 @@ pub async fn serve_with_listener(
             tasks.push(jh);
         }),
     )?;
+
+    let check_server_task = match (check_listener, &config.upstream) {
+        (Some(chk_listener), UpstreamSettings::Http(settings)) => {
+            let ac = settings.auth_context.as_ref().ok_or_else(|| {
+                "check_listener provided without upstream.auth_context".to_owned()
+            })?;
+            let digest = Arc::new(CheckTokenDigest(sha256_bytes(&ac.check_token)));
+            let chk_oauth = Arc::clone(&oauth);
+            let chk_shutdown = shutdown.clone();
+            Some(tokio::spawn(async move {
+                run_auth_check_loop(chk_listener, chk_oauth, digest, chk_shutdown).await;
+            }))
+        }
+        (None, UpstreamSettings::Http(settings)) if settings.auth_context.is_some() => {
+            return Err("missing loopback listener for upstream.auth_context".to_owned());
+        }
+        _ => None,
+    };
 
     let public_url: Arc<str> = Arc::from(config.public_url.as_str());
     let semaphore = Arc::new(Semaphore::new(MAX_CONCURRENT_CONNECTIONS));
@@ -450,8 +499,112 @@ pub async fn serve_with_listener(
         let _ = jh.await;
     }
 
+    if let Some(chk_task) = check_server_task {
+        let _ = chk_task.await;
+    }
+
     upstream.shutdown().await;
     Ok(())
+}
+
+async fn run_auth_check_loop(
+    listener: TcpListener,
+    oauth: Arc<OAuthEngine>,
+    expected_digest: Arc<CheckTokenDigest>,
+    shutdown: CancellationToken,
+) {
+    let semaphore = Arc::new(Semaphore::new(MAX_CHECK_CONNECTIONS));
+    let mut connections = JoinSet::new();
+    let mut accept_err_log = RateLimitedLog::new(ERROR_LOG_INTERVAL);
+
+    loop {
+        while connections.try_join_next().is_some() {}
+
+        tokio::select! {
+            _ = shutdown.cancelled() => break,
+            accept_res = listener.accept() => {
+                let (stream, peer_addr) = match accept_res {
+                    Ok(pair) => pair,
+                    Err(err) => {
+                        accept_err_log.log(&format!("auth check accept failed: {err}"));
+                        tokio::time::sleep(Duration::from_millis(10)).await;
+                        continue;
+                    }
+                };
+                let peer_ip = peer_addr.ip().to_canonical();
+                if !peer_ip.is_loopback() {
+                    drop(stream);
+                    continue;
+                }
+                let Ok(permit) = Arc::clone(&semaphore).try_acquire_owned() else {
+                    drop(stream);
+                    continue;
+                };
+
+                let _ = stream.set_nodelay(true);
+                let io = TokioIo::new(stream);
+                let oauth_ref = Arc::clone(&oauth);
+                let digest_ref = Arc::clone(&expected_digest);
+                let conn_shutdown = shutdown.clone();
+                let activity = Arc::new(ConnActivity::new());
+                let svc_activity = Arc::clone(&activity);
+
+                connections.spawn(async move {
+                    let _permit = permit;
+                    let svc = service_fn(move |req: Request<Incoming>| {
+                        svc_activity.in_flight.fetch_add(1, Ordering::AcqRel);
+                        let req_guard = ActiveReqGuard {
+                            activity: Arc::clone(&svc_activity),
+                        };
+                        let oauth_inner = Arc::clone(&oauth_ref);
+                        let digest_inner = Arc::clone(&digest_ref);
+                        async move {
+                            let resp = oauth_inner
+                                .handle_auth_check(req, peer_ip, &digest_inner.0)
+                                .await;
+                            let wrapped = resp.map(|body| {
+                                ActiveReplyBody {
+                                    inner: body,
+                                    guard: Some(req_guard),
+                                }
+                                .boxed()
+                            });
+                            Ok::<HttpReply, Infallible>(wrapped)
+                        }
+                    });
+
+                    let mut builder = http1::Builder::new();
+                    builder
+                        .timer(TokioTimer::new())
+                        .header_read_timeout(CHECK_HEADER_READ_TIMEOUT);
+                    let conn = builder.serve_connection(io, svc);
+                    let idle_expired = wait_for_conn_idle(&activity, IDLE_KEEPALIVE_TIMEOUT);
+                    tokio::pin!(conn);
+                    tokio::pin!(idle_expired);
+
+                    tokio::select! {
+                        _ = &mut conn => {}
+                        _ = &mut idle_expired => {
+                            conn.as_mut().graceful_shutdown();
+                            let _ = tokio::time::timeout(CHECK_HEADER_READ_TIMEOUT, &mut conn).await;
+                        }
+                        _ = conn_shutdown.cancelled() => {
+                            conn.as_mut().graceful_shutdown();
+                            let _ = conn.await;
+                        }
+                    }
+                });
+            }
+        }
+    }
+
+    drop(listener);
+    let _ = tokio::time::timeout(SHUTDOWN_DRAIN_TIMEOUT, async {
+        while connections.join_next().await.is_some() {}
+    })
+    .await;
+    connections.abort_all();
+    while connections.join_next().await.is_some() {}
 }
 
 async fn route_request(

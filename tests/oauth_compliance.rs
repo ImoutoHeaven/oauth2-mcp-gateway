@@ -770,6 +770,7 @@ async fn confidential_clients_enforce_pkce_s256_basic_urldecode_and_revocation()
         ("response_type", "code"),
         ("client_id", &client_id),
         ("redirect_uri", cb_uri),
+        ("state", "pkce-missing"),
     ]);
     let (no_pkce_st, no_pkce_hdr, _) = send_req(
         &engine,
@@ -779,8 +780,21 @@ async fn confidential_clients_enforce_pkce_s256_basic_urldecode_and_revocation()
         Bytes::new(),
     )
     .await;
-    assert_eq!(no_pkce_st, StatusCode::BAD_REQUEST);
-    assert!(!no_pkce_hdr.contains_key(header::LOCATION));
+    assert_eq!(no_pkce_st, StatusCode::SEE_OTHER);
+    let no_pkce_loc = Url::parse(no_pkce_hdr[header::LOCATION].to_str().unwrap()).unwrap();
+    let no_pkce_params: BTreeMap<String, String> = no_pkce_loc.query_pairs().into_owned().collect();
+    assert_eq!(
+        no_pkce_params.get("error").map(String::as_str),
+        Some("invalid_request")
+    );
+    assert_eq!(
+        no_pkce_params.get("state").map(String::as_str),
+        Some("pkce-missing")
+    );
+    assert_eq!(
+        no_pkce_params.get("iss").map(String::as_str),
+        Some("https://mcp.example.com")
+    );
 
     let (verifier, challenge) = pkce_pair("conf-basic");
     let plain_pkce_q = form_encode(&[
@@ -789,8 +803,9 @@ async fn confidential_clients_enforce_pkce_s256_basic_urldecode_and_revocation()
         ("redirect_uri", cb_uri),
         ("code_challenge", &verifier),
         ("code_challenge_method", "plain"),
+        ("state", "pkce-plain"),
     ]);
-    let (plain_st, _, _) = send_req(
+    let (plain_st, plain_hdr, _) = send_req(
         &engine,
         Method::GET,
         &format!("/oauth/authorize?{plain_pkce_q}"),
@@ -798,7 +813,21 @@ async fn confidential_clients_enforce_pkce_s256_basic_urldecode_and_revocation()
         Bytes::new(),
     )
     .await;
-    assert_eq!(plain_st, StatusCode::BAD_REQUEST);
+    assert_eq!(plain_st, StatusCode::SEE_OTHER);
+    let plain_loc = Url::parse(plain_hdr[header::LOCATION].to_str().unwrap()).unwrap();
+    let plain_params: BTreeMap<String, String> = plain_loc.query_pairs().into_owned().collect();
+    assert_eq!(
+        plain_params.get("error").map(String::as_str),
+        Some("invalid_request")
+    );
+    assert_eq!(
+        plain_params.get("state").map(String::as_str),
+        Some("pkce-plain")
+    );
+    assert_eq!(
+        plain_params.get("iss").map(String::as_str),
+        Some("https://mcp.example.com")
+    );
 
     let bad_uri_q = form_encode(&[
         ("response_type", "code"),
@@ -992,7 +1021,8 @@ async fn xss_escaping_security_headers_and_csrf_cookie_enforcement() {
     )
     .await;
     assert_eq!(status, StatusCode::OK);
-    let expected_csp = "default-src 'none'; style-src 'unsafe-inline'; form-action 'self'";
+    let expected_csp =
+        "default-src 'none'; style-src 'unsafe-inline'; form-action 'self'; frame-ancestors 'none'";
     assert_eq!(
         headers.get(header::CONTENT_SECURITY_POLICY).unwrap(),
         expected_csp
@@ -1013,7 +1043,7 @@ async fn xss_escaping_security_headers_and_csrf_cookie_enforcement() {
         unregistered_headers
             .get(header::CONTENT_SECURITY_POLICY)
             .unwrap(),
-        "default-src 'none'; style-src 'unsafe-inline'; form-action 'self'"
+        expected_csp
     );
     assert_eq!(headers.get(header::X_FRAME_OPTIONS).unwrap(), "DENY");
     assert_eq!(
@@ -1749,28 +1779,8 @@ async fn password_rate_limiting_and_least_loaded_pool_slot_selection() {
         (cookie, ar_id, csrf)
     };
 
-    let (mut cookie, mut ar_id, mut csrf) = open_ar().await;
+    let (cookie, ar_id, csrf) = open_ar().await;
     for attempt in 0..10 {
-        if attempt > 0 && attempt % 3 == 0 {
-            // Confirm burned ar_id rejects further tries with 400 before opening a new one.
-            let (burned_st, _, _) = send_req(
-                &engine,
-                Method::POST,
-                "/oauth/authorize",
-                &[
-                    ("content-type", "application/x-www-form-urlencoded"),
-                    ("cookie", &cookie),
-                ],
-                form_encode(&[
-                    ("ar_id", &ar_id),
-                    ("csrf_token", &csrf),
-                    ("password", OWNER_SECRET),
-                ]),
-            )
-            .await;
-            assert_eq!(burned_st, StatusCode::BAD_REQUEST);
-            (cookie, ar_id, csrf) = open_ar().await;
-        }
         let (st, _, _) = send_req(
             &engine,
             Method::POST,
@@ -2607,7 +2617,8 @@ async fn per_ip_lockout_isolation_ar_burn_pending_cap_and_mid_login_dcr_protecti
     let owner_ar = extract_hidden_input(owner_html, "ar_id");
     let owner_csrf = extract_hidden_input(owner_html, "csrf_token");
 
-    // Fill remaining 15 client slots with active grants; DCR must NOT evict mid_login_client.
+    // Fill all 16 client slots with active grants/codes; DCR must NOT evict active clients.
+    let _ = mint_public_grant(&engine, &mid_login_client, cb, "active-0").await;
     for i in 1..16 {
         let uri = format!("http://127.0.0.1:28000/cb/{i}");
         let cid = register_public_client(&engine, &uri, None).await;
@@ -2623,8 +2634,8 @@ async fn per_ip_lockout_isolation_ar_burn_pending_cap_and_mid_login_dcr_protecti
     .await;
     assert_eq!(dcr_full_st, StatusCode::TOO_MANY_REQUESTS);
 
-    // Per-IP pending_auths cap (32) blocks flood_ip without blocking other IPs.
-    for i in 0..32 {
+    // Stateless GET /oauth/authorize serves >32 requests from flood_ip without 429 or lockup.
+    for i in 0..40 {
         let (_, ch) = pkce_pair(&format!("flood-{i}"));
         let fq = form_encode(&[
             ("response_type", "code"),
@@ -2644,26 +2655,8 @@ async fn per_ip_lockout_isolation_ar_burn_pending_cap_and_mid_login_dcr_protecti
         .await;
         assert_eq!(fst, StatusCode::OK);
     }
-    let (_, ch33) = pkce_pair("flood-33");
-    let fq33 = form_encode(&[
-        ("response_type", "code"),
-        ("client_id", &mid_login_client),
-        ("redirect_uri", cb),
-        ("code_challenge", &ch33),
-        ("code_challenge_method", "S256"),
-    ]);
-    let (fst33, _, _) = send_req_from_ip(
-        &engine,
-        Some(flood_ip),
-        Method::GET,
-        &format!("/oauth/authorize?{fq33}"),
-        &[],
-        Bytes::new(),
-    )
-    .await;
-    assert_eq!(fst33, StatusCode::TOO_MANY_REQUESTS);
 
-    // Attacker IP burns ar_id after 3 failures and hits per-IP 429 at 10 failures.
+    // Attacker IP hits per-IP 429 at 10 failures without affecting owner_ip.
     let open_attacker_ar = || async {
         let (_, ch) = pkce_pair("atk");
         let aq = form_encode(&[
@@ -2691,28 +2684,8 @@ async fn per_ip_lockout_isolation_ar_burn_pending_cap_and_mid_login_dcr_protecti
         )
     };
 
-    let (mut atk_cookie, mut atk_ar, mut atk_csrf) = open_attacker_ar().await;
-    for i in 0..10 {
-        if i > 0 && i % 3 == 0 {
-            let (burned, _, _) = send_req_from_ip(
-                &engine,
-                Some(attacker_ip),
-                Method::POST,
-                "/oauth/authorize",
-                &[
-                    ("content-type", "application/x-www-form-urlencoded"),
-                    ("cookie", &atk_cookie),
-                ],
-                form_encode(&[
-                    ("ar_id", &atk_ar),
-                    ("csrf_token", &atk_csrf),
-                    ("password", OWNER_SECRET),
-                ]),
-            )
-            .await;
-            assert_eq!(burned, StatusCode::BAD_REQUEST);
-            (atk_cookie, atk_ar, atk_csrf) = open_attacker_ar().await;
-        }
+    let (atk_cookie, atk_ar, atk_csrf) = open_attacker_ar().await;
+    for _ in 0..10 {
         let (st, _, _) = send_req_from_ip(
             &engine,
             Some(attacker_ip),
@@ -3318,4 +3291,561 @@ async fn converge_policy_preserves_same_client_continuity_past_grace_and_restart
     .await;
     assert_eq!(s_after_rev, StatusCode::BAD_REQUEST);
     assert_eq!(parse_json(&b_after_rev)["error"], "invalid_grant");
+}
+
+#[tokio::test]
+async fn trusted_proxies_xff_extraction_and_untrusted_loopback_token_bucket() {
+    let tmp = TempDir::new().unwrap();
+    let pw_hash = PasswordVerifier::from_plaintext_with_iterations(OWNER_SECRET, 10_000)
+        .unwrap()
+        .encode();
+    let proxy_cfg = Arc::new(
+        GatewayConfig::from_json_str(
+            &json!({
+                "listen": "127.0.0.1:0",
+                "public_url": "https://mcp.example.com",
+                "state_path": "proxy_state.json",
+                "trusted_proxies": ["127.0.0.1", "10.0.0.1"],
+                "oauth": { "owner_password_hash": pw_hash },
+                "upstream": {
+                    "transport": "http",
+                    "url": "http://127.0.0.1:9090/mcp",
+                    "bearer_tokens": ["up-tok"]
+                }
+            })
+            .to_string(),
+            tmp.path(),
+        )
+        .unwrap(),
+    );
+    let proxy_engine = OAuthEngine::open(proxy_cfg).unwrap();
+    let cb = "http://127.0.0.1:29100/cb";
+    let cid = register_public_client(&proxy_engine, cb, Some("Proxy Test")).await;
+
+    let open_form = |eng: Arc<OAuthEngine>, client_id: String| async move {
+        let (_, ch) = pkce_pair("proxy-pkce");
+        let q = form_encode(&[
+            ("response_type", "code"),
+            ("client_id", &client_id),
+            ("redirect_uri", cb),
+            ("code_challenge", &ch),
+            ("code_challenge_method", "S256"),
+        ]);
+        let (st, hdr, b) = send_req(
+            &eng,
+            Method::GET,
+            &format!("/oauth/authorize?{q}"),
+            &[],
+            Bytes::new(),
+        )
+        .await;
+        assert_eq!(st, StatusCode::OK);
+        let html = std::str::from_utf8(&b).unwrap();
+        (
+            extract_cookie_pair(&hdr),
+            extract_hidden_input(html, "ar_id"),
+            extract_hidden_input(html, "csrf_token"),
+        )
+    };
+
+    let proxy_peer: IpAddr = "127.0.0.1".parse().unwrap();
+    let (cookie, ar_id, csrf) = open_form(Arc::clone(&proxy_engine), cid.clone()).await;
+
+    // Rightmost non-trusted IP in XFF (203.0.113.77) is isolated from spoofed leftmost IP (198.51.100.250).
+    for _ in 0..10 {
+        let (st, _, _) = send_req_from_ip(
+            &proxy_engine,
+            Some(proxy_peer),
+            Method::POST,
+            "/oauth/authorize",
+            &[
+                ("content-type", "application/x-www-form-urlencoded"),
+                ("cookie", &cookie),
+                ("x-forwarded-for", "198.51.100.250, 203.0.113.77, 10.0.0.1"),
+            ],
+            form_encode(&[
+                ("ar_id", &ar_id),
+                ("csrf_token", &csrf),
+                ("password", "wrong-guess"),
+            ]),
+        )
+        .await;
+        assert_eq!(st, StatusCode::UNAUTHORIZED);
+    }
+    let (locked_st, _, _) = send_req_from_ip(
+        &proxy_engine,
+        Some(proxy_peer),
+        Method::POST,
+        "/oauth/authorize",
+        &[
+            ("content-type", "application/x-www-form-urlencoded"),
+            ("cookie", &cookie),
+            ("x-forwarded-for", "198.51.100.9, 203.0.113.77, 10.0.0.1"),
+        ],
+        form_encode(&[
+            ("ar_id", &ar_id),
+            ("csrf_token", &csrf),
+            ("password", OWNER_SECRET),
+        ]),
+    )
+    .await;
+    assert_eq!(locked_st, StatusCode::TOO_MANY_REQUESTS);
+
+    // Legitimate user 198.51.100.250 behind the same trusted proxy succeeds cleanly.
+    let (ok_st, _, _) = send_req_from_ip(
+        &proxy_engine,
+        Some(proxy_peer),
+        Method::POST,
+        "/oauth/authorize",
+        &[
+            ("content-type", "application/x-www-form-urlencoded"),
+            ("cookie", &cookie),
+            ("x-forwarded-for", "198.51.100.250, 10.0.0.1"),
+        ],
+        form_encode(&[
+            ("ar_id", &ar_id),
+            ("csrf_token", &csrf),
+            ("password", OWNER_SECRET),
+        ]),
+    )
+    .await;
+    assert_eq!(ok_st, StatusCode::SEE_OTHER);
+
+    // Direct untrusted peer ignores forged X-Forwarded-For referencing locked-out 203.0.113.77.
+    let (cookie2, ar_id2, csrf2) = open_form(Arc::clone(&proxy_engine), cid.clone()).await;
+    let untrusted_peer: IpAddr = "198.51.100.55".parse().unwrap();
+    let (direct_st, _, _) = send_req_from_ip(
+        &proxy_engine,
+        Some(untrusted_peer),
+        Method::POST,
+        "/oauth/authorize",
+        &[
+            ("content-type", "application/x-www-form-urlencoded"),
+            ("cookie", &cookie2),
+            ("x-forwarded-for", "203.0.113.77"),
+        ],
+        form_encode(&[
+            ("ar_id", &ar_id2),
+            ("csrf_token", &csrf2),
+            ("password", OWNER_SECRET),
+        ]),
+    )
+    .await;
+    assert_eq!(direct_st, StatusCode::SEE_OTHER);
+
+    // Untrusted loopback (trusted_proxies empty) uses short-window token bucket rather than 15m lockout.
+    let loop_cfg = build_config(tmp.path(), &TestOpts::default());
+    let loop_engine = OAuthEngine::open(loop_cfg).unwrap();
+    let loop_cid = register_public_client(&loop_engine, cb, Some("Loopback Bucket")).await;
+    let (l_cookie, l_ar, l_csrf) = open_form(Arc::clone(&loop_engine), loop_cid).await;
+
+    let mut saw_throttled = false;
+    for _ in 0..14 {
+        let (st, _, _) = send_req_from_ip(
+            &loop_engine,
+            Some(proxy_peer),
+            Method::POST,
+            "/oauth/authorize",
+            &[
+                ("content-type", "application/x-www-form-urlencoded"),
+                ("cookie", &l_cookie),
+            ],
+            form_encode(&[
+                ("ar_id", &l_ar),
+                ("csrf_token", &l_csrf),
+                ("password", "wrong-loop"),
+            ]),
+        )
+        .await;
+        if st == StatusCode::TOO_MANY_REQUESTS {
+            saw_throttled = true;
+            break;
+        }
+        assert_eq!(st, StatusCode::UNAUTHORIZED);
+    }
+    assert!(
+        saw_throttled,
+        "loopback burst must trigger short-window 429"
+    );
+
+    tokio::time::sleep(Duration::from_millis(2200)).await;
+    let (bucket_refilled_st, _, _) = send_req_from_ip(
+        &loop_engine,
+        Some(proxy_peer),
+        Method::POST,
+        "/oauth/authorize",
+        &[
+            ("content-type", "application/x-www-form-urlencoded"),
+            ("cookie", &l_cookie),
+        ],
+        form_encode(&[
+            ("ar_id", &l_ar),
+            ("csrf_token", &l_csrf),
+            ("password", OWNER_SECRET),
+        ]),
+    )
+    .await;
+    assert_eq!(bucket_refilled_st, StatusCode::SEE_OTHER);
+
+    // check_authorization computes union of unexpired access_tokens when grant has no refresh_token.
+    let (reg_no_rt_st, _, reg_no_rt_body) = send_req(
+        &loop_engine,
+        Method::POST,
+        "/oauth/register",
+        &[("content-type", "application/json")],
+        json!({
+            "redirect_uris": [cb],
+            "grant_types": ["authorization_code"],
+            "scope": "mcp"
+        })
+        .to_string(),
+    )
+    .await;
+    assert_eq!(reg_no_rt_st, StatusCode::CREATED);
+    let no_rt_cid = parse_json(&reg_no_rt_body)["client_id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let (nr_ver, nr_ch) = pkce_pair("no-rt-grant");
+    let nr_code = authorize_and_get_code(&loop_engine, &no_rt_cid, cb, &nr_ch, "st-nr").await;
+    let (nr_tok_st, _, nr_tok_body) = send_req(
+        &loop_engine,
+        Method::POST,
+        "/oauth/token",
+        &[("content-type", "application/x-www-form-urlencoded")],
+        form_encode(&[
+            ("grant_type", "authorization_code"),
+            ("client_id", &no_rt_cid),
+            ("code", &nr_code),
+            ("redirect_uri", cb),
+            ("code_verifier", &nr_ver),
+        ]),
+    )
+    .await;
+    assert_eq!(nr_tok_st, StatusCode::OK);
+    let nr_tok_json = parse_json(&nr_tok_body);
+    assert!(nr_tok_json.get("refresh_token").is_none());
+    let nr_at = nr_tok_json["access_token"].as_str().unwrap();
+    let mut nr_hdrs = HeaderMap::new();
+    nr_hdrs.insert(
+        header::AUTHORIZATION,
+        HeaderValue::from_str(&format!("Bearer {nr_at}")).unwrap(),
+    );
+    let verified = loop_engine.verify_bearer(&nr_hdrs).unwrap();
+    let nr_aref =
+        oauth2_mcp_gateway::crypto::compute_auth_ref(&verified.resource, &verified.grant_id);
+    let chk = loop_engine.check_authorization(&nr_aref);
+    assert_eq!(chk["active"], true);
+    assert_eq!(chk["scopes"], json!(["mcp"]));
+    assert_eq!(chk["principal"], nr_aref);
+}
+
+#[tokio::test]
+async fn cidr_trusted_proxies_and_x_real_ip_fallback() {
+    let tmp = TempDir::new().unwrap();
+    let pw_hash = PasswordVerifier::from_plaintext_with_iterations(OWNER_SECRET, 10_000)
+        .unwrap()
+        .encode();
+    let cfg = Arc::new(
+        GatewayConfig::from_json_str(
+            &json!({
+                "listen": "127.0.0.1:0",
+                "public_url": "https://mcp.example.com",
+                "state_path": "cidr_state.json",
+                "trusted_proxies": ["10.0.0.0/8", "fd00::/8"],
+                "oauth": { "owner_password_hash": pw_hash },
+                "upstream": {
+                    "transport": "http",
+                    "url": "http://127.0.0.1:9090/mcp",
+                    "bearer_tokens": ["up-tok"]
+                }
+            })
+            .to_string(),
+            tmp.path(),
+        )
+        .unwrap(),
+    );
+    let engine = OAuthEngine::open(cfg).unwrap();
+    let cb = "http://127.0.0.1:29200/cb";
+    let cid = register_public_client(&engine, cb, Some("CIDR Proxy Test")).await;
+
+    let open_form = || {
+        let eng = Arc::clone(&engine);
+        let client_id = cid.clone();
+        async move {
+            let (_, ch) = pkce_pair("cidr-pkce");
+            let q = form_encode(&[
+                ("response_type", "code"),
+                ("client_id", &client_id),
+                ("redirect_uri", cb),
+                ("code_challenge", &ch),
+                ("code_challenge_method", "S256"),
+            ]);
+            let (st, hdr, b) = send_req(
+                &eng,
+                Method::GET,
+                &format!("/oauth/authorize?{q}"),
+                &[],
+                Bytes::new(),
+            )
+            .await;
+            assert_eq!(st, StatusCode::OK);
+            let html = std::str::from_utf8(&b).unwrap();
+            (
+                extract_cookie_pair(&hdr),
+                extract_hidden_input(html, "ar_id"),
+                extract_hidden_input(html, "csrf_token"),
+            )
+        }
+    };
+
+    // 1. IPv4 CIDR 10.0.0.0/8 strips 10.1.2.3 hop from X-Forwarded-For and isolates 198.51.100.20.
+    let v4_proxy: IpAddr = "10.42.99.5".parse().unwrap();
+    let (c1, ar1, csrf1) = open_form().await;
+    for _ in 0..10 {
+        let (st, _, _) = send_req_from_ip(
+            &engine,
+            Some(v4_proxy),
+            Method::POST,
+            "/oauth/authorize",
+            &[
+                ("content-type", "application/x-www-form-urlencoded"),
+                ("cookie", &c1),
+                ("x-forwarded-for", "198.51.100.20, 10.1.2.3"),
+            ],
+            form_encode(&[
+                ("ar_id", &ar1),
+                ("csrf_token", &csrf1),
+                ("password", "wrong"),
+            ]),
+        )
+        .await;
+        assert_eq!(st, StatusCode::UNAUTHORIZED);
+    }
+    let (v4_locked, _, _) = send_req_from_ip(
+        &engine,
+        Some(v4_proxy),
+        Method::POST,
+        "/oauth/authorize",
+        &[
+            ("content-type", "application/x-www-form-urlencoded"),
+            ("cookie", &c1),
+            ("x-forwarded-for", "198.51.100.20, 10.1.2.3"),
+        ],
+        form_encode(&[
+            ("ar_id", &ar1),
+            ("csrf_token", &csrf1),
+            ("password", OWNER_SECRET),
+        ]),
+    )
+    .await;
+    assert_eq!(v4_locked, StatusCode::TOO_MANY_REQUESTS);
+
+    // 2. IPv6 CIDR fd00::/8 falls back to X-Real-IP when X-Forwarded-For is absent.
+    let v6_proxy: IpAddr = "fd12:3456::9".parse().unwrap();
+    let (c2, ar2, csrf2) = open_form().await;
+    for _ in 0..10 {
+        let (st, _, _) = send_req_from_ip(
+            &engine,
+            Some(v6_proxy),
+            Method::POST,
+            "/oauth/authorize",
+            &[
+                ("content-type", "application/x-www-form-urlencoded"),
+                ("cookie", &c2),
+                ("x-real-ip", "2001:db8::44"),
+            ],
+            form_encode(&[
+                ("ar_id", &ar2),
+                ("csrf_token", &csrf2),
+                ("password", "wrong"),
+            ]),
+        )
+        .await;
+        assert_eq!(st, StatusCode::UNAUTHORIZED);
+    }
+    let (v6_locked, _, _) = send_req_from_ip(
+        &engine,
+        Some(v6_proxy),
+        Method::POST,
+        "/oauth/authorize",
+        &[
+            ("content-type", "application/x-www-form-urlencoded"),
+            ("cookie", &c2),
+            ("x-real-ip", "2001:db8::44"),
+        ],
+        form_encode(&[
+            ("ar_id", &ar2),
+            ("csrf_token", &csrf2),
+            ("password", OWNER_SECRET),
+        ]),
+    )
+    .await;
+    assert_eq!(v6_locked, StatusCode::TOO_MANY_REQUESTS);
+
+    let (v6_other_ok, _, _) = send_req_from_ip(
+        &engine,
+        Some(v6_proxy),
+        Method::POST,
+        "/oauth/authorize",
+        &[
+            ("content-type", "application/x-www-form-urlencoded"),
+            ("cookie", &c2),
+            ("x-real-ip", "2001:db8::55"),
+        ],
+        form_encode(&[
+            ("ar_id", &ar2),
+            ("csrf_token", &csrf2),
+            ("password", OWNER_SECRET),
+        ]),
+    )
+    .await;
+    assert_eq!(v6_other_ok, StatusCode::SEE_OTHER);
+
+    // 3. Untrusted peer outside CIDR ignores forged X-Real-IP.
+    let (c3, ar3, csrf3) = open_form().await;
+    let untrusted: IpAddr = "11.0.0.5".parse().unwrap();
+    let (untrusted_ok, _, _) = send_req_from_ip(
+        &engine,
+        Some(untrusted),
+        Method::POST,
+        "/oauth/authorize",
+        &[
+            ("content-type", "application/x-www-form-urlencoded"),
+            ("cookie", &c3),
+            ("x-real-ip", "2001:db8::44"),
+        ],
+        form_encode(&[
+            ("ar_id", &ar3),
+            ("csrf_token", &csrf3),
+            ("password", OWNER_SECRET),
+        ]),
+    )
+    .await;
+    assert_eq!(untrusted_ok, StatusCode::SEE_OTHER);
+}
+
+#[tokio::test]
+async fn rfc8252_literal_loopback_dynamic_port_matching_and_token_port_binding() {
+    let tmp = TempDir::new().unwrap();
+    let cfg = build_config(tmp.path(), &TestOpts::default());
+    let engine = OAuthEngine::open(cfg).unwrap();
+
+    let (reg_st, _, reg_body) = send_req(
+        &engine,
+        Method::POST,
+        "/oauth/register",
+        &[("content-type", "application/json")],
+        json!({
+            "client_name": "Native CLI",
+            "redirect_uris": [
+                "http://127.0.0.1:41000/callback",
+                "http://[::1]:41000/callback?mode=cli",
+                "http://localhost:41000/callback",
+                "https://127.0.0.1:41000/secure"
+            ]
+        })
+        .to_string(),
+    )
+    .await;
+    assert_eq!(reg_st, StatusCode::CREATED);
+    let client_id = parse_json(&reg_body)["client_id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+
+    // Reject path/query mismatch, port 0, localhost dynamic port, and https dynamic port.
+    let (_, ch_bad) = pkce_pair("bad-dyn");
+    for rejected_uri in [
+        "http://127.0.0.1:53991/other",
+        "http://127.0.0.1:53991/callback?extra=1",
+        "http://[::1]:61444/callback?mode=wrong",
+        "http://127.0.0.1:0/callback",
+        "http://[::1]:0/callback?mode=cli",
+        "http://localhost:53991/callback",
+        "https://127.0.0.1:53991/secure",
+    ] {
+        let q = form_encode(&[
+            ("response_type", "code"),
+            ("client_id", &client_id),
+            ("redirect_uri", rejected_uri),
+            ("code_challenge", &ch_bad),
+            ("code_challenge_method", "S256"),
+        ]);
+        let (st, hdr, _) = send_req(
+            &engine,
+            Method::GET,
+            &format!("/oauth/authorize?{q}"),
+            &[],
+            Bytes::new(),
+        )
+        .await;
+        assert_eq!(
+            st,
+            StatusCode::BAD_REQUEST,
+            "expected {rejected_uri} to be rejected"
+        );
+        assert!(!hdr.contains_key(header::LOCATION));
+    }
+
+    // Authorize with dynamic ephemeral port 53991, then verify /oauth/token rejects port 41000.
+    let ephem_v4_a = "http://127.0.0.1:53991/callback";
+    let (ver_a, ch_a) = pkce_pair("dyn-v4-a");
+    let code_a = authorize_and_get_code(&engine, &client_id, ephem_v4_a, &ch_a, "st-a").await;
+    let (mismatch_tok_st, _, mismatch_tok_body) = send_req(
+        &engine,
+        Method::POST,
+        "/oauth/token",
+        &[("content-type", "application/x-www-form-urlencoded")],
+        form_encode(&[
+            ("grant_type", "authorization_code"),
+            ("client_id", &client_id),
+            ("code", &code_a),
+            ("redirect_uri", "http://127.0.0.1:41000/callback"),
+            ("code_verifier", &ver_a),
+        ]),
+    )
+    .await;
+    assert_eq!(mismatch_tok_st, StatusCode::BAD_REQUEST);
+    assert_eq!(parse_json(&mismatch_tok_body)["error"], "invalid_grant");
+
+    // Authorize on a second ephemeral IPv4 port 58123 and exchange with exact matching redirect_uri.
+    let ephem_v4_b = "http://127.0.0.1:58123/callback";
+    let (ver_b, ch_b) = pkce_pair("dyn-v4-b");
+    let code_b = authorize_and_get_code(&engine, &client_id, ephem_v4_b, &ch_b, "st-b").await;
+    let (ok_v4_st, _, _) = send_req(
+        &engine,
+        Method::POST,
+        "/oauth/token",
+        &[("content-type", "application/x-www-form-urlencoded")],
+        form_encode(&[
+            ("grant_type", "authorization_code"),
+            ("client_id", &client_id),
+            ("code", &code_b),
+            ("redirect_uri", ephem_v4_b),
+            ("code_verifier", &ver_b),
+        ]),
+    )
+    .await;
+    assert_eq!(ok_v4_st, StatusCode::OK);
+
+    // Authorize on ephemeral IPv6 [::1] port with exact query preservation and exchange.
+    let ephem_v6 = "http://[::1]:61444/callback?mode=cli";
+    let (ver_v6, ch_v6) = pkce_pair("dyn-v6");
+    let code_v6 = authorize_and_get_code(&engine, &client_id, ephem_v6, &ch_v6, "st-v6").await;
+    let (ok_v6_st, _, _) = send_req(
+        &engine,
+        Method::POST,
+        "/oauth/token",
+        &[("content-type", "application/x-www-form-urlencoded")],
+        form_encode(&[
+            ("grant_type", "authorization_code"),
+            ("client_id", &client_id),
+            ("code", &code_v6),
+            ("redirect_uri", ephem_v6),
+            ("code_verifier", &ver_v6),
+        ]),
+    )
+    .await;
+    assert_eq!(ok_v6_st, StatusCode::OK);
 }

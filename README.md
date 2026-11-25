@@ -22,11 +22,11 @@ export OWNER_PASSWORD_HASH='pbkdf2-sha256$600000$...'
 export UPSTREAM_BEARER_TOKEN_1='upstream-token-a'
 export UPSTREAM_BEARER_TOKEN_2='upstream-token-b'
 
-./target/release/oauth2-mcp-gateway check --config gateway.json
-./target/release/oauth2-mcp-gateway serve --config gateway.json
+./target/release/oauth2-mcp-gateway check -c gateway.json
+./target/release/oauth2-mcp-gateway serve -c gateway.json
 ```
 
-`OAUTH2_MCP_GATEWAY_CONFIG` sets the default config path when `--config` is omitted. `SIGINT` (and `SIGTERM` on Unix) drains active HTTP connections and terminates managed `stdio` child process trees before exit.
+Both `check` and `serve` accept `-c <path>` or `--config <path>`. `OAUTH2_MCP_GATEWAY_CONFIG` sets the default config path (`gateway.json`) when the flag is omitted. `SIGINT` (and `SIGTERM` on Unix) drains active HTTP connections and terminates managed `stdio` child process trees before exit.
 
 ## Configuration
 
@@ -40,6 +40,7 @@ String fields equal to `"${VAR}"` expand from the environment at startup, except
 | `public_url` | string | required | External origin URL (`https://`, or loopback `http://`), such as `"https://mcp.example.com"`. |
 | `resource_path` | string | `"/mcp"` | Public MCP endpoint path served by the gateway. |
 | `state_path` | string | required | Path to the persisted OAuth client and grant state file (`state.json`). |
+| `trusted_proxies` | `string[]` | `[]` | Optional reverse-proxy IP addresses or CIDR blocks trusted to supply client IPs via `X-Forwarded-For` or `X-Real-IP`. |
 | `oauth` | object | required | Owner credential and OAuth 2.1 token lifetime settings. |
 | `upstream` | object | required | Upstream MCP transport configuration (`"transport": "http"` or `"stdio"`). |
 
@@ -66,8 +67,11 @@ Set either `owner_password_hash` or `owner_password`.
 | :--- | :--- | :--- | :--- |
 | `url` | string | required | Upstream Streamable HTTP MCP endpoint URL (`http://` or `https://`). |
 | `bearer_tokens` | `string[]` | `[]` | Optional upstream Bearer token pool pinned per OAuth grant. |
+| `auth_context` | object | none | Optional delegated authorization block (`check_listen` and `check_token`) for downstream daemons such as `mcp-hookd`. |
 | `passthrough_prefixes` | `string[]` | `[]` | Unauthenticated URL prefixes (such as `["/t/"]`) streamed directly to the upstream origin. |
 | `request_timeout_secs` | integer | `300` | Upstream response and stream frame timeout in seconds. |
+
+When `upstream.auth_context` is set, `check_listen` binds a loopback socket (such as `"127.0.0.1:8083"`) serving `POST /authorization/check`, and `check_token` sets a shared Bearer secret of at least 16 visible ASCII characters (`"${VAR}"` expansion supported). The gateway strips inbound `X-Authorization-*` headers on all routes and injects `X-Authorization-Ref` and `X-Authorization-Scope` on authorized `<resource_path>` requests so downstream services can verify live grant scopes and revocation state over loopback.
 
 ### `upstream` fields (`"transport": "stdio"`)
 
@@ -82,7 +86,7 @@ Set either `owner_password_hash` or `owner_password`.
 
 ## Nginx reverse proxy
 
-Disable proxy buffering so `text/event-stream` responses and passthrough transfers stream immediately:
+Disable proxy buffering so `text/event-stream` responses and passthrough transfers stream immediately, and list your local proxy addresses in `trusted_proxies` (for example `["127.0.0.1", "::1"]`) so OAuth login rate limits track each remote client IP from `X-Forwarded-For`:
 
 ```nginx
 server {
@@ -121,8 +125,8 @@ cargo clippy --locked --all-targets -- -D warnings
 python3 scripts/ci/run-tests.py
 ```
 
-See [`docs/design.md`](docs/design.md) for request guards, OAuth 2.1 endpoint rules, single-tip refresh rotation, upstream session eviction, active byte budgets, and child process-group reaping.
+See [`docs/design.md`](docs/design.md) for request guards, OAuth 2.1 endpoint rules, single-tip refresh rotation, delegated authorization propagation, upstream session eviction, active byte budgets, and child process-group reaping.
 
 ## License
 
-Apache-2.0. See [LICENSE](LICENSE).
+Apache-2.0. See [LICENSE](LICENSE) and [NOTICE](NOTICE).

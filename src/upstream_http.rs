@@ -1,5 +1,5 @@
-use crate::config::HttpUpstreamSettings;
-use crate::crypto::constant_time_eq_str;
+use crate::config::{HttpUpstreamSettings, is_valid_scope_token};
+use crate::crypto::{compute_auth_ref, constant_time_eq_str};
 use crate::types::{
     ByteBudget, ByteLease, HttpReply, ReadBodyError, ReplyBody, VerifiedToken, bytes_body,
     empty_body, hex_nibble, leased_bytes, method_not_allowed, read_bounded_body,
@@ -72,10 +72,22 @@ impl HttpClient {
     }
 }
 
+type DelegatedHeaders = (HeaderValue, HeaderValue);
+type OwnedSessionCancel = (String, usize, Option<DelegatedHeaders>, CancellationToken);
+type AuthChallengeEntry = (String, Vec<(String, String)>);
+
+#[derive(Clone)]
+struct OAuthUpstreamContext {
+    resource_url: String,
+    resource_metadata_url: String,
+    scopes: Vec<String>,
+}
+
 struct SessionBinding {
     binding_id: u64,
     grant_id: String,
     pool_slot: usize,
+    delegated_auth: Option<DelegatedHeaders>,
     last_used_seq: u64,
     active_post_streams: usize,
     cancel: CancellationToken,
@@ -85,7 +97,7 @@ enum BindOutcome {
     Bound {
         binding_id: u64,
         session_cancel: CancellationToken,
-        evicted: Option<(String, usize, CancellationToken)>,
+        evicted: Option<OwnedSessionCancel>,
     },
     CapacityExhausted,
 }
@@ -150,6 +162,7 @@ impl HttpSessionState {
         sid: String,
         grant_id: &str,
         pool_slot: usize,
+        delegated_auth: Option<DelegatedHeaders>,
         limits: HttpLimits,
     ) -> BindOutcome {
         if self.sessions.contains_key(&sid) {
@@ -158,6 +171,7 @@ impl HttpSessionState {
             existing.grant_id.clear();
             existing.grant_id.push_str(grant_id);
             existing.pool_slot = pool_slot;
+            existing.delegated_auth = delegated_auth;
             existing.last_used_seq = seq;
             return BindOutcome::Bound {
                 binding_id: existing.binding_id,
@@ -188,7 +202,12 @@ impl HttpSessionState {
                 return BindOutcome::CapacityExhausted;
             };
             if let Some(removed) = self.sessions.remove(&evict_key) {
-                evicted = Some((evict_key, removed.pool_slot, removed.cancel));
+                evicted = Some((
+                    evict_key,
+                    removed.pool_slot,
+                    removed.delegated_auth,
+                    removed.cancel,
+                ));
             }
         } else if self.sessions.len() >= global_cap {
             let Some(evict_key) = self
@@ -201,7 +220,12 @@ impl HttpSessionState {
                 return BindOutcome::CapacityExhausted;
             };
             if let Some(removed) = self.sessions.remove(&evict_key) {
-                evicted = Some((evict_key, removed.pool_slot, removed.cancel));
+                evicted = Some((
+                    evict_key,
+                    removed.pool_slot,
+                    removed.delegated_auth,
+                    removed.cancel,
+                ));
             }
         }
 
@@ -213,6 +237,7 @@ impl HttpSessionState {
                 binding_id: seq,
                 grant_id: grant_id.to_owned(),
                 pool_slot,
+                delegated_auth,
                 last_used_seq: seq,
                 active_post_streams: 0,
                 cancel: cancel.clone(),
@@ -306,6 +331,7 @@ pub struct HttpUpstream {
     mcp_url_str: String,
     upstream_host: HeaderValue,
     forwarded_proto: HeaderValue,
+    oauth_context: Option<OAuthUpstreamContext>,
     state: Arc<Mutex<HttpSessionState>>,
     shutdown_token: CancellationToken,
 }
@@ -313,6 +339,23 @@ pub struct HttpUpstream {
 impl HttpUpstream {
     pub fn new(settings: HttpUpstreamSettings) -> Result<Self, String> {
         Self::with_limits(settings, ByteBudget::global(), HttpLimits::default())
+    }
+
+    pub fn with_oauth_context(
+        mut self,
+        public_url: &str,
+        resource_path: &str,
+        scopes: Vec<String>,
+    ) -> Self {
+        let base = public_url.trim_end_matches('/');
+        self.oauth_context = Some(OAuthUpstreamContext {
+            resource_url: format!("{base}{resource_path}"),
+            resource_metadata_url: format!(
+                "{base}/.well-known/oauth-protected-resource{resource_path}"
+            ),
+            scopes,
+        });
+        self
     }
 
     pub fn with_limits(
@@ -377,16 +420,62 @@ impl HttpUpstream {
             mcp_url_str,
             upstream_host,
             forwarded_proto,
+            oauth_context: None,
             state: Arc::new(Mutex::new(HttpSessionState::new())),
             shutdown_token: CancellationToken::new(),
         })
     }
 
+    fn effective_resource_url(&self, token: &VerifiedToken) -> String {
+        if let Some(ctx) = &self.oauth_context {
+            return ctx.resource_url.clone();
+        }
+        if !token.resource.is_empty() {
+            return token.resource.clone();
+        }
+        format!("{}/mcp", self.origin_base_str)
+    }
+
+    fn effective_resource_metadata_url(&self, token: &VerifiedToken) -> String {
+        if let Some(ctx) = &self.oauth_context {
+            return ctx.resource_metadata_url.clone();
+        }
+        let res_url = self.effective_resource_url(token);
+        if let Ok(parsed) = url::Url::parse(&res_url) {
+            let origin = parsed.origin().ascii_serialization();
+            let path = parsed.path();
+            return format!("{origin}/.well-known/oauth-protected-resource{path}");
+        }
+        format!(
+            "{}/.well-known/oauth-protected-resource/mcp",
+            self.origin_base_str
+        )
+    }
+
+    fn effective_allowed_scopes(&self) -> &[String] {
+        match &self.oauth_context {
+            Some(ctx) => &ctx.scopes,
+            None => &[],
+        }
+    }
+
+    fn build_delegated_headers(
+        &self,
+        token: &VerifiedToken,
+    ) -> Result<Option<DelegatedHeaders>, ()> {
+        if self.settings.auth_context.is_none() {
+            return Ok(None);
+        }
+        let resource_url = self.effective_resource_url(token);
+        let auth_ref = compute_auth_ref(&resource_url, &token.grant_id);
+        let scope_str = token.scopes.join(" ");
+        let ref_hv = HeaderValue::from_str(&auth_ref).map_err(|_| ())?;
+        let scope_hv = HeaderValue::from_str(&scope_str).map_err(|_| ())?;
+        Ok(Some((ref_hv, scope_hv)))
+    }
+
     pub async fn terminate_grant(&self, grant_id: &str) {
-        let (grant_cancel, owned_sessions): (
-            Option<CancellationToken>,
-            Vec<(String, usize, CancellationToken)>,
-        ) = {
+        let (grant_cancel, owned_sessions): (Option<CancellationToken>, Vec<OwnedSessionCancel>) = {
             let mut st = self.state.lock().unwrap_or_else(|p| p.into_inner());
             st.bump_grant_epoch(grant_id);
             let cancel = st.active_grants.remove(grant_id).map(|e| e.cancel);
@@ -399,7 +488,7 @@ impl HttpUpstream {
             let mut owned = Vec::with_capacity(keys.len());
             for k in keys {
                 if let Some(b) = st.sessions.remove(&k) {
-                    owned.push((k, b.pool_slot, b.cancel));
+                    owned.push((k, b.pool_slot, b.delegated_auth, b.cancel));
                 }
             }
             (cancel, owned)
@@ -408,7 +497,7 @@ impl HttpUpstream {
         if let Some(cancel) = grant_cancel {
             cancel.cancel();
         }
-        for (_, _, sc) in &owned_sessions {
+        for (_, _, _, sc) in &owned_sessions {
             sc.cancel();
         }
 
@@ -417,8 +506,10 @@ impl HttpUpstream {
         }
 
         let mut deletes = JoinSet::new();
-        for (sid, pool_slot, _) in owned_sessions {
-            if let Some(req) = self.build_session_delete_request(&sid, pool_slot) {
+        for (sid, pool_slot, delegated, _) in owned_sessions {
+            if let Some(req) =
+                self.build_session_delete_request(&sid, pool_slot, delegated.as_ref())
+            {
                 let client = self.client.clone();
                 let timeout_dur = REVOKE_DELETE_TIMEOUT
                     .min(Duration::from_secs(self.settings.request_timeout_secs));
@@ -449,6 +540,7 @@ impl HttpUpstream {
         &self,
         sid: &str,
         pool_slot: usize,
+        delegated: Option<&DelegatedHeaders>,
     ) -> Option<Request<ReplyBody>> {
         let target_uri = self.mcp_url_str.parse::<Uri>().ok()?;
         let sid_hv = HeaderValue::from_str(sid).ok()?;
@@ -467,6 +559,16 @@ impl HttpUpstream {
             {
                 headers.insert(header::AUTHORIZATION, hv);
             }
+        }
+        if let Some((ref_hv, scope_hv)) = delegated {
+            headers.insert(
+                HeaderName::from_static("x-authorization-ref"),
+                ref_hv.clone(),
+            );
+            headers.insert(
+                HeaderName::from_static("x-authorization-scope"),
+                scope_hv.clone(),
+            );
         }
         builder.body(empty_body()).ok()
     }
@@ -523,7 +625,7 @@ impl HttpUpstream {
         let (parts, incoming) = req.into_parts();
         let mut out_req = Request::builder().method(method).uri(target_uri);
         if let Some(headers) = out_req.headers_mut() {
-            copy_filtered_headers(&parts.headers, headers, true, false);
+            copy_filtered_headers(&parts.headers, headers, true);
             headers.insert(header::HOST, self.upstream_host.clone());
             headers.insert(
                 HeaderName::from_static("x-forwarded-proto"),
@@ -557,7 +659,7 @@ impl HttpUpstream {
         let (up_parts, up_body) = up_resp.into_parts();
         let mut reply = Response::builder().status(up_parts.status);
         if let Some(headers) = reply.headers_mut() {
-            copy_filtered_headers(&up_parts.headers, headers, false, false);
+            copy_filtered_headers(&up_parts.headers, headers, false);
         }
         let out_body = GrantBoundBody::new(
             up_body.map_err(io::Error::other),
@@ -668,9 +770,13 @@ impl HttpUpstream {
             },
         };
 
+        let Ok(delegated_headers) = self.build_delegated_headers(token) else {
+            return empty_status_reply(StatusCode::INTERNAL_SERVER_ERROR);
+        };
+
         let mut out_req = Request::builder().method(method.clone()).uri(target_uri);
         if let Some(headers) = out_req.headers_mut() {
-            copy_filtered_headers(&parts.headers, headers, true, false);
+            copy_filtered_headers(&parts.headers, headers, true);
             headers.remove(header::CONTENT_LENGTH);
             if !body_bytes.is_empty() || method == Method::POST {
                 headers.insert(header::CONTENT_LENGTH, HeaderValue::from(body_bytes.len()));
@@ -681,6 +787,16 @@ impl HttpUpstream {
                 if let Ok(hv) = HeaderValue::from_str(&auth_val) {
                     headers.insert(header::AUTHORIZATION, hv);
                 }
+            }
+            if let Some((ref ref_hv, ref scope_hv)) = delegated_headers {
+                headers.insert(
+                    HeaderName::from_static("x-authorization-ref"),
+                    ref_hv.clone(),
+                );
+                headers.insert(
+                    HeaderName::from_static("x-authorization-scope"),
+                    scope_hv.clone(),
+                );
             }
             headers.insert(header::HOST, self.upstream_host.clone());
             headers.insert(
@@ -717,30 +833,40 @@ impl HttpUpstream {
         };
 
         let (up_parts, up_body) = up_resp.into_parts();
-        if !self.settings.bearer_tokens.is_empty()
+        let synthesized_www_auth = if self.settings.auth_context.is_some() {
+            match self.resolve_delegated_auth_status(up_parts.status, &up_parts.headers, token) {
+                Ok(opt_hv) => opt_hv,
+                Err(()) => return empty_status_reply(StatusCode::BAD_GATEWAY),
+            }
+        } else if !self.settings.bearer_tokens.is_empty()
             && matches!(
                 up_parts.status,
                 StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN
             )
         {
             return empty_status_reply(StatusCode::BAD_GATEWAY);
-        }
+        } else {
+            None
+        };
 
         let Ok(resp_sid) = extract_mcp_session_id(&up_parts.headers) else {
             return empty_status_reply(StatusCode::BAD_GATEWAY);
         };
 
-        let mut pending_deletes: Vec<(String, usize)> = Vec::new();
+        let should_remove_session = up_parts.status == StatusCode::NOT_FOUND
+            || (method == Method::DELETE && up_parts.status.is_success());
+
+        let mut pending_deletes: Vec<(String, usize, Option<DelegatedHeaders>)> = Vec::new();
         let mut cancels_to_fire: Vec<CancellationToken> = Vec::new();
         let mut body_session_cancel: Option<CancellationToken> = None;
         let session_outcome = {
             let mut st = self.state.lock().unwrap_or_else(|p| p.into_inner());
             if st.shutting_down || st.grant_epoch(&token.grant_id) != start_epoch {
                 if let Some(sid) = resp_sid.clone().or_else(|| req_sid.clone()) {
-                    pending_deletes.push((sid, token.pool_slot));
+                    pending_deletes.push((sid, token.pool_slot, delegated_headers.clone()));
                 }
                 Err(StatusCode::SERVICE_UNAVAILABLE)
-            } else if method == Method::DELETE || up_parts.status == StatusCode::NOT_FOUND {
+            } else if should_remove_session {
                 if let Some(ref sid) = req_sid
                     && st.sessions.get(sid).is_some_and(|b| {
                         Some(b.binding_id) == req_binding_id
@@ -761,7 +887,11 @@ impl HttpUpstream {
                     && req_sid.as_deref() != Some(rsid.as_str())
                     && !st.sessions.contains_key(rsid)
                 {
-                    pending_deletes.push((rsid.clone(), token.pool_slot));
+                    pending_deletes.push((
+                        rsid.clone(),
+                        token.pool_slot,
+                        delegated_headers.clone(),
+                    ));
                 }
                 Err(StatusCode::NOT_FOUND)
             } else if let Some(ref rsid) = resp_sid
@@ -783,6 +913,7 @@ impl HttpUpstream {
                         };
                         if let Some(b) = st.sessions.get_mut(sid) {
                             b.pool_slot = token.pool_slot;
+                            b.delegated_auth = delegated_headers.clone();
                             if let Some(s) = seq {
                                 b.last_used_seq = s;
                             }
@@ -797,6 +928,7 @@ impl HttpUpstream {
                             rsid.clone(),
                             &token.grant_id,
                             token.pool_slot,
+                            delegated_headers.clone(),
                             self.limits,
                         ) {
                             BindOutcome::Bound {
@@ -805,9 +937,9 @@ impl HttpUpstream {
                                 evicted,
                             } => {
                                 body_session_cancel = Some(session_cancel);
-                                if let Some((ev_sid, ev_slot, ev_cancel)) = evicted {
+                                if let Some((ev_sid, ev_slot, ev_del, ev_cancel)) = evicted {
                                     cancels_to_fire.push(ev_cancel);
-                                    pending_deletes.push((ev_sid, ev_slot));
+                                    pending_deletes.push((ev_sid, ev_slot, ev_del));
                                 }
                                 if method == Method::POST
                                     && let Some(b) = st.sessions.get_mut(rsid)
@@ -819,7 +951,11 @@ impl HttpUpstream {
                             }
                             BindOutcome::CapacityExhausted => {
                                 if !was_existing {
-                                    pending_deletes.push((rsid.clone(), token.pool_slot));
+                                    pending_deletes.push((
+                                        rsid.clone(),
+                                        token.pool_slot,
+                                        delegated_headers.clone(),
+                                    ));
                                 }
                                 outcome = Err(StatusCode::SERVICE_UNAVAILABLE);
                             }
@@ -837,8 +973,9 @@ impl HttpUpstream {
             c.cancel();
         }
 
-        for (sid, slot) in pending_deletes {
-            if let Some(del_req) = self.build_session_delete_request(&sid, slot) {
+        for (sid, slot, delegated) in pending_deletes {
+            if let Some(del_req) = self.build_session_delete_request(&sid, slot, delegated.as_ref())
+            {
                 let client = self.client.clone();
                 let del_timeout = REVOKE_DELETE_TIMEOUT
                     .min(Duration::from_secs(self.settings.request_timeout_secs));
@@ -867,7 +1004,10 @@ impl HttpUpstream {
                 });
         let mut reply = Response::builder().status(up_parts.status);
         if let Some(headers) = reply.headers_mut() {
-            copy_filtered_headers(&up_parts.headers, headers, false, true);
+            copy_filtered_headers(&up_parts.headers, headers, false);
+            if let Some(www_hv) = synthesized_www_auth {
+                headers.insert(header::WWW_AUTHENTICATE, www_hv);
+            }
             if is_sse {
                 headers.remove(header::CONTENT_LENGTH);
             }
@@ -905,11 +1045,285 @@ impl HttpUpstream {
             .body(out_body)
             .unwrap_or_else(|_| empty_status_reply(StatusCode::BAD_GATEWAY))
     }
+
+    fn resolve_delegated_auth_status(
+        &self,
+        status: StatusCode,
+        up_headers: &HeaderMap,
+        token: &VerifiedToken,
+    ) -> Result<Option<HeaderValue>, ()> {
+        if !matches!(status, StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN) {
+            return Ok(None);
+        }
+
+        let parsed = parse_upstream_www_authenticate(up_headers);
+        if status == StatusCode::UNAUTHORIZED {
+            if let UpstreamWwwAuth::Bearer {
+                error: Some(err), ..
+            } = parsed
+                && err == "invalid_token"
+            {
+                let meta_url = self.effective_resource_metadata_url(token);
+                let val =
+                    format!("Bearer resource_metadata=\"{meta_url}\", error=\"invalid_token\"");
+                return HeaderValue::from_str(&val).map(Some).map_err(|_| ());
+            }
+            return Err(());
+        }
+
+        match parsed {
+            UpstreamWwwAuth::Absent => Ok(None),
+            UpstreamWwwAuth::Bearer {
+                error: Some(err),
+                scope,
+            } if err == "insufficient_scope" => {
+                let meta_url = self.effective_resource_metadata_url(token);
+                let allowed = self.effective_allowed_scopes();
+                let mut filtered: Vec<String> = Vec::new();
+                if let Some(raw_scope) = scope {
+                    for tok in raw_scope.split(' ') {
+                        if tok.is_empty() || !is_valid_scope_token(tok) {
+                            continue;
+                        }
+                        let in_allowed = if allowed.is_empty() {
+                            token.scopes.iter().any(|s| s == tok) || tok == "mcp"
+                        } else {
+                            allowed.iter().any(|s| s == tok)
+                        };
+                        if in_allowed && !filtered.iter().any(|existing| existing == tok) {
+                            filtered.push(tok.to_owned());
+                        }
+                    }
+                }
+                let effective_scope = if !filtered.is_empty() {
+                    filtered.join(" ")
+                } else if !allowed.is_empty() {
+                    allowed.join(" ")
+                } else if !token.scopes.is_empty() {
+                    token.scopes.join(" ")
+                } else {
+                    "mcp".to_owned()
+                };
+                let val = format!(
+                    "Bearer resource_metadata=\"{meta_url}\", error=\"insufficient_scope\", scope=\"{effective_scope}\""
+                );
+                HeaderValue::from_str(&val).map(Some).map_err(|_| ())
+            }
+            UpstreamWwwAuth::Bearer { .. } | UpstreamWwwAuth::OtherOrMalformed => Err(()),
+        }
+    }
 }
 
 impl Drop for HttpUpstream {
     fn drop(&mut self) {
         self.shutdown_token.cancel();
+    }
+}
+
+enum UpstreamWwwAuth {
+    Absent,
+    Bearer {
+        error: Option<String>,
+        scope: Option<String>,
+    },
+    OtherOrMalformed,
+}
+
+fn parse_upstream_www_authenticate(headers: &HeaderMap) -> UpstreamWwwAuth {
+    let values: Vec<&HeaderValue> = headers.get_all(header::WWW_AUTHENTICATE).iter().collect();
+    if values.is_empty() {
+        return UpstreamWwwAuth::Absent;
+    }
+
+    let mut found_bearer: Option<(Option<String>, Option<String>)> = None;
+    for hv in values {
+        let Ok(raw) = hv.to_str() else {
+            return UpstreamWwwAuth::OtherOrMalformed;
+        };
+        let Some(challenges) = parse_auth_challenges(raw) else {
+            return UpstreamWwwAuth::OtherOrMalformed;
+        };
+        for (scheme, params) in challenges {
+            if !scheme.eq_ignore_ascii_case("bearer") {
+                continue;
+            }
+            let mut err_val: Option<String> = None;
+            let mut scope_val: Option<String> = None;
+            for (k, v) in params {
+                if k.eq_ignore_ascii_case("error") {
+                    if err_val.is_some() {
+                        return UpstreamWwwAuth::OtherOrMalformed;
+                    }
+                    err_val = Some(v);
+                } else if k.eq_ignore_ascii_case("scope") {
+                    if scope_val.is_some() {
+                        return UpstreamWwwAuth::OtherOrMalformed;
+                    }
+                    scope_val = Some(v);
+                }
+            }
+            if found_bearer.is_some() {
+                return UpstreamWwwAuth::OtherOrMalformed;
+            }
+            found_bearer = Some((err_val, scope_val));
+        }
+    }
+
+    match found_bearer {
+        Some((error, scope)) => UpstreamWwwAuth::Bearer { error, scope },
+        None => UpstreamWwwAuth::OtherOrMalformed,
+    }
+}
+
+fn is_http_tchar(b: u8) -> bool {
+    b.is_ascii_alphanumeric()
+        || matches!(
+            b,
+            b'!' | b'#'
+                | b'$'
+                | b'%'
+                | b'&'
+                | b'\''
+                | b'*'
+                | b'+'
+                | b'-'
+                | b'.'
+                | b'^'
+                | b'_'
+                | b'`'
+                | b'|'
+                | b'~'
+        )
+}
+
+fn parse_auth_challenges(raw: &str) -> Option<Vec<AuthChallengeEntry>> {
+    let bytes = raw.as_bytes();
+    let mut pos = 0;
+    let mut challenges: Vec<AuthChallengeEntry> = Vec::new();
+
+    let skip_ws_and_commas = |p: &mut usize| {
+        while *p < bytes.len() && matches!(bytes[*p], b' ' | b'\t' | b',') {
+            *p += 1;
+        }
+    };
+    let skip_ows = |p: &mut usize| {
+        while *p < bytes.len() && matches!(bytes[*p], b' ' | b'\t') {
+            *p += 1;
+        }
+    };
+
+    skip_ws_and_commas(&mut pos);
+    while pos < bytes.len() {
+        let tok_start = pos;
+        while pos < bytes.len() && is_http_tchar(bytes[pos]) {
+            pos += 1;
+        }
+        if pos == tok_start {
+            return None;
+        }
+        let ident = std::str::from_utf8(&bytes[tok_start..pos]).ok()?.to_owned();
+        skip_ows(&mut pos);
+
+        if pos < bytes.len() && bytes[pos] == b'=' {
+            let mut eq_end = pos;
+            while eq_end < bytes.len() && bytes[eq_end] == b'=' {
+                eq_end += 1;
+            }
+            let is_token68_pad = !challenges.is_empty()
+                && challenges
+                    .last()
+                    .is_some_and(|(_, params)| params.is_empty())
+                && (eq_end == bytes.len() || matches!(bytes[eq_end], b' ' | b'\t' | b','));
+            if is_token68_pad {
+                pos = eq_end;
+                skip_ws_and_commas(&mut pos);
+                continue;
+            }
+            if challenges.is_empty() {
+                return None;
+            }
+            pos += 1;
+            skip_ows(&mut pos);
+            if pos >= bytes.len() {
+                return None;
+            }
+            let val = if bytes[pos] == b'"' {
+                pos += 1;
+                let mut out = String::new();
+                let mut closed = false;
+                while pos < bytes.len() {
+                    let b = bytes[pos];
+                    pos += 1;
+                    if b == b'"' {
+                        closed = true;
+                        break;
+                    }
+                    if b == b'\\' {
+                        if pos >= bytes.len() {
+                            return None;
+                        }
+                        let esc = bytes[pos];
+                        pos += 1;
+                        if !(esc == b'\t' || (0x20..=0x7E).contains(&esc)) {
+                            return None;
+                        }
+                        out.push(esc as char);
+                    } else if b == b'\t' || (0x20..=0x7E).contains(&b) {
+                        out.push(b as char);
+                    } else {
+                        return None;
+                    }
+                }
+                if !closed {
+                    return None;
+                }
+                out
+            } else {
+                let v_start = pos;
+                while pos < bytes.len() && is_http_tchar(bytes[pos]) {
+                    pos += 1;
+                }
+                if pos == v_start {
+                    return None;
+                }
+                std::str::from_utf8(&bytes[v_start..pos]).ok()?.to_owned()
+            };
+            challenges.last_mut()?.1.push((ident, val));
+            skip_ws_and_commas(&mut pos);
+        } else {
+            challenges.push((ident, Vec::new()));
+            if pos < bytes.len() && bytes[pos] != b',' {
+                let is_t68_char = |b: u8| {
+                    b.is_ascii_alphanumeric()
+                        || matches!(b, b'-' | b'.' | b'_' | b'~' | b'+' | b'/')
+                };
+                let mut p = pos;
+                while p < bytes.len() && is_t68_char(bytes[p]) {
+                    p += 1;
+                }
+                let mut p_eq = p;
+                while p_eq < bytes.len() && bytes[p_eq] == b'=' {
+                    p_eq += 1;
+                }
+                let mut p_ws = p_eq;
+                skip_ows(&mut p_ws);
+                let is_token68 = p > pos
+                    && (p_eq == bytes.len() || matches!(bytes[p_eq], b' ' | b'\t' | b','))
+                    && (p_ws == bytes.len() || bytes[p_ws] != b'=');
+                if is_token68 {
+                    pos = p_ws;
+                    skip_ws_and_commas(&mut pos);
+                }
+            } else {
+                skip_ws_and_commas(&mut pos);
+            }
+        }
+    }
+
+    if challenges.is_empty() {
+        None
+    } else {
+        Some(challenges)
     }
 }
 
@@ -1188,12 +1602,7 @@ fn is_event_stream(headers: &HeaderMap) -> bool {
         })
 }
 
-fn copy_filtered_headers(
-    src: &HeaderMap,
-    dst: &mut HeaderMap,
-    is_request: bool,
-    strip_www_authenticate: bool,
-) {
+fn copy_filtered_headers(src: &HeaderMap, dst: &mut HeaderMap, is_request: bool) {
     let mut connection_tokens: HashSet<Vec<u8>> = HashSet::new();
     for val in src.get_all(header::CONNECTION) {
         for raw_tok in val.as_bytes().split(|&b| b == b',') {
@@ -1219,9 +1628,7 @@ fn copy_filtered_headers(
         if is_request && is_stripped_request_header(lower) {
             continue;
         }
-        if !is_request
-            && (lower == "set-cookie" || (strip_www_authenticate && lower == "www-authenticate"))
-        {
+        if !is_request && (lower == "set-cookie" || lower == "www-authenticate") {
             continue;
         }
         dst.append(name.clone(), value.clone());
@@ -1230,6 +1637,7 @@ fn copy_filtered_headers(
 
 fn is_stripped_request_header(lower_name: &str) -> bool {
     lower_name.starts_with("x-user-")
+        || lower_name.starts_with("x-authorization-")
         || matches!(
             lower_name,
             "authorization"
@@ -1845,19 +2253,19 @@ mod tests {
         };
 
         assert!(matches!(
-            st.bind_session("s1".to_owned(), "g1", 0, limits),
+            st.bind_session("s1".to_owned(), "g1", 0, None, limits),
             BindOutcome::Bound { evicted: None, .. }
         ));
         assert!(matches!(
-            st.bind_session("s2".to_owned(), "g2", 1, limits),
+            st.bind_session("s2".to_owned(), "g2", 1, None, limits),
             BindOutcome::Bound { evicted: None, .. }
         ));
 
         // Mark oldest global session s1 as having an active POST stream; s3 must evict s2 instead of s1.
         st.sessions.get_mut("s1").unwrap().active_post_streams = 1;
-        match st.bind_session("s3".to_owned(), "g3", 2, limits) {
+        match st.bind_session("s3".to_owned(), "g3", 2, None, limits) {
             BindOutcome::Bound {
-                evicted: Some((ev_sid, ev_slot, ev_cancel)),
+                evicted: Some((ev_sid, ev_slot, _, ev_cancel)),
                 ..
             } => {
                 assert_eq!(ev_sid, "s2");
@@ -1873,7 +2281,7 @@ mod tests {
         // When both global slots have active POST streams, a 3rd distinct session returns CapacityExhausted.
         st.sessions.get_mut("s3").unwrap().active_post_streams = 1;
         assert!(matches!(
-            st.bind_session("s4".to_owned(), "g4", 0, limits),
+            st.bind_session("s4".to_owned(), "g4", 0, None, limits),
             BindOutcome::CapacityExhausted
         ));
         assert!(!st.sessions.contains_key("s4"));
@@ -1963,6 +2371,7 @@ mod tests {
                 bearer_tokens: Vec::new(),
                 passthrough_prefixes: Vec::new(),
                 request_timeout_secs: 30,
+                auth_context: None,
             })
             .unwrap(),
         );

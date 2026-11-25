@@ -5,6 +5,110 @@ use std::net::{IpAddr, SocketAddr};
 use std::path::{Path, PathBuf};
 use url::{Host, Url};
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum IpNet {
+    V4 { addr: u32, mask: u32, prefix: u8 },
+    V6 { addr: u128, mask: u128, prefix: u8 },
+}
+
+impl IpNet {
+    pub fn parse(raw: &str) -> Result<Self, String> {
+        let trimmed = raw.trim();
+        if trimmed.is_empty() {
+            return Err("empty IP or CIDR".to_owned());
+        }
+        let Some((ip_part, prefix_part)) = trimmed.split_once('/') else {
+            let ip = trimmed
+                .parse::<IpAddr>()
+                .map_err(|e| format!("{e}"))?
+                .to_canonical();
+            return Ok(match ip {
+                IpAddr::V4(v4) => Self::V4 {
+                    addr: u32::from(v4),
+                    mask: u32::MAX,
+                    prefix: 32,
+                },
+                IpAddr::V6(v6) => Self::V6 {
+                    addr: u128::from(v6),
+                    mask: u128::MAX,
+                    prefix: 128,
+                },
+            });
+        };
+
+        if ip_part.is_empty()
+            || prefix_part.is_empty()
+            || prefix_part.contains('/')
+            || !prefix_part.bytes().all(|b| b.is_ascii_digit())
+            || (prefix_part.len() > 1 && prefix_part.starts_with('0'))
+        {
+            return Err(format!("invalid CIDR notation {trimmed:?}"));
+        }
+        let prefix = prefix_part
+            .parse::<u8>()
+            .map_err(|_| format!("invalid CIDR prefix length in {trimmed:?}"))?;
+        let raw_ip = ip_part
+            .parse::<IpAddr>()
+            .map_err(|e| format!("invalid IP address in {trimmed:?}: {e}"))?;
+
+        match raw_ip {
+            IpAddr::V4(v4) => {
+                if prefix > 32 {
+                    return Err(format!("IPv4 CIDR prefix length {prefix} exceeds 32"));
+                }
+                let mask = if prefix == 0 {
+                    0
+                } else {
+                    u32::MAX << (32 - prefix)
+                };
+                Ok(Self::V4 {
+                    addr: u32::from(v4) & mask,
+                    mask,
+                    prefix,
+                })
+            }
+            IpAddr::V6(v6) => {
+                if prefix > 128 {
+                    return Err(format!("IPv6 CIDR prefix length {prefix} exceeds 128"));
+                }
+                if let Some(v4) = v6.to_ipv4_mapped()
+                    && prefix >= 96
+                {
+                    let v4_prefix = prefix - 96;
+                    let mask = if v4_prefix == 0 {
+                        0
+                    } else {
+                        u32::MAX << (32 - v4_prefix)
+                    };
+                    return Ok(Self::V4 {
+                        addr: u32::from(v4) & mask,
+                        mask,
+                        prefix: v4_prefix,
+                    });
+                }
+                let mask = if prefix == 0 {
+                    0
+                } else {
+                    u128::MAX << (128 - prefix)
+                };
+                Ok(Self::V6 {
+                    addr: u128::from(v6) & mask,
+                    mask,
+                    prefix,
+                })
+            }
+        }
+    }
+
+    pub fn contains(&self, ip: IpAddr) -> bool {
+        match (*self, ip.to_canonical()) {
+            (Self::V4 { addr, mask, .. }, IpAddr::V4(v4)) => (u32::from(v4) & mask) == addr,
+            (Self::V6 { addr, mask, .. }, IpAddr::V6(v6)) => (u128::from(v6) & mask) == addr,
+            _ => false,
+        }
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct GatewayConfig {
     pub listen: SocketAddr,
@@ -12,6 +116,7 @@ pub struct GatewayConfig {
     pub resource_path: String,
     pub public_is_https: bool,
     pub state_path: PathBuf,
+    pub trusted_proxies: Vec<IpNet>,
     pub oauth: OAuthSettings,
     pub upstream: UpstreamSettings,
 }
@@ -68,6 +173,27 @@ impl UpstreamSettings {
     }
 }
 
+#[derive(Clone, PartialEq, Eq)]
+pub struct UpstreamAuthContextConfig {
+    pub check_listen: SocketAddr,
+    pub check_token: String,
+}
+
+impl Drop for UpstreamAuthContextConfig {
+    fn drop(&mut self) {
+        zeroize_string(&mut self.check_token);
+    }
+}
+
+impl std::fmt::Debug for UpstreamAuthContextConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("UpstreamAuthContextConfig")
+            .field("check_listen", &self.check_listen)
+            .field("check_token", &"<redacted>")
+            .finish()
+    }
+}
+
 #[derive(Clone)]
 pub struct HttpUpstreamSettings {
     pub url: Url,
@@ -76,6 +202,7 @@ pub struct HttpUpstreamSettings {
     pub bearer_tokens: Vec<String>,
     pub passthrough_prefixes: Vec<String>,
     pub request_timeout_secs: u64,
+    pub auth_context: Option<UpstreamAuthContextConfig>,
 }
 
 impl std::fmt::Debug for HttpUpstreamSettings {
@@ -90,6 +217,7 @@ impl std::fmt::Debug for HttpUpstreamSettings {
             )
             .field("passthrough_prefixes", &self.passthrough_prefixes)
             .field("request_timeout_secs", &self.request_timeout_secs)
+            .field("auth_context", &self.auth_context)
             .finish()
     }
 }
@@ -129,6 +257,8 @@ struct RawConfig {
     public_url: String,
     resource_path: Option<String>,
     state_path: String,
+    #[serde(default)]
+    trusted_proxies: Vec<String>,
     oauth: RawOAuth,
     upstream: RawUpstream,
 }
@@ -156,6 +286,13 @@ struct RawOAuth {
 }
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawAuthContext {
+    check_listen: String,
+    check_token: String,
+}
+
+#[derive(Deserialize)]
 #[serde(tag = "transport", rename_all = "lowercase", deny_unknown_fields)]
 enum RawUpstream {
     Http {
@@ -166,6 +303,8 @@ enum RawUpstream {
         passthrough_prefixes: Vec<String>,
         #[serde(default = "default_http_timeout")]
         request_timeout_secs: u64,
+        #[serde(default)]
+        auth_context: Option<RawAuthContext>,
     },
     Stdio {
         command: String,
@@ -371,6 +510,16 @@ impl GatewayConfig {
             base_dir.join(state_raw)
         };
 
+        let mut trusted_proxies = Vec::with_capacity(raw.trusted_proxies.len());
+        for (idx, raw_entry) in raw.trusted_proxies.iter().enumerate() {
+            let expanded = expand_env_reference(raw_entry, &format!("trusted_proxies[{idx}]"))?;
+            let parsed_net = IpNet::parse(&expanded)
+                .map_err(|e| format!("invalid IP or CIDR in trusted_proxies[{idx}]: {e}"))?;
+            if !trusted_proxies.contains(&parsed_net) {
+                trusted_proxies.push(parsed_net);
+            }
+        }
+
         let verifier = match (&raw.oauth.owner_password, &raw.oauth.owner_password_hash) {
             (Some(_), Some(_)) => {
                 return Err(
@@ -475,6 +624,7 @@ impl GatewayConfig {
                 bearer_tokens,
                 passthrough_prefixes,
                 request_timeout_secs,
+                auth_context,
             } => {
                 let expanded_url = expand_env_reference(&url, "upstream.url")?;
                 let parsed =
@@ -533,6 +683,53 @@ impl GatewayConfig {
                 if !(5..=3600).contains(&request_timeout_secs) {
                     return Err("upstream.request_timeout_secs must be in 5..=3600".to_owned());
                 }
+                let auth_context = match auth_context {
+                    None => None,
+                    Some(raw_ac) => {
+                        if tokens.is_empty() {
+                            return Err(
+                                "upstream.bearer_tokens must not be empty when upstream.auth_context is configured"
+                                    .to_owned(),
+                            );
+                        }
+                        let check_listen_str = expand_env_reference(
+                            &raw_ac.check_listen,
+                            "upstream.auth_context.check_listen",
+                        )?;
+                        let check_listen: SocketAddr = check_listen_str.parse().map_err(|e| {
+                            format!(
+                                "invalid upstream.auth_context.check_listen socket address: {e}"
+                            )
+                        })?;
+                        if !check_listen.ip().is_loopback() {
+                            return Err(
+                                "upstream.auth_context.check_listen must use a loopback IP address"
+                                    .to_owned(),
+                            );
+                        }
+                        if listen.port() != 0 && check_listen == listen {
+                            return Err("upstream.auth_context.check_listen must not equal listen"
+                                .to_owned());
+                        }
+                        let mut check_token = expand_env_reference(
+                            &raw_ac.check_token,
+                            "upstream.auth_context.check_token",
+                        )?;
+                        if check_token.len() < 16
+                            || !check_token.bytes().all(|b| (0x21..=0x7E).contains(&b))
+                        {
+                            zeroize_string(&mut check_token);
+                            return Err(
+                                "upstream.auth_context.check_token must contain at least 16 visible ASCII characters"
+                                    .to_owned(),
+                            );
+                        }
+                        Some(UpstreamAuthContextConfig {
+                            check_listen,
+                            check_token,
+                        })
+                    }
+                };
                 UpstreamSettings::Http(HttpUpstreamSettings {
                     url: parsed,
                     origin_base,
@@ -540,6 +737,7 @@ impl GatewayConfig {
                     bearer_tokens: tokens,
                     passthrough_prefixes: prefixes,
                     request_timeout_secs,
+                    auth_context,
                 })
             }
             RawUpstream::Stdio {
@@ -604,6 +802,7 @@ impl GatewayConfig {
             resource_path,
             public_is_https,
             state_path,
+            trusted_proxies,
             oauth,
             upstream,
         })
@@ -614,7 +813,7 @@ impl GatewayConfig {
     }
 }
 
-fn is_valid_scope_token(scope: &str) -> bool {
+pub(crate) fn is_valid_scope_token(scope: &str) -> bool {
     !scope.is_empty()
         && scope
             .bytes()
@@ -786,5 +985,145 @@ mod tests {
         assert!(expand_env_reference("${DEFINITELY_UNSET_GW_TEST_VAR}", "field").is_err());
         assert!(expand_env_reference("prefix-${VAR}", "field").is_err());
         assert!(expand_env_reference("${BAD-NAME}", "field").is_err());
+    }
+
+    #[test]
+    fn validates_auth_context_and_trusted_proxies() {
+        let hash = test_hash();
+        let valid_json = serde_json::json!({
+            "listen": "127.0.0.1:8080",
+            "public_url": "https://mcp.example.com",
+            "state_path": "state.json",
+            "trusted_proxies": [
+                "127.0.0.1",
+                "::ffff:127.0.0.1",
+                "127.0.0.1/32",
+                "10.0.0.0/8",
+                "fd00::/8",
+                "::1/128"
+            ],
+            "oauth": { "owner_password_hash": hash },
+            "upstream": {
+                "transport": "http",
+                "url": "http://127.0.0.1:9000/mcp",
+                "bearer_tokens": ["hop-secret-token"],
+                "auth_context": {
+                    "check_listen": "127.0.0.1:8083",
+                    "check_token": "0123456789abcdef_check"
+                }
+            }
+        });
+        let cfg = GatewayConfig::from_json_str(&valid_json.to_string(), Path::new("/tmp")).unwrap();
+        assert_eq!(cfg.trusted_proxies.len(), 4);
+        assert!(
+            cfg.trusted_proxies
+                .iter()
+                .any(|n| n.contains("10.254.12.9".parse().unwrap()))
+        );
+        assert!(
+            !cfg.trusted_proxies
+                .iter()
+                .any(|n| n.contains("11.0.0.1".parse().unwrap()))
+        );
+        assert!(
+            cfg.trusted_proxies
+                .iter()
+                .any(|n| n.contains("fd12:3456::1".parse().unwrap()))
+        );
+        assert!(
+            !cfg.trusted_proxies
+                .iter()
+                .any(|n| n.contains("fe80::1".parse().unwrap()))
+        );
+        assert!(
+            IpNet::parse("0.0.0.0/0")
+                .unwrap()
+                .contains("203.0.113.1".parse().unwrap())
+        );
+        assert!(
+            IpNet::parse("::/0")
+                .unwrap()
+                .contains("2001:db8::1".parse().unwrap())
+        );
+
+        for bad_proxy in [
+            "10.0.0.0/33",
+            "fd00::/129",
+            "10.0.0.0/8/16",
+            "10.0.0.0/",
+            "/8",
+            "10.0.0.0/08",
+            "10.0.0.0/+8",
+            "not-an-ip/24",
+        ] {
+            let mut j = valid_json.clone();
+            j["trusted_proxies"] = serde_json::json!([bad_proxy]);
+            assert!(
+                GatewayConfig::from_json_str(&j.to_string(), Path::new("/tmp")).is_err(),
+                "expected trusted_proxies entry {bad_proxy:?} to fail"
+            );
+        }
+        let dbg = format!("{cfg:?}");
+        assert!(!dbg.contains("0123456789abcdef_check"));
+        let UpstreamSettings::Http(ref http_up) = cfg.upstream else {
+            panic!("expected http upstream");
+        };
+        let ac = http_up.auth_context.as_ref().unwrap();
+        assert_eq!(ac.check_listen, "127.0.0.1:8083".parse().unwrap());
+
+        for bad_listen in [
+            "0.0.0.0:8083",
+            "[::]:8083",
+            "192.168.1.10:8083",
+            "127.0.0.1:8080",
+        ] {
+            let mut j = valid_json.clone();
+            j["upstream"]["auth_context"]["check_listen"] = serde_json::json!(bad_listen);
+            assert!(
+                GatewayConfig::from_json_str(&j.to_string(), Path::new("/tmp")).is_err(),
+                "expected check_listen {bad_listen} to fail"
+            );
+        }
+
+        for bad_token in [
+            "short-15-chars!",
+            "has space in token!!",
+            "non-ascii-token-é!",
+        ] {
+            let mut j = valid_json.clone();
+            j["upstream"]["auth_context"]["check_token"] = serde_json::json!(bad_token);
+            assert!(
+                GatewayConfig::from_json_str(&j.to_string(), Path::new("/tmp")).is_err(),
+                "expected check_token {bad_token:?} to fail"
+            );
+        }
+
+        let mut no_bearers = valid_json.clone();
+        no_bearers["upstream"]["bearer_tokens"] = serde_json::json!([]);
+        assert!(GatewayConfig::from_json_str(&no_bearers.to_string(), Path::new("/tmp")).is_err());
+
+        let mut unknown_field = valid_json.clone();
+        unknown_field["upstream"]["auth_context"]["extra"] = serde_json::json!(true);
+        assert!(
+            GatewayConfig::from_json_str(&unknown_field.to_string(), Path::new("/tmp")).is_err()
+        );
+
+        let stdio_with_ac = serde_json::json!({
+            "listen": "127.0.0.1:8080",
+            "public_url": "https://mcp.example.com",
+            "state_path": "state.json",
+            "oauth": { "owner_password_hash": hash },
+            "upstream": {
+                "transport": "stdio",
+                "command": "echo",
+                "auth_context": {
+                    "check_listen": "127.0.0.1:8083",
+                    "check_token": "0123456789abcdef_check"
+                }
+            }
+        });
+        assert!(
+            GatewayConfig::from_json_str(&stdio_with_ac.to_string(), Path::new("/tmp")).is_err()
+        );
     }
 }

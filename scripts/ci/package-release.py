@@ -17,7 +17,7 @@ with tempfile.TemporaryDirectory(prefix="gateway-release-") as work:
     root = Path(work)
     package = root / name
     package.mkdir()
-    for source in (binary, "LICENSE", "README.md"):
+    for source in (binary, "LICENSE", "NOTICE", "README.md"):
         shutil.copy2(source, package)
 
     archive = shutil.make_archive(
@@ -28,6 +28,9 @@ with tempfile.TemporaryDirectory(prefix="gateway-release-") as work:
     )
     extracted = root / "extracted"
     shutil.unpack_archive(archive, extracted)
+    for doc in ("LICENSE", "NOTICE", "README.md"):
+        if not (extracted / name / doc).is_file():
+            raise SystemExit(f"missing {doc} in extracted archive")
     exe = extracted / name / Path(binary).name
     actual = subprocess.check_output([exe, "--version"], text=True, timeout=30).strip()
     expected = f"oauth2-mcp-gateway {version}"
