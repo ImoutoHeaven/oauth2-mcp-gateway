@@ -1007,10 +1007,7 @@ mod windows_platform {
                 return Ok(false);
             }
         }
-        if require_inheritable && !has_inheritable_ace {
-            return Ok(false);
-        }
-        Ok(true)
+        Ok(!require_inheritable || has_inheritable_ace)
     }
 
     fn inspect_handle_security(
