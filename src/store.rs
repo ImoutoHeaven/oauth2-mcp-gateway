@@ -11,8 +11,24 @@ use std::time::{SystemTime, UNIX_EPOCH};
 pub const STATE_VERSION: u32 = 1;
 pub const MAX_GRACE_REFRESHES: usize = 16;
 const MAX_STATE_FILE_BYTES: u64 = 64 * 1024 * 1024;
+const READ_EOF_PROBE_SLACK_BYTES: usize = 64;
+const READ_CHUNK_BYTES: usize = 8192;
 
 static MONOTONIC_UNIX_FLOOR: AtomicU64 = AtomicU64::new(0);
+
+#[derive(Default)]
+struct CountingWriter(u64);
+
+impl Write for CountingWriter {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.0 = self.0.saturating_add(buf.len() as u64);
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
 
 struct ZeroizingBuf(Vec<u8>);
 
@@ -25,8 +41,69 @@ impl ZeroizingBuf {
         &self.0
     }
 
-    fn as_mut_vec(&mut self) -> &mut Vec<u8> {
-        &mut self.0
+    fn grow_zeroizing(&mut self, min_capacity: usize) {
+        if min_capacity <= self.0.capacity() {
+            return;
+        }
+        let doubled = self.0.capacity().saturating_mul(2);
+        let target_cap = min_capacity.max(doubled).max(READ_EOF_PROBE_SLACK_BYTES);
+        let mut next = Vec::with_capacity(target_cap);
+        next.extend_from_slice(&self.0);
+        zeroize_bytes(&mut self.0);
+        self.0.clear();
+        self.0 = next;
+    }
+
+    fn extend_zeroizing(&mut self, chunk: &[u8]) {
+        let needed = self.0.len().saturating_add(chunk.len());
+        if needed > self.0.capacity() {
+            self.grow_zeroizing(needed);
+        }
+        self.0.extend_from_slice(chunk);
+    }
+
+    fn read_to_end_bounded<R: Read>(
+        &mut self,
+        mut reader: R,
+        max_bytes: u64,
+    ) -> std::io::Result<()> {
+        struct ZeroizingChunk([u8; READ_CHUNK_BYTES]);
+
+        impl Drop for ZeroizingChunk {
+            fn drop(&mut self) {
+                zeroize_bytes(&mut self.0);
+            }
+        }
+
+        let max_plus_one = usize::try_from(max_bytes)
+            .unwrap_or(usize::MAX)
+            .saturating_add(1);
+        let mut chunk = ZeroizingChunk([0u8; READ_CHUNK_BYTES]);
+        loop {
+            let remaining = max_plus_one.saturating_sub(self.0.len());
+            if remaining == 0 {
+                break;
+            }
+            let read_cap = chunk.0.len().min(remaining);
+            match reader.read(&mut chunk.0[..read_cap]) {
+                Ok(0) => break,
+                Ok(n) => self.extend_zeroizing(&chunk.0[..n]),
+                Err(err) if err.kind() == std::io::ErrorKind::Interrupted => continue,
+                Err(err) => return Err(err),
+            }
+        }
+        Ok(())
+    }
+}
+
+impl Write for ZeroizingBuf {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.extend_zeroizing(buf);
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
     }
 }
 
@@ -231,17 +308,24 @@ impl StateStore {
 
         validate_target_path(&self.path)?;
 
-        let approx_cap = 256usize
-            .saturating_add(state.clients.len().saturating_mul(384))
-            .saturating_add(state.grants.len().saturating_mul(512));
-        let mut payload = ZeroizingBuf::with_capacity(approx_cap);
-        serde_json::to_writer_pretty(payload.as_mut_vec(), state)
+        let mut counter = CountingWriter::default();
+        serde_json::to_writer_pretty(&mut counter, state)
             .map_err(|e| format!("cannot serialize OAuth state: {e}"))?;
-        if payload.as_slice().len() as u64 > MAX_STATE_FILE_BYTES {
+        if counter.0 > MAX_STATE_FILE_BYTES {
             return Err(format!(
                 "serialized OAuth state exceeds maximum size limit ({MAX_STATE_FILE_BYTES} bytes)"
             ));
         }
+        let exact_len = usize::try_from(counter.0).map_err(|_| {
+            format!(
+                "serialized OAuth state exceeds maximum size limit ({MAX_STATE_FILE_BYTES} bytes)"
+            )
+        })?;
+        let mut payload = ZeroizingBuf::with_capacity(exact_len);
+        serde_json::to_writer_pretty(&mut payload, state)
+            .map_err(|e| format!("cannot serialize OAuth state: {e}"))?;
+        debug_assert_eq!(payload.as_slice().len(), exact_len);
+
         let base_name = base_file_name(&self.path)?;
         let suffix = random_token_b64(12)?;
         let tmp_path = parent.join(format!(".{base_name}.tmp.{suffix}"));
@@ -316,14 +400,39 @@ fn create_state_dir(parent: &Path) -> Result<(), String> {
     builder
         .create(parent)
         .map_err(|e| format!("cannot create state directory {}: {e}", parent.display()))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+        let dir_file = OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
+            .open(parent)
+            .map_err(|e| format!("cannot open state directory {}: {e}", parent.display()))?;
+        let meta = dir_file
+            .metadata()
+            .map_err(|e| format!("cannot stat state directory {}: {e}", parent.display()))?;
+        if (meta.permissions().mode() & 0o777) != 0o700 {
+            dir_file
+                .set_permissions(fs::Permissions::from_mode(0o700))
+                .map_err(|e| {
+                    format!(
+                        "cannot enforce 0700 on state directory {}: {e}",
+                        parent.display()
+                    )
+                })?;
+        }
+    }
     #[cfg(windows)]
-    for dir in missing_dirs.iter().rev() {
-        windows_platform::apply_owner_only_dacl(dir, true).map_err(|e| {
-            format!(
-                "cannot set owner-only DACL on state directory {}: {e}",
-                dir.display()
-            )
-        })?;
+    {
+        for dir in missing_dirs.iter().skip(1).rev() {
+            windows_platform::apply_owner_only_dacl(dir, true).map_err(|e| {
+                format!(
+                    "cannot set owner-only DACL on state directory {}: {e}",
+                    dir.display()
+                )
+            })?;
+        }
+        windows_platform::verify_and_enforce_state_dir_security(parent)?;
     }
     Ok(())
 }
@@ -452,10 +561,10 @@ fn read_state_file(path: &Path) -> Result<PersistedState, String> {
             path.display()
         ));
     }
-    let mut buf =
-        ZeroizingBuf::with_capacity((meta.len() as usize).min(MAX_STATE_FILE_BYTES as usize));
-    file.take(MAX_STATE_FILE_BYTES + 1)
-        .read_to_end(buf.as_mut_vec())
+    let file_len = usize::try_from(meta.len())
+        .map_err(|_| format!("state file {} exceeds maximum size limit", path.display()))?;
+    let mut buf = ZeroizingBuf::with_capacity(file_len.saturating_add(READ_EOF_PROBE_SLACK_BYTES));
+    buf.read_to_end_bounded(file, MAX_STATE_FILE_BYTES)
         .map_err(|e| format!("cannot read state file {}: {e}", path.display()))?;
     if buf.as_slice().len() as u64 > MAX_STATE_FILE_BYTES {
         return Err(format!(
@@ -532,7 +641,7 @@ fn sync_directory(dir: &Path) -> Result<(), String> {
     }
     #[cfg(not(unix))]
     {
-        // Windows does not support File::open on directories.
+        // Windows does not support fsync on directory handles.
         let _ = dir;
     }
     Ok(())
@@ -566,14 +675,15 @@ mod windows_platform {
     };
     use windows_sys::Win32::Storage::FileSystem::{
         BY_HANDLE_FILE_INFORMATION, CREATE_NEW, CreateFileW, FILE_ATTRIBUTE_DIRECTORY,
-        FILE_ATTRIBUTE_REPARSE_POINT, FILE_FLAG_OPEN_REPARSE_POINT, FILE_READ_ATTRIBUTES,
-        FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE, GetFileInformationByHandle,
-        MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH, MoveFileExW, OPEN_EXISTING,
-        READ_CONTROL, WRITE_DAC,
+        FILE_ATTRIBUTE_REPARSE_POINT, FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT,
+        FILE_READ_ATTRIBUTES, FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE,
+        GetFileInformationByHandle, MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH, MoveFileExW,
+        OPEN_EXISTING, READ_CONTROL, WRITE_DAC,
     };
     use windows_sys::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
 
     const ACCESS_ALLOWED_ACE_KIND: u8 = 0;
+    const CONTAINER_AND_OBJECT_INHERIT_FLAGS: u8 = 0x03;
     const SID_HEADER_BYTES: usize = 8;
     const SID_MAX_SUB_AUTHORITIES: usize = 15;
 
@@ -748,7 +858,10 @@ mod windows_platform {
         Ok(info)
     }
 
-    fn validate_handle_info(path: &Path, info: &BY_HANDLE_FILE_INFORMATION) -> Result<(), String> {
+    fn validate_file_handle_info(
+        path: &Path,
+        info: &BY_HANDLE_FILE_INFORMATION,
+    ) -> Result<(), String> {
         if (info.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT) != 0 {
             return Err(format!(
                 "state_path {} must not be a reparse point",
@@ -765,6 +878,25 @@ mod windows_platform {
             return Err(format!(
                 "state_path {} must not have multiple hard links",
                 path.display()
+            ));
+        }
+        Ok(())
+    }
+
+    fn validate_dir_handle_info(
+        dir: &Path,
+        info: &BY_HANDLE_FILE_INFORMATION,
+    ) -> Result<(), String> {
+        if (info.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT) != 0 {
+            return Err(format!(
+                "state directory {} must not be a reparse point",
+                dir.display()
+            ));
+        }
+        if (info.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) == 0 {
+            return Err(format!(
+                "state directory {} must be a directory",
+                dir.display()
             ));
         }
         Ok(())
@@ -797,7 +929,7 @@ mod windows_platform {
         let file = unsafe { File::from_raw_handle(handle) };
         let info = query_handle_info(&file)
             .map_err(|e| format!("cannot inspect state_path {}: {e}", path.display()))?;
-        validate_handle_info(path, &info)
+        validate_file_handle_info(path, &info)
     }
 
     fn is_trusted_sid(candidate: PSID, current_user_sid: PSID) -> bool {
@@ -815,6 +947,7 @@ mod windows_platform {
         sd: PSECURITY_DESCRIPTOR,
         dacl: *const ACL,
         current_user_sid: PSID,
+        require_inheritable: bool,
     ) -> io::Result<bool> {
         let mut control: u16 = 0;
         let mut revision: u32 = 0;
@@ -844,6 +977,7 @@ mod windows_platform {
             return Ok(false);
         }
         let sid_offset = std::mem::offset_of!(ACCESS_ALLOWED_ACE, SidStart);
+        let mut has_inheritable_ace = false;
         for ace_index in 0..acl_size.AceCount {
             let mut ace_ptr: *mut c_void = std::ptr::null_mut();
             if unsafe { GetAce(dacl, ace_index, &mut ace_ptr) } == 0 || ace_ptr.is_null() {
@@ -854,6 +988,11 @@ mod windows_platform {
                 || (header.AceSize as usize) < sid_offset + SID_HEADER_BYTES
             {
                 return Ok(false);
+            }
+            if (header.AceFlags & CONTAINER_AND_OBJECT_INHERIT_FLAGS)
+                == CONTAINER_AND_OBJECT_INHERIT_FLAGS
+            {
+                has_inheritable_ace = true;
             }
             let allow_ace = unsafe { &*(ace_ptr as *const ACCESS_ALLOWED_ACE) };
             let trustee_sid = std::ptr::addr_of!(allow_ace.SidStart) as PSID;
@@ -868,12 +1007,16 @@ mod windows_platform {
                 return Ok(false);
             }
         }
+        if require_inheritable && !has_inheritable_ace {
+            return Ok(false);
+        }
         Ok(true)
     }
 
     fn inspect_handle_security(
         handle: HANDLE,
         current_user_sid: PSID,
+        require_inheritable: bool,
     ) -> io::Result<HandleSecurityState> {
         let mut owner_sid: PSID = std::ptr::null_mut();
         let mut dacl: *mut ACL = std::ptr::null_mut();
@@ -897,7 +1040,7 @@ mod windows_platform {
         if !is_trusted_sid(owner_sid, current_user_sid) {
             return Ok(HandleSecurityState::UntrustedOwner);
         }
-        if is_strict_protected_dacl(sd.0, dacl, current_user_sid)? {
+        if is_strict_protected_dacl(sd.0, dacl, current_user_sid, require_inheritable)? {
             Ok(HandleSecurityState::StrictProtected)
         } else {
             Ok(HandleSecurityState::NeedsTightening)
@@ -910,22 +1053,28 @@ mod windows_platform {
             && a.nFileIndexLow == b.nFileIndexLow
     }
 
-    fn tighten_dacl_for_same_file(
+    fn tighten_dacl_for_same_object(
         path: &Path,
         expected: &BY_HANDLE_FILE_INFORMATION,
         user_sid_sddl: &str,
+        is_dir: bool,
     ) -> io::Result<()> {
-        let desc = owner_only_descriptor(user_sid_sddl, false)?;
+        let desc = owner_only_descriptor(user_sid_sddl, is_dir)?;
         let dacl = extract_dacl(&desc)?;
         let wpath = wide(path.as_os_str())?;
+        let flags = if is_dir {
+            FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT
+        } else {
+            FILE_FLAG_OPEN_REPARSE_POINT
+        };
         let handle = unsafe {
             CreateFileW(
                 wpath.as_ptr(),
-                READ_CONTROL | WRITE_DAC,
+                FILE_READ_ATTRIBUTES | READ_CONTROL | WRITE_DAC,
                 FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
                 std::ptr::null(),
                 OPEN_EXISTING,
-                FILE_FLAG_OPEN_REPARSE_POINT,
+                flags,
                 std::ptr::null_mut(),
             )
         };
@@ -934,13 +1083,18 @@ mod windows_platform {
         }
         let dac_file = unsafe { File::from_raw_handle(handle) };
         let actual = query_handle_info(&dac_file)?;
-        if !same_file_identity(expected, &actual)
-            || (actual.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT) != 0
-            || actual.nNumberOfLinks != 1
-        {
+        let valid_kind = if is_dir {
+            (actual.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT) == 0
+                && (actual.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) != 0
+        } else {
+            (actual.dwFileAttributes & (FILE_ATTRIBUTE_DIRECTORY | FILE_ATTRIBUTE_REPARSE_POINT))
+                == 0
+                && actual.nNumberOfLinks == 1
+        };
+        if !same_file_identity(expected, &actual) || !valid_kind {
             return Err(io::Error::new(
                 io::ErrorKind::PermissionDenied,
-                "state file changed during DACL enforcement",
+                "filesystem target changed during DACL enforcement",
             ));
         }
         let status = unsafe {
@@ -960,10 +1114,78 @@ mod windows_platform {
         Ok(())
     }
 
+    pub fn verify_and_enforce_state_dir_security(dir: &Path) -> Result<(), String> {
+        let wdir = wide(dir.as_os_str())
+            .map_err(|e| format!("cannot inspect state directory {}: {e}", dir.display()))?;
+        let handle = unsafe {
+            CreateFileW(
+                wdir.as_ptr(),
+                FILE_READ_ATTRIBUTES | READ_CONTROL,
+                FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                std::ptr::null(),
+                OPEN_EXISTING,
+                FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT,
+                std::ptr::null_mut(),
+            )
+        };
+        if handle == INVALID_HANDLE_VALUE {
+            return Err(format!(
+                "cannot open state directory {}: {}",
+                dir.display(),
+                io::Error::last_os_error()
+            ));
+        }
+        let dir_file = unsafe { File::from_raw_handle(handle) };
+        let info = query_handle_info(&dir_file)
+            .map_err(|e| format!("cannot inspect state directory {}: {e}", dir.display()))?;
+        validate_dir_handle_info(dir, &info)?;
+
+        let user = ProcessUserSid::current().map_err(|e| {
+            format!(
+                "cannot query process user SID for state directory {}: {e}",
+                dir.display()
+            )
+        })?;
+        match inspect_handle_security(dir_file.as_raw_handle(), user.psid(), true).map_err(|e| {
+            format!(
+                "cannot inspect security descriptor on {}: {e}",
+                dir.display()
+            )
+        })? {
+            HandleSecurityState::StrictProtected => Ok(()),
+            HandleSecurityState::UntrustedOwner => Err(format!(
+                "state directory {} is owned by an untrusted principal",
+                dir.display()
+            )),
+            HandleSecurityState::NeedsTightening => {
+                tighten_dacl_for_same_object(dir, &info, &user.sddl_sid, true).map_err(|e| {
+                    format!(
+                        "cannot enforce protected owner-only DACL on state directory {}: {e}",
+                        dir.display()
+                    )
+                })?;
+                let recheck = inspect_handle_security(dir_file.as_raw_handle(), user.psid(), true)
+                    .map_err(|e| {
+                        format!(
+                            "cannot re-verify security descriptor on state directory {}: {e}",
+                            dir.display()
+                        )
+                    })?;
+                if recheck != HandleSecurityState::StrictProtected {
+                    return Err(format!(
+                        "state directory {} failed protected DACL verification after tightening",
+                        dir.display()
+                    ));
+                }
+                Ok(())
+            }
+        }
+    }
+
     pub fn verify_and_enforce_state_file_security(file: &File, path: &Path) -> Result<(), String> {
         let info = query_handle_info(file)
             .map_err(|e| format!("cannot inspect open state file {}: {e}", path.display()))?;
-        validate_handle_info(path, &info)?;
+        validate_file_handle_info(path, &info)?;
 
         let user = ProcessUserSid::current().map_err(|e| {
             format!(
@@ -971,7 +1193,7 @@ mod windows_platform {
                 path.display()
             )
         })?;
-        match inspect_handle_security(file.as_raw_handle(), user.psid()).map_err(|e| {
+        match inspect_handle_security(file.as_raw_handle(), user.psid(), false).map_err(|e| {
             format!(
                 "cannot inspect security descriptor on {}: {e}",
                 path.display()
@@ -983,14 +1205,14 @@ mod windows_platform {
                 path.display()
             )),
             HandleSecurityState::NeedsTightening => {
-                tighten_dacl_for_same_file(path, &info, &user.sddl_sid).map_err(|e| {
+                tighten_dacl_for_same_object(path, &info, &user.sddl_sid, false).map_err(|e| {
                     format!(
                         "cannot enforce protected owner-only DACL on state file {}: {e}",
                         path.display()
                     )
                 })?;
-                let recheck =
-                    inspect_handle_security(file.as_raw_handle(), user.psid()).map_err(|e| {
+                let recheck = inspect_handle_security(file.as_raw_handle(), user.psid(), false)
+                    .map_err(|e| {
                         format!(
                             "cannot re-verify security descriptor on state file {}: {e}",
                             path.display()
@@ -1081,7 +1303,10 @@ mod windows_platform {
     }
 
     #[cfg(test)]
-    pub(super) fn sddl_satisfies_strict_dacl(sddl: &str) -> io::Result<bool> {
+    pub(super) fn sddl_satisfies_strict_dacl(
+        sddl: &str,
+        require_inheritable: bool,
+    ) -> io::Result<bool> {
         let user = ProcessUserSid::current()?;
         let desc = descriptor_from_sddl(sddl)?;
         let mut present = 0;
@@ -1097,12 +1322,37 @@ mod windows_platform {
         } else {
             dacl.cast_const()
         };
-        is_strict_protected_dacl(desc.0, dacl_ptr, user.psid())
+        is_strict_protected_dacl(desc.0, dacl_ptr, user.psid(), require_inheritable)
     }
 
     #[cfg(test)]
     pub(super) fn current_sddl_sid() -> io::Result<String> {
         Ok(ProcessUserSid::current()?.sddl_sid)
+    }
+
+    #[cfg(test)]
+    pub(super) fn is_dir_already_strict_protected(dir: &Path) -> io::Result<bool> {
+        let wdir = wide(dir.as_os_str())?;
+        let handle = unsafe {
+            CreateFileW(
+                wdir.as_ptr(),
+                FILE_READ_ATTRIBUTES | READ_CONTROL,
+                FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                std::ptr::null(),
+                OPEN_EXISTING,
+                FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT,
+                std::ptr::null_mut(),
+            )
+        };
+        if handle == INVALID_HANDLE_VALUE {
+            return Err(io::Error::last_os_error());
+        }
+        let dir_file = unsafe { File::from_raw_handle(handle) };
+        let user = ProcessUserSid::current()?;
+        Ok(
+            inspect_handle_security(dir_file.as_raw_handle(), user.psid(), true)?
+                == HandleSecurityState::StrictProtected,
+        )
     }
 }
 
@@ -1177,6 +1427,7 @@ mod tests {
                 fs::metadata(parent).unwrap().permissions().mode() & 0o777,
                 0o700
             );
+            fs::set_permissions(parent, fs::Permissions::from_mode(0o755)).unwrap();
             fs::set_permissions(&nested, fs::Permissions::from_mode(0o644)).unwrap();
         }
 
@@ -1189,9 +1440,19 @@ mod tests {
                 fs::metadata(&nested).unwrap().permissions().mode() & 0o777,
                 0o600
             );
+            // Saving into a pre-existing permissive directory must tighten it back to 0700.
+            let precreated = dir.path().join("precreated");
+            fs::create_dir(&precreated).unwrap();
+            fs::set_permissions(&precreated, fs::Permissions::from_mode(0o755)).unwrap();
+            let (_, _) = StateStore::open(precreated.join("oauth_state.json"), unix_now()).unwrap();
+            assert_eq!(
+                fs::metadata(&precreated).unwrap().permissions().mode() & 0o777,
+                0o700
+            );
         }
         #[cfg(windows)]
         {
+            assert!(windows_platform::is_dir_already_strict_protected(parent).unwrap());
             let file = open_state_for_read(&nested).unwrap();
             windows_platform::verify_and_enforce_state_file_security(&file, &nested).unwrap();
         }
@@ -1257,14 +1518,48 @@ mod tests {
     }
 
     #[test]
-    fn zeroizing_buf_clears_sensitive_bytes_before_release() {
-        let mut buf = ZeroizingBuf::with_capacity(64);
-        buf.as_mut_vec()
-            .extend_from_slice(b"{\"family_key_b64\":\"super_secret_key_material\"}");
-        assert!(!buf.as_slice().is_empty());
-        zeroize_bytes(&mut buf.0);
-        assert!(buf.0.iter().all(|&b| b == 0));
-        drop(buf);
+    fn counting_writer_and_zeroizing_buf_avoid_unzeroized_reallocations() {
+        let state = sample_state(1_760_000_000);
+        let mut counter = CountingWriter::default();
+        serde_json::to_writer_pretty(&mut counter, &state).unwrap();
+        let exact_len = usize::try_from(counter.0).unwrap();
+
+        let mut payload = ZeroizingBuf::with_capacity(exact_len);
+        let write_ptr_before = payload.0.as_ptr();
+        let write_cap_before = payload.0.capacity();
+        serde_json::to_writer_pretty(&mut payload, &state).unwrap();
+        assert_eq!(payload.as_slice().len(), exact_len);
+        assert_eq!(payload.0.capacity(), write_cap_before);
+        assert_eq!(payload.0.as_ptr(), write_ptr_before);
+
+        let dir = tempfile::TempDir::new().unwrap();
+        let file_path = dir.path().join("exact_read.json");
+        fs::write(&file_path, payload.as_slice()).unwrap();
+
+        let file = fs::File::open(&file_path).unwrap();
+        let meta_len = usize::try_from(file.metadata().unwrap().len()).unwrap();
+        let mut read_buf =
+            ZeroizingBuf::with_capacity(meta_len.saturating_add(READ_EOF_PROBE_SLACK_BYTES));
+        let read_ptr_before = read_buf.0.as_ptr();
+        let read_cap_before = read_buf.0.capacity();
+        read_buf
+            .read_to_end_bounded(file, MAX_STATE_FILE_BYTES)
+            .unwrap();
+        assert_eq!(read_buf.as_slice(), payload.as_slice());
+        assert_eq!(read_buf.0.capacity(), read_cap_before);
+        assert_eq!(read_buf.0.as_ptr(), read_ptr_before);
+
+        // Forced growth path must preserve bytes and zeroize on release.
+        let mut small = ZeroizingBuf::with_capacity(8);
+        small
+            .write_all(b"{\"family_key_b64\":\"0123456789abcdef0123456789abcdef\"}")
+            .unwrap();
+        assert_eq!(
+            small.as_slice(),
+            b"{\"family_key_b64\":\"0123456789abcdef0123456789abcdef\"}"
+        );
+        zeroize_bytes(&mut small.0);
+        assert!(small.0.iter().all(|&b| b == 0));
     }
 
     #[test]
@@ -1305,6 +1600,16 @@ mod tests {
             "unexpected error: {sym_err}"
         );
 
+        let real_dir = dir.path().join("real_dir");
+        fs::create_dir(&real_dir).unwrap();
+        let sym_dir = dir.path().join("sym_dir");
+        symlink(&real_dir, &sym_dir).unwrap();
+        let dir_sym_err = StateStore::open(sym_dir.join("state.json"), unix_now()).unwrap_err();
+        assert!(
+            dir_sym_err.contains("state directory"),
+            "unexpected error: {dir_sym_err}"
+        );
+
         let hard_a = dir.path().join("hard_a.json");
         let hard_b = dir.path().join("hard_b.json");
         let (store, _) = StateStore::open(hard_a.clone(), unix_now()).unwrap();
@@ -1326,24 +1631,34 @@ mod tests {
     #[test]
     fn windows_rejects_hard_links_and_validates_dacl_descriptors() {
         let sid = windows_platform::current_sddl_sid().unwrap();
-        let strict = build_owner_only_sddl(&sid, false);
-        assert!(windows_platform::sddl_satisfies_strict_dacl(&strict).unwrap());
+        let strict_file = build_owner_only_sddl(&sid, false);
+        assert!(windows_platform::sddl_satisfies_strict_dacl(&strict_file, false).unwrap());
+        assert!(!windows_platform::sddl_satisfies_strict_dacl(&strict_file, true).unwrap());
+
+        let strict_dir = build_owner_only_sddl(&sid, true);
+        assert!(windows_platform::sddl_satisfies_strict_dacl(&strict_dir, true).unwrap());
 
         // Unprotected DACL (missing P flag) must be flagged as non-strict.
         let unprotected = format!("D:(A;;GA;;;{sid})(A;;GA;;;SY)(A;;GA;;;BA)");
-        assert!(!windows_platform::sddl_satisfies_strict_dacl(&unprotected).unwrap());
+        assert!(!windows_platform::sddl_satisfies_strict_dacl(&unprotected, false).unwrap());
 
         // Protected DACL granting read access to Everyone (WD) must be rejected as non-strict.
         let world_readable = format!("D:P(A;;GA;;;{sid})(A;;FR;;;WD)");
-        assert!(!windows_platform::sddl_satisfies_strict_dacl(&world_readable).unwrap());
+        assert!(!windows_platform::sddl_satisfies_strict_dacl(&world_readable, false).unwrap());
 
-        // Seeded state file with inherited ACL must be tightened on open, and hard links rejected.
+        // Pre-created directory with inherited permissive ACL must be tightened on open/save.
         let dir = tempfile::TempDir::new().unwrap();
-        let seeded = dir.path().join("seeded.json");
+        let precreated_dir = dir.path().join("precreated");
+        fs::create_dir(&precreated_dir).unwrap();
+        assert!(!windows_platform::is_dir_already_strict_protected(&precreated_dir).unwrap());
+
+        let seeded = precreated_dir.join("seeded.json");
         fs::write(&seeded, r#"{"version":1,"clients":[],"grants":[]}"#).unwrap();
         let (store, _) = StateStore::open(seeded.clone(), unix_now()).unwrap();
+        store.save(&PersistedState::empty()).unwrap();
+        assert!(windows_platform::is_dir_already_strict_protected(&precreated_dir).unwrap());
 
-        let linked = dir.path().join("linked.json");
+        let linked = precreated_dir.join("linked.json");
         fs::hard_link(&seeded, &linked).unwrap();
         let open_err = StateStore::open(seeded, unix_now()).unwrap_err();
         assert!(
