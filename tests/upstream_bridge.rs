@@ -3855,7 +3855,7 @@ gate_events = {}
 burst_flushed_events = {}
 waiter_cond = threading.Condition()
 gate_waiter_counts = {}
-spew_after_init = int(os.environ.get("MOCK_SPEW_AFTER_INIT_BYTES", "0"))
+startup_log_bytes = int(os.environ.get("MOCK_STARTUP_LOG_BYTES", "0"))
 
 def write_raw(data: bytes):
     with out_lock:
@@ -3872,6 +3872,11 @@ def build_tail_id_line(req_id, target_bytes: int) -> bytes:
     pad_len = target_bytes - len(prefix) - len(suffix)
     assert pad_len >= 0, f"target_bytes {target_bytes} too small"
     return prefix + (b"A" * pad_len) + suffix
+
+if startup_log_bytes > 0:
+    write_raw((json.dumps({"jsonrpc": "2.0", "method": "notifications/message", "params": {
+        "level": "info", "logger": "startup", "data": "L" * startup_log_bytes
+    }}) + "\n").encode("utf-8"))
 
 for raw_line in sys.stdin.buffer:
     line = raw_line.decode("utf-8").strip()
@@ -3893,8 +3898,6 @@ for raw_line in sys.stdin.buffer:
             },
         }
         out = (json.dumps(resp, separators=(",", ":")) + "\n").encode("utf-8")
-        if spew_after_init > 0:
-            out += b'{"jsonrpc":"2.0","unsolicited":"' + (b"U" * spew_after_init) + b'"}\n'
         write_raw(out)
         continue
 
@@ -5268,10 +5271,10 @@ async fn stdio_unsolicited_large_output_sessionless_hard_rejects() {
         gw_cancel.cancel();
     }
 
-    // 3. Sessionless dead-session mapping when child spews > max_control_line_bytes right after `initialize` (`UnexpectedLargeOutput` preserved through `register_request` / `send_request_line`).
+    // 3. A standard startup log above the configured control capacity keeps its 502 classification.
     {
         let mut spew_env = BTreeMap::new();
-        spew_env.insert("MOCK_SPEW_AFTER_INIT_BYTES".to_owned(), "600".to_owned());
+        spew_env.insert("MOCK_STARTUP_LOG_BYTES".to_owned(), "600".to_owned());
         let budget = ByteBudget::new(64 * 1024);
         let stdio_up = Arc::new(
             StdioUpstream::with_limits(
@@ -7373,7 +7376,7 @@ async fn stdio_server_discover_and_sessionless_meta_forwarding() {
         let native_flag = if native_discover { "True" } else { "False" };
         let script = format!(
             r#"import json, os, sys
-log_path = os.path.join({dir:?}, f"init_{{os.getpid()}}.json")
+log_path = os.path.join({dir:?}, f"request_{{os.getpid()}}.jsonl")
 for raw in sys.stdin:
     line = raw.strip()
     if not line:
@@ -7381,9 +7384,13 @@ for raw in sys.stdin:
     msg = json.loads(line)
     m = msg.get("method")
     mid = msg.get("id")
+    with open(log_path, "a", encoding="utf-8") as f:
+        f.write(json.dumps(msg) + "\n")
     if m == "initialize":
-        with open(log_path, "w", encoding="utf-8") as f:
-            json.dump({{"pid": os.getpid(), "params": msg.get("params")}}, f)
+        if "{proto_ver}" == "2026-07-28":
+            print(json.dumps({{"jsonrpc": "2.0", "id": mid,
+                "error": {{"code": -32601, "message": "Use per-request metadata"}}}}), flush=True)
+            continue
         resp = {{
             "jsonrpc": "2.0",
             "id": mid,
@@ -7402,7 +7409,8 @@ for raw in sys.stdin:
                 "jsonrpc": "2.0",
                 "id": mid,
                 "result": {{
-                    "supportedVersions": ["{proto_ver}"],
+                    "resultType": "complete",
+                    "supportedVersions": ["2026-07-28", "2025-11-25"],
                     "capabilities": {{"tools": {{"listChanged": True}}}},
                     "ttlMs": 15000,
                     "cacheScope": "private",
@@ -7570,7 +7578,7 @@ for raw in sys.stdin:
     assert_eq!(mod_val["result"]["resultType"], "complete");
     assert_eq!(
         mod_val["result"]["supportedVersions"],
-        json!(["2026-07-28"])
+        json!(["2026-07-28", "2025-11-25"])
     );
     assert_eq!(
         mod_val["result"]["_meta"]["io.modelcontextprotocol/serverInfo"]["name"],
@@ -7578,20 +7586,18 @@ for raw in sys.stdin:
     );
     let disc_pid = mod_val["result"]["_meta"]["pid"].as_u64().unwrap() as u32;
     assert!(wait_process_gone(disc_pid).await);
-    let disc_init_log: Value = serde_json::from_str(
-        &std::fs::read_to_string(tmp.path().join(format!("init_{disc_pid}.json"))).unwrap(),
-    )
-    .unwrap();
-    assert_eq!(
-        disc_init_log["params"]["capabilities"],
-        json!({"roots": {"listChanged": true}})
-    );
-    assert_eq!(
-        disc_init_log["params"]["clientInfo"],
-        json!({"name": "rmcp-probe", "version": "3.9.0"})
-    );
+    let disc_requests: Vec<Value> =
+        std::fs::read_to_string(tmp.path().join(format!("request_{disc_pid}.jsonl")))
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+    assert_eq!(disc_requests.len(), 1);
+    assert_eq!(disc_requests[0]["method"], "server/discover");
+    assert_eq!(disc_requests[0]["params"], valid_discover["params"]);
+    assert!(mod_val["result"].get("instructions").is_none());
 
-    // Ordinary handle_sessionless also forwards clientCapabilities and clientInfo from _meta.
+    // Each ordinary modern request keeps its own metadata and child lifetime.
     let sl_call = json!({
         "jsonrpc": "2.0",
         "id": 77,
@@ -7621,48 +7627,55 @@ for raw in sys.stdin:
         serde_json::from_slice(&sl_resp.into_body().collect().await.unwrap().to_bytes()).unwrap();
     let sl_pid = sl_val["result"]["pid"].as_u64().unwrap() as u32;
     assert!(wait_process_gone(sl_pid).await);
-    let sl_init_log: Value = serde_json::from_str(
-        &std::fs::read_to_string(tmp.path().join(format!("init_{sl_pid}.json"))).unwrap(),
-    )
-    .unwrap();
-    assert_eq!(
-        sl_init_log["params"]["capabilities"],
-        json!({"elicitation": {}})
-    );
-    assert_eq!(
-        sl_init_log["params"]["clientInfo"],
-        json!({"name": "sl-caller", "version": "2.0.0"})
-    );
+    let sl_requests: Vec<Value> =
+        std::fs::read_to_string(tmp.path().join(format!("request_{sl_pid}.jsonl")))
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+    assert_eq!(sl_requests.len(), 1);
+    assert_eq!(sl_requests[0]["method"], "tools/call");
+    assert_eq!(sl_requests[0]["params"], sl_call["params"]);
     mod_up.shutdown().await;
     mod_cancel.cancel();
 
-    // 3. Modern >= 2026-07-28 stdio child without post-init server/discover handler synthesizes DiscoverResult.
-    let synth_script = write_discover_script("synth_disc.py", "2026-07-28", false);
-    let (syn_up, syn_addr, syn_cancel) = make_stdio_harness(&synth_script).await;
-    let syn_resp = client
+    // A dual-era child keeps its legacy initialize path separate from modern discovery.
+    let dual_script = write_discover_script("dual_disc.py", "2025-11-25", true);
+    let (dual_up, dual_addr, dual_cancel) = make_stdio_harness(&dual_script).await;
+    let dual_resp = client
         .request(
             Request::builder()
                 .method(Method::POST)
-                .uri(format!("http://{syn_addr}/mcp"))
+                .uri(format!("http://{dual_addr}/mcp"))
                 .header(header::CONTENT_TYPE, "application/json")
                 .body(bytes_body(valid_discover.to_string()))
                 .unwrap(),
         )
         .await
         .unwrap();
-    assert_eq!(syn_resp.status(), StatusCode::OK);
-    let syn_val: Value =
-        serde_json::from_slice(&syn_resp.into_body().collect().await.unwrap().to_bytes()).unwrap();
-    assert_eq!(syn_val["result"]["resultType"], "complete");
+    assert_eq!(dual_resp.status(), StatusCode::OK);
+    let dual_val: Value =
+        serde_json::from_slice(&dual_resp.into_body().collect().await.unwrap().to_bytes()).unwrap();
+    assert_eq!(dual_val["id"], valid_discover["id"]);
     assert_eq!(
-        syn_val["result"]["supportedVersions"],
-        json!(["2026-07-28"])
+        dual_val["result"]["supportedVersions"],
+        json!(["2026-07-28", "2025-11-25"])
     );
-    assert_eq!(syn_val["result"]["instructions"], "use tools");
     assert_eq!(
-        syn_val["result"]["_meta"]["io.modelcontextprotocol/serverInfo"]["name"],
-        "mock-stdio"
+        dual_val["result"]["capabilities"]["tools"]["listChanged"],
+        true
     );
-    syn_up.shutdown().await;
-    syn_cancel.cancel();
+    let dual_pid = dual_val["result"]["_meta"]["pid"].as_u64().unwrap() as u32;
+    assert!(wait_process_gone(dual_pid).await);
+    let dual_requests: Vec<Value> =
+        std::fs::read_to_string(tmp.path().join(format!("request_{dual_pid}.jsonl")))
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+    assert_eq!(dual_requests.len(), 1);
+    assert_eq!(dual_requests[0]["method"], "server/discover");
+    assert_eq!(dual_requests[0]["params"], valid_discover["params"]);
+    dual_up.shutdown().await;
+    dual_cancel.cancel();
 }
